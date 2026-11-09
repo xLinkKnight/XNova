@@ -1991,14 +1991,19 @@ const TARGET_TIP: &str = "Where the modification can occur:\n\
     • [ protein N-terminus, [M\n\
     • ] protein C-terminus";
 
-/// Enter a UniMod accession, fetch the record and add it at one of its sites
+/// Enter a Unimod accession, look the record up and add it at one of its sites
 fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
-    let tip = "Type a UniMod accession number (the Accession # column of unimod.org's modification list), \
+    let tip = format!(
+        "Type a Unimod accession number (the Accession # column of unimod.org's modification list), \
         e.g. 35 for oxidation or UNIMOD:21 for phospho, and press Enter. The name, monoisotopic mass and \
-        allowed sites are fetched from unimod.org (downloaded once, then cached).";
+        allowed sites come from the copy of Unimod bundled with XNova (Unimod of {}): no internet \
+        connection is needed.",
+        unimod::BUNDLED_DATE
+    );
+    let tip = tip.as_str();
     let busy = lk.busy();
     ui.horizontal(|ui| {
-        ui.label("UniMod accession #").on_hover_text(tip);
+        ui.label("Unimod accession #").on_hover_text(tip);
         let edit = ui
             .add(TextEdit::singleline(&mut lk.input).hint_text("e.g. 35").desired_width(100.0))
             .on_hover_text(tip);
@@ -2009,17 +2014,49 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
         }
         if busy {
             ui.spinner();
-            ui.label(RichText::new("Fetching from unimod.org…").weak());
+            if lk.downloading {
+                ui.label(RichText::new("Downloading Unimod from unimod.org…").weak());
+            }
         }
     });
+    ui.label(
+        RichText::new(format!(
+            "Modifications from Unimod (unimod.org; Creasy & Cottrell, Proteomics 2004), copy of {}. \
+             © 2002-2006 Unimod, Design Science License, without any warranty.",
+            unimod::BUNDLED_DATE
+        ))
+        .weak()
+        .small(),
+    )
+    .on_hover_text(format!(
+        "{}.\n\nXNova carries Unimod's XML export unchanged, with its license (the unimod folder of the \
+         XNova download, and crates/sage-gui/assets/unimod in its repository).",
+        unimod::NOTICE
+    ));
 
     let entry = match &lk.result {
         None => return,
-        Some(Err(e)) => {
+        Some(unimod::Found::Error(e)) => {
             ui.label(RichText::new(format!("✖ {e}")).color(Color32::from_rgb(210, 60, 60)));
             return;
         }
-        Some(Ok(entry)) => entry.clone(),
+        Some(unimod::Found::Missing { accession, message, may_download }) => {
+            let (accession, may_download) = (*accession, *may_download);
+            ui.label(RichText::new(format!("✖ {message}")).color(Color32::from_rgb(210, 60, 60)));
+            if may_download {
+                let check = ui
+                    .add_enabled(!busy, egui::Button::new("Check unimod.org"))
+                    .on_hover_text(
+                        "Download Unimod's current list (about 2.5 MB) from unimod.org, once. It is kept on this \
+                         computer and used from then on; unimod.org is asked at most once a day.",
+                    );
+                if check.clicked() {
+                    lk.check_online(ui.ctx(), accession);
+                }
+            }
+            return;
+        }
+        Some(unimod::Found::Entry(entry)) => entry.clone(),
     };
     ui.group(|ui| {
         ui.horizontal(|ui| {
@@ -2103,7 +2140,7 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
                 }
             })
             .response
-            .on_hover_text("Pick a frequently used modification; mass and UniMod name are filled in.");
+            .on_hover_text("Pick a frequently used modification; mass and Unimod name are filled in.");
         if ui
             .button("Add custom modification")
             .on_hover_text("Add an empty row and enter the target and mass yourself.")
@@ -2845,6 +2882,49 @@ mod screenshots {
         assert!(harness.query_by_label("sp|P16370|RPB3_YEAST").is_some(), "the list opens");
         assert!(harness.query_by_label("sp|P34087|RPB7_YEAST").is_some());
         let _ = std::fs::remove_file(&fasta);
+    }
+
+    /// The Unimod lookup answers from the copy bundled with XNova: a record is
+    /// found, and a missing one is reported (unimod.org is not contacted, as
+    /// "Check unimod.org" is not clicked)
+    #[test]
+    fn unimod_lookup_needs_no_internet() {
+        use egui_kittest::kittest::Queryable;
+        let cases: [(&str, &[&str]); 2] = [
+            ("UNIMOD:35", &["(Oxidation or Hydroxylation)"]),
+            ("99999", &["is not in the copy of Unimod bundled with XNova", "Unimod has no record with accession #99999"]),
+        ];
+        for (input, expected) in cases {
+            let mut s = Settings::default();
+            let mut lk = unimod::Lookup { input: input.into(), ..Default::default() };
+            let mut installed = false;
+            let mut harness = Harness::builder()
+                .with_size(egui::vec2(900.0, 600.0))
+                .build_ui(move |ui| {
+                    // fonts take effect on the frame after they are set
+                    if !installed {
+                        theme::install(ui.ctx(), false);
+                        installed = true;
+                        return;
+                    }
+                    unimod_panel(ui, &mut s, &mut lk)
+                });
+            harness.step();
+            harness.step();
+            assert!(harness.query_by_label_contains("Design Science License").is_some(), "Unimod's notice is shown");
+            harness.get_by_label("Look up").click();
+            let mut found = false;
+            for _ in 0..500 {
+                harness.step();
+                if expected.iter().any(|e| harness.query_by_label_contains(e).is_some()) {
+                    found = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(found, "{input}: none of {expected:?} shown");
+            assert!(harness.query_by_label_contains("Downloading").is_none(), "{input}: nothing downloaded");
+        }
     }
 
     /// "Open in xiVIEW" with the choice of crosslinks, for a folder with

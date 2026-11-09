@@ -127,6 +127,10 @@ XNova serves xiVIEW the data model of the PRIDE Crosslinking Resource's API; for
 
 Perez-Riverol, Y.; Bandla, C.; Kundu, D. J.; Kamatchinathan, S.; Bai, J.; Hewapathirana, S.; John, N. S.; Prakash, A.; Walzer, M.; Wang, S.; Vizcaíno, J. A. [The PRIDE database at 20 years: 2025 update](https://doi.org/10.1093/nar/gkae1011). *Nucleic Acids Res.* **2025**, 53 (D1), D543–D553. doi:10.1093/nar/gkae1011
 
+If you add modifications from [Unimod](https://www.unimod.org) (`sage-gui`, Modifications tab, "Unimod accession #"), please cite Unimod:
+
+Creasy, D. M.; Cottrell, J. S. [Unimod: Protein modifications for mass spectrometry](https://doi.org/10.1002/pmic.200300744). *Proteomics* **2004**, 4 (6), 1534–1536. doi:10.1002/pmic.200300744
+
 ## Acknowledgments
 
 The spectrum annotation in `sage-gui` (ProForma 2.0 peptidoforms including crosslinks, theoretical fragmentation and peak matching) uses the [`mzcore`](https://crates.io/crates/mzcore), [`mzannotate`](https://crates.io/crates/mzannotate) and [`mzident`](https://crates.io/crates/mzident) libraries by Douwe Schulte, Ralf Gabriels, Auke Heerdink and contributors ([rusteomics/mzcore](https://github.com/rusteomics/mzcore)), the engine of [Annotator](https://github.com/snijderlab/annotator) from the Snijder lab at Utrecht University. They are used under the MIT license (they are dual-licensed MIT OR Apache-2.0). Spectra in the viewer are read with [`mzdata`](https://github.com/mobiusklein/mzdata) by Joshua Klein, and figures are rendered with [`resvg`](https://github.com/linebender/resvg).
@@ -136,6 +140,8 @@ xiVIEW in `sage-gui` ("Open in xiVIEW") is the work of the [Rappsilber Laborator
 - [Rappsilber-Laboratory/xiview-server](https://github.com/Rappsilber-Laboratory/xiview-server) (Apache-2.0): the page shells, styles, GO terms and help pages.
 - [PRIDE-Archive/crosslinking-api](https://github.com/PRIDE-Archive/crosslinking-api) and its [Rappsilber-Laboratory fork](https://github.com/Rappsilber-Laboratory/crosslinking-api) (Apache-2.0), by the PRIDE team at EMBL-EBI and the Rappsilber Laboratory: the data API of the [PRIDE Crosslinking Resource](https://www.ebi.ac.uk/pride/markdownpage/crosslinking), which XNova's local server answers in the same form; its data model comes from [mzidentml-reader](https://github.com/PRIDE-Archive/mzidentml-reader) ([Rappsilber-Laboratory/mzidentml-reader](https://github.com/Rappsilber-Laboratory/mzidentml-reader)).
 - [xiAnnotator](https://github.com/Rappsilber-Laboratory/xiAnnotator) and [xi2annotator](https://github.com/Rappsilber-Laboratory/xi2annotator) (Rappsilber Laboratory): the annotation format xiSPEC reads, which XNova writes from Annotator's engine.
+
+Modification names, masses and sites in `sage-gui` come from [Unimod](https://www.unimod.org), the protein modification database for mass spectrometry started by David Creasy and John Cottrell at Matrix Science. Unimod is a public domain database, distributed under a copyleft licence, the [Design Science License](crates/sage-gui/assets/unimod/LICENSE-unimod.txt): "Copyright (C) 2002-2006 Unimod; this information may be copied, distributed and/or modified under certain conditions, but it comes WITHOUT ANY WARRANTY; see the accompanying Design Science License for more details." XNova bundles Unimod's XML export unchanged, with that notice and license ([crates/sage-gui/assets/unimod](crates/sage-gui/assets/unimod), and the `unimod` folder of each release download), and compiles it into `sage-gui`. Looking up a modification therefore needs no internet connection and sends no traffic to unimod.org. The Design Science License covers the Unimod data only; it does not extend to XNova's own code. `mzcore`, Annotator's engine, also carries its own compiled copy of Unimod.
 
 
 ## Features from Sage

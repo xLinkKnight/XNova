@@ -11,3 +11,5 @@ data/
 *.fasta
 *.fas
 **/*.DS_Store
+# Unimod's license travels with its data (crates/sage-gui/assets/unimod/README.md)
+!crates/sage-gui/assets/unimod/LICENSE-unimod.txt

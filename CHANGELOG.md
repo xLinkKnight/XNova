@@ -4,7 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [v1.0.2] - 2026-11-09
+
+### Changed
+- `sage-gui`: Unimod is bundled. The Unimod accession lookup on the Modifications tab reads a copy of Unimod's XML export compiled into `sage-gui` (Unimod of 17 February 2026, 1,560 modifications), so it needs no internet connection and no longer downloads Unimod from unimod.org on first use, or again for every accession it could not find. unimod.org is contacted only when you click **Check unimod.org** for an accession that is not in the bundled copy, at most once a day; that download is kept and used while it is newer than the bundled copy. The tests no longer download Unimod either.
+- Unimod is credited and cited: README (Citation, Acknowledgments), CITATION.cff (Creasy & Cottrell, *Proteomics* 2004), and a notice under the lookup. Unimod's data is a public domain database under the Design Science License; XNova redistributes the XML unchanged, with its copyright notice and the license (`crates/sage-gui/assets/unimod`; release downloads carry it as a `unimod` folder).
 
 ### Fixed
 - CI: the Rust workflow runs its test searches with `cargo run --bin sage`. A bare `cargo run` had failed on every push since `sage-gui` joined the workspace, as Cargo could not choose between the two programs.

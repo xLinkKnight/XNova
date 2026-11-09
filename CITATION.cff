@@ -146,3 +146,18 @@ references:
     year: 2025
     doi: 10.1093/nar/gkae1011
     notes: "PRIDE; XNova's local xiVIEW server answers the data API of the PRIDE Crosslinking Resource (https://github.com/PRIDE-Archive/crosslinking-api)."
+  - type: article
+    title: "Unimod: Protein modifications for mass spectrometry"
+    authors:
+      - family-names: Creasy
+        given-names: David M.
+      - family-names: Cottrell
+        given-names: John S.
+    journal: Proteomics
+    volume: 4
+    issue: 6
+    start: 1534
+    end: 1536
+    year: 2004
+    doi: 10.1002/pmic.200300744
+    notes: "Unimod (https://www.unimod.org), bundled with sage-gui for modification lookups; a public domain database under the Design Science License."
