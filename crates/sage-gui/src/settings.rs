@@ -270,7 +270,7 @@ impl Site {
         s
     }
 
-    fn from_spec(spec: &str) -> Self {
+    pub fn from_spec(spec: &str) -> Self {
         Site {
             residues: spec.chars().filter(char::is_ascii_alphabetic).collect(),
             protein_nterm: spec.contains('['),

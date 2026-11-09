@@ -58,6 +58,39 @@ results: `results.sage.tsv` (PSMs), `peptides.sage.tsv` (peptides at 1% FDR) and
 enabled. Protein groups are not cut at 1%: Sage's picked protein FDR cannot go below 1 / (number of
 protein groups), about 0.08 for a 13-protein complex. Run as normal: `sage config.json`.
 
+## Saved crosslinkers and modifications (sage-gui)
+
+In `sage-gui`, crosslinkers and modifications can be saved under a name and
+used again in later searches.
+
+* **Crosslinking tab, Saved crosslinkers.** Set the reagent up as usual: a
+  preset, or *Custom mass* with its linker mass, MS-cleavable or not, stub
+  masses, and reactive residues or Site 1 / Site 2. Then type a name next to
+  *Save the current crosslinker as* and click **Save**. Saved crosslinkers are
+  listed in a table and at the end of the **Reagent** menu, which shows the
+  name while that crosslinker is set up.
+  * **Use** sets it up for the search. The search settings (backend, peaks,
+    loop-links, ...) stay as they are.
+  * **Edit** sets it up above, so you can change it with the usual controls
+    and rename it. **Save changes** replaces the saved crosslinker; **Cancel**
+    keeps it as it was and restores the reagent from before.
+  * **Delete** asks once more before removing it.
+* **Modifications tab, Saved modifications.** **Save...** on a row of the
+  modifications table saves it under a name. The name is suggested from its
+  Unimod record, e.g. `Oxidation (M)`. The saved entry keeps the type,
+  target, mass shift, maximum per peptide and ProForma name.
+  * **Add**, or the *Add saved modification...* menu, adds it to the search.
+  * **Edit** changes it in place, then **Save** or **Cancel**.
+  * **Delete** asks once more before removing it.
+
+Both lists are kept on this computer in `%APPDATA%\sage-gui\library.json`,
+apart from the search settings. The file is written as soon as something is
+saved, edited or deleted, and can be copied to another computer. A saved
+crosslinker is written like the `crosslink` settings above (`mass`, `cleavable`,
+`residues` / `protein_nterm` or `site1` / `site2`), with a `name`. The name is
+not part of the search settings: Sage runs a saved crosslinker as a custom
+reagent with its mass, stubs and sites, and the exports call it `custom`.
+
 ## Required database settings
 
 * **`enzyme.missed_cleavages` must be >= 1 (typically 2).** A crosslinked lysine

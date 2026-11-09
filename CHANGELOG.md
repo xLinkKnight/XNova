@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.0] - 2026-11-09
+
+### Added
+- `sage-gui`: saved crosslinkers. On the Crosslinking tab, the crosslinker set up (a preset or a custom one: linker mass, MS-cleavable or not, stub masses, reactive residues or Site 1 / Site 2) can be saved under a name, and is listed under Saved crosslinkers and in the Reagent menu for later searches. **Use** sets a saved crosslinker up; **Edit** sets it up to change it with the usual controls, then **Save changes** or **Cancel**; **Delete** asks first.
+- `sage-gui`: saved modifications. On the Modifications tab, **Save...** on a row saves that modification under a name (suggested from its Unimod record), with its type, target, mass shift, maximum per peptide and ProForma name. Saved modifications are listed under Saved modifications and in an *Add saved modification...* menu. **Add** puts one in the search; **Edit** changes it in place; **Delete** asks first.
+- Both lists are kept in `%APPDATA%\sage-gui\library.json`, apart from the search settings, and written as soon as something is saved, edited or deleted. A file that cannot be read is kept as `library.json.bak` before it is replaced. See CROSSLINKING.md, "Saved crosslinkers and modifications".
+
 ## [v1.0.2] - 2026-11-09
 
 ### Changed

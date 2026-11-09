@@ -3,6 +3,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod library;
 mod progress;
 mod runner;
 mod settings;
@@ -102,6 +103,9 @@ struct SageGui {
     show_json: bool,
     last_saved: Option<PathBuf>,
     unimod: unimod::Lookup,
+    /// Crosslinkers and modifications saved under a name, kept on this computer
+    library: library::Library,
+    library_ed: library::Editor,
     /// Steps, metrics and errors of the current or last search
     tracker: Option<progress::Tracker>,
     /// The mobiligrams of the last search, being written in the background
@@ -156,6 +160,8 @@ impl SageGui {
             show_json: false,
             last_saved: None,
             unimod: Default::default(),
+            library: library::Library::load(),
+            library_ed: Default::default(),
             tracker: None,
             figures: None,
             usage: usage::Monitor::start(system::gpus()),
@@ -802,10 +808,12 @@ impl SageGui {
                 ui.add_enabled_ui(!running, |ui| match tab {
                     Tab::Files => self.files_tab(ui),
                     Tab::Database => database_tab(ui, &mut self.s),
-                    Tab::Modifications => modifications_tab(ui, &mut self.s, &mut self.unimod),
+                    Tab::Modifications => {
+                        modifications_tab(ui, &mut self.s, &mut self.unimod, &mut self.library, &mut self.library_ed)
+                    }
                     Tab::Spectra => spectra_tab(ui, &mut self.s),
                     Tab::Scoring => scoring_tab(ui, &mut self.s),
-                    Tab::Crosslink => crosslink_tab(ui, &mut self.s),
+                    Tab::Crosslink => crosslink_tab(ui, &mut self.s, &mut self.library, &mut self.library_ed),
                     Tab::Progress => self.progress_tab(ui),
                     Tab::Viewer => {
                         // the folder shown, else the output folder
@@ -2118,7 +2126,13 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
     });
 }
 
-fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
+fn modifications_tab(
+    ui: &mut Ui,
+    s: &mut Settings,
+    lk: &mut unimod::Lookup,
+    lib: &mut library::Library,
+    ed: &mut library::Editor,
+) {
     heading(ui, "Modifications");
     note(ui, "Fixed modifications are always present (e.g. carbamidomethyl C after iodoacetamide). \
         Variable modifications may or may not be present; each one increases search time.");
@@ -2154,6 +2168,7 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
                 max_count: 0,
             });
         }
+        library::mod_menu(ui, &mut s.mods, lib);
     });
     ui.add_space(4.0);
     unimod_panel(ui, s, lk);
@@ -2186,15 +2201,20 @@ fn modifications_tab(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
                 .on_hover_text("0 = no per-modification limit.");
             ui.add(TextEdit::singleline(&mut m.name).hint_text("UNIMOD:…").desired_width(110.0))
                 .on_hover_text("e.g. UNIMOD:4 (carbamidomethyl), UNIMOD:35 (oxidation), UNIMOD:21 (phospho)");
-            if ui.small_button("✖").on_hover_text("Remove this modification").clicked() {
-                remove = Some(i);
-            }
+            ui.horizontal(|ui| {
+                library::mod_save_button(ui, i, m, ed);
+                if ui.small_button("✖").on_hover_text("Remove this modification").clicked() {
+                    remove = Some(i);
+                }
+            });
             ui.end_row();
         }
     });
     if let Some(i) = remove {
         s.mods.remove(i);
+        library::mod_row_removed(ed, i);
     }
+    library::mod_panel(ui, &mut s.mods, lib, ed);
 
     heading(ui, "Limits");
     grid(ui, "modlimits", |ui| {
@@ -2421,7 +2441,7 @@ fn open_url(url: &str) -> Result<(), String> {
 const VIEW_TIP: &str = "Show the matches of this results folder on the \"Annotated spectra\" tab: \
     each spectrum annotated with Annotator's engine (built in), linear and crosslinked.";
 
-fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
+fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: &mut library::Editor) {
     heading(ui, "Crosslinking (XL-MS)");
     ui.checkbox(&mut s.crosslink.enabled, theme::bold("Search for crosslinked peptides"))
         .on_hover_text("Turns this into a crosslink search: results go to crosslinks.sage.tsv \
@@ -2451,11 +2471,12 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
                     let before = xl.reagent;
                     let r = ComboBox::from_id_salt("reagent")
                         .width(260.0)
-                        .selected_text(xl.reagent.label())
+                        .selected_text(library::reagent_text(xl, lib))
                         .show_ui(ui, |ui| {
                             for r in Reagent::ALL {
                                 ui.selectable_value(&mut xl.reagent, r, r.label());
                             }
+                            library::reagent_menu(ui, xl, lib);
                         })
                         .response;
                     if xl.reagent != before {
@@ -2560,6 +2581,7 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings) {
         if xl.is_cleavable() {
             stub_masses(ui, xl);
         }
+        library::linker_panel(ui, xl, lib, ed);
 
         heading(ui, "Non-cleavable search engine");
         if xl.is_cleavable() {
@@ -2737,7 +2759,9 @@ mod screenshots {
         s.labelled_proteins.insert("sp|P08518|RPB2_YEAST".into(), sage_core::labelled::Isotope::N15);
         s.labelled_proteins.insert("sp|P04050|RPB1_YEAST".into(), sage_core::labelled::Isotope::C13N15);
         let tabs: [(&str, fn(&mut Ui, &mut Settings)); 3] =
-            [("database", database_tab), ("scoring", scoring_tab), ("crosslinking", crosslink_tab)];
+            [("database", database_tab), ("scoring", scoring_tab), ("crosslinking", |ui, s| {
+                crosslink_tab(ui, s, &mut library::Library::default(), &mut Default::default())
+            })];
         for (name, tab) in tabs {
             let mut settings = s.clone();
             // fonts take effect on the frame after they are set: draw from the second
@@ -2882,6 +2906,237 @@ mod screenshots {
         assert!(harness.query_by_label("sp|P16370|RPB3_YEAST").is_some(), "the list opens");
         assert!(harness.query_by_label("sp|P34087|RPB7_YEAST").is_some());
         let _ = std::fs::remove_file(&fasta);
+    }
+
+    /// A harness drawing one tab with its own settings and an in-memory library
+    fn library_harness(
+        state: std::rc::Rc<std::cell::RefCell<(Settings, library::Library, library::Editor)>>,
+        crosslinking: bool,
+    ) -> Harness<'static> {
+        let mut installed = false;
+        let mut lookup = unimod::Lookup::default();
+        Harness::builder().with_size(egui::vec2(1100.0, 2000.0)).build_ui(move |ui| {
+            // fonts take effect on the frame after they are set
+            if !installed {
+                theme::install(ui.ctx(), false);
+                installed = true;
+                return;
+            }
+            let (s, lib, ed) = &mut *state.borrow_mut();
+            if crosslinking {
+                crosslink_tab(ui, s, lib, ed)
+            } else {
+                modifications_tab(ui, s, &mut lookup, lib, ed)
+            }
+        })
+    }
+
+    /// Pictures of the saved crosslinkers and modifications panels, with a
+    /// few entries and one being edited (`SAGE_GUI_FIGURES` = output folder)
+    #[test]
+    #[ignore]
+    fn library_panels_preview() {
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let state: std::rc::Rc<std::cell::RefCell<(Settings, library::Library, library::Editor)>> = Default::default();
+        {
+            let (s, lib, ed) = &mut *state.borrow_mut();
+            s.crosslink.enabled = true;
+            for (name, reagent) in [("DSSO-d8", Reagent::Dsso), ("cliXlink", Reagent::Clixlink), ("EDC, K to DE", Reagent::Edc)] {
+                let mut xl = settings::Crosslink { enabled: true, reagent, ..Default::default() };
+                if let Some((a, b)) = reagent.sites() {
+                    xl.two_sites = true;
+                    xl.site1 = a;
+                    xl.site2 = b;
+                }
+                xl.reset_stubs();
+                lib.put_linker(library::SavedLinker::from_crosslink(name, &xl), None).unwrap();
+            }
+            lib.crosslinkers[0].apply(&mut s.crosslink);
+            for (name, i) in [("Carbamidomethyl (C)", 0), ("Oxidation (M)", 2), ("Phospho (S)", 4)] {
+                lib.put_mod(library::SavedMod::from_modification(name, &(&settings::PRESETS[i]).into()), None).unwrap();
+            }
+            ed.mod_edit = Some((2, lib.modifications[2].clone()));
+            ed.mod_save = Some((1, "Oxidation (M)".into()));
+        }
+        for (name, crosslinking) in [("library_crosslinking", true), ("library_modifications", false)] {
+            let mut harness = library_harness(state.clone(), crosslinking);
+            harness.run();
+            let image = harness.render().expect("render");
+            let path = out.join(format!("{name}.png"));
+            image.save(&path).unwrap();
+            println!("{}", path.display());
+        }
+        // a saved crosslinker being edited
+        {
+            let (s, _, ed) = &mut *state.borrow_mut();
+            ed.linker_edit = Some(library::LinkerEdit { index: 0, name: "DSSO-d8".into(), before: s.crosslink.clone() });
+        }
+        let mut harness = library_harness(state.clone(), true);
+        harness.run();
+        let path = out.join("library_crosslinking_edit.png");
+        harness.render().expect("render").save(&path).unwrap();
+        println!("{}", path.display());
+    }
+
+    /// Saved crosslinkers: save the one set up, use it, edit it (cancel, then
+    /// save the changes) and delete it
+    #[test]
+    fn saved_crosslinkers_save_use_edit_delete() {
+        use egui_kittest::kittest::Queryable;
+        let state: std::rc::Rc<std::cell::RefCell<(Settings, library::Library, library::Editor)>> = Default::default();
+        {
+            let (s, _, ed) = &mut *state.borrow_mut();
+            s.crosslink.enabled = true;
+            s.crosslink.reagent = Reagent::Dsso;
+            s.crosslink.reset_stubs();
+            ed.linker_name = "DSSO-d8".into();
+        }
+        let mut harness = library_harness(state.clone(), true);
+        harness.run();
+        harness.get_by_label("Save").click();
+        harness.run();
+        {
+            let (_, lib, _) = &*state.borrow();
+            assert_eq!(lib.crosslinkers.len(), 1);
+            let l = &lib.crosslinkers[0];
+            assert_eq!(l.name, "DSSO-d8");
+            assert!(l.cleavable && (l.mass - 158.00376).abs() < 1e-9 && (l.stub_long - 103.9932).abs() < 1e-9);
+        }
+        assert!(harness.query_by_label_contains("Saved \"DSSO-d8\"").is_some());
+
+        // Use: from another reagent back to the saved one, shown by name in the Reagent menu
+        state.borrow_mut().0.crosslink.reagent = Reagent::Dss;
+        harness.run();
+        harness.get_by_label("Use").click();
+        harness.run();
+        {
+            let xl = &state.borrow().0.crosslink;
+            assert_eq!(xl.reagent, Reagent::Custom);
+            assert!(xl.is_cleavable() && (xl.linker_mass() - 158.00376).abs() < 1e-9);
+        }
+        {
+            // (a menu's text is drawn, not exposed as a label)
+            let (s, lib, _) = &*state.borrow();
+            assert_eq!(library::reagent_text(&s.crosslink, lib), "DSSO-d8 (saved)", "the Reagent menu names it");
+        }
+
+        // Edit, change the mass, Cancel: the saved one and the set-up are as before
+        harness.get_by_label("Edit").click();
+        harness.run();
+        assert!(harness.query_by_label_contains("Editing the saved crosslinker").is_some());
+        state.borrow_mut().0.crosslink.custom_mass = 1.0;
+        harness.run();
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        {
+            let (s, lib, ed) = &*state.borrow();
+            assert!(ed.linker_edit.is_none());
+            assert!((lib.crosslinkers[0].mass - 158.00376).abs() < 1e-9);
+            assert!((s.crosslink.linker_mass() - 158.00376).abs() < 1e-9, "the crosslinker from before Edit");
+        }
+
+        // Edit, rename, change the mass and reactive residues, Save changes
+        harness.get_by_label("Edit").click();
+        harness.run();
+        {
+            let (s, _, ed) = &mut *state.borrow_mut();
+            s.crosslink.custom_mass = 166.05;
+            s.crosslink.residues = "KSTY".into();
+            ed.linker_edit.as_mut().unwrap().name = "DSSO heavy".into();
+        }
+        harness.run();
+        harness.get_by_label("Save changes").click();
+        harness.run();
+        {
+            let (_, lib, ed) = &*state.borrow();
+            assert!(ed.linker_edit.is_none());
+            assert_eq!(lib.crosslinkers.len(), 1);
+            let l = &lib.crosslinkers[0];
+            assert_eq!((l.name.as_str(), l.residues.as_str()), ("DSSO heavy", "KSTY"));
+            assert!((l.mass - 166.05).abs() < 1e-9 && l.cleavable);
+        }
+
+        // Delete asks first; Keep keeps it, Delete removes it
+        harness.get_by_label("Delete").click();
+        harness.run();
+        assert!(harness.query_by_label("Delete \"DSSO heavy\"?").is_some());
+        harness.get_by_label("Keep").click();
+        harness.run();
+        assert_eq!(state.borrow().1.crosslinkers.len(), 1);
+        harness.get_by_label("Delete").click();
+        harness.run();
+        harness.get_by_label("Delete").click();
+        harness.run();
+        assert!(state.borrow().1.crosslinkers.is_empty());
+        assert!(harness.query_by_label_contains("Deleted \"DSSO heavy\"").is_some());
+    }
+
+    /// Saved modifications: save a row of the table under a name, add it to a
+    /// search, edit it and delete it
+    #[test]
+    fn saved_modifications_save_add_edit_delete() {
+        use egui_kittest::kittest::Queryable;
+        let state = std::rc::Rc::new(std::cell::RefCell::new(Default::default()));
+        {
+            let (s, _, _): &mut (Settings, library::Library, library::Editor) = &mut *state.borrow_mut();
+            s.mods = vec![(&settings::PRESETS[0]).into(), (&settings::PRESETS[2]).into()];
+        }
+        let mut harness = library_harness(state.clone(), false);
+        harness.run();
+        assert!(harness.query_by_label("No saved modifications yet.").is_some());
+        // Save… on the oxidation row: named after its Unimod record
+        harness.get_all_by_label("Save…").nth(1).unwrap().click();
+        harness.run();
+        assert_eq!(state.borrow().2.mod_save.as_ref().unwrap().1, "Oxidation (M)");
+        harness.get_by_label("Save").click();
+        harness.run();
+        {
+            let (_, lib, ed) = &*state.borrow();
+            assert!(ed.mod_save.is_none());
+            assert_eq!(lib.modifications.len(), 1);
+            let m = &lib.modifications[0];
+            assert_eq!((m.name.as_str(), m.target.as_str(), m.proforma.as_str(), m.kind), ("Oxidation (M)", "M", "UNIMOD:35", ModKind::Variable));
+        }
+        // it is in the search already; removed from the search, Add puts it back
+        assert!(harness.query_by_label("✔ added").is_some());
+        state.borrow_mut().0.mods.remove(1);
+        harness.run();
+        harness.get_by_label("Add").click();
+        harness.run();
+        {
+            let mods = &state.borrow().0.mods;
+            assert_eq!(mods.len(), 2);
+            assert_eq!((mods[1].target.as_str(), mods[1].name.as_str()), ("M", "UNIMOD:35"));
+        }
+
+        // Edit in place, then Save
+        harness.get_by_label("Edit").click();
+        harness.run();
+        {
+            let (_, _, ed) = &mut *state.borrow_mut();
+            let draft = &mut ed.mod_edit.as_mut().unwrap().1;
+            draft.name = "Dioxidation (M)".into();
+            draft.mass = 31.989829;
+            draft.proforma = "UNIMOD:425".into();
+        }
+        harness.run();
+        harness.get_by_label("Save").click();
+        harness.run();
+        {
+            let (_, lib, ed) = &*state.borrow();
+            assert!(ed.mod_edit.is_none());
+            let m = &lib.modifications[0];
+            assert_eq!((m.name.as_str(), m.proforma.as_str()), ("Dioxidation (M)", "UNIMOD:425"));
+            assert!((m.mass - 31.989829).abs() < 1e-9);
+        }
+
+        // Delete, confirmed
+        harness.get_by_label("Delete").click();
+        harness.run();
+        harness.get_by_label("Delete").click();
+        harness.run();
+        assert!(state.borrow().1.modifications.is_empty());
     }
 
     /// The Unimod lookup answers from the copy bundled with XNova: a record is
