@@ -1,6 +1,7 @@
 use clap::{value_parser, Arg, Command, ValueHint};
 use rayon::ThreadPoolBuilder;
 use sage_cli::input::Input;
+use sage_cli::memory::{gib, MemoryGuard};
 use sage_cli::runner::Runner;
 
 fn main() -> anyhow::Result<()> {
@@ -112,6 +113,19 @@ fn main() -> anyhow::Result<()> {
                 .help("Report whether this build can use a GPU, list the adapters it sees, and exit"),
         )
         .arg(
+            Arg::new("max-memory")
+                .long("max-memory")
+                .value_parser(value_parser!(f64))
+                .help("Stop the search when sage.exe uses more memory than this, in GB (also max_memory_gb)")
+                .value_hint(ValueHint::Other),
+        )
+        .arg(
+            Arg::new("estimate")
+                .long("estimate")
+                .action(clap::ArgAction::SetTrue)
+                .help("Print the size of the database the search would build (peptides, fragments, memory) and exit"),
+        )
+        .arg(
             Arg::new("stack-size")
                 .long("stack-size")
                 .value_parser(value_parser!(u32).range(1..))
@@ -159,18 +173,56 @@ fn main() -> anyhow::Result<()> {
         .copied()
         .unwrap_or(true);
 
+    let estimate = matches.get_flag("estimate");
+    let max_memory = matches.get_one::<f64>("max-memory").copied();
+
     let input = Input::from_arguments(matches)?;
+    let mut parameters = input.build()?;
 
-    let runner = input
-        .build()
-        .and_then(|parameters| Runner::new(parameters, parallel))?;
+    if estimate {
+        return print_estimate(&mut parameters, parallel);
+    }
 
+    // the limit given on the command line, else the configuration's
+    let limit = max_memory.filter(|gb| *gb > 0.0).or(parameters.max_memory_gb);
+    if let Some(gb) = limit {
+        log::info!("memory limit: {:.2} GB", gb);
+    }
+    let guard = MemoryGuard::start(limit);
+
+    let runner = Runner::new(parameters, parallel)?;
     let tel = runner.run(parallel, parquet)?;
+    log::info!("peak memory use: {:.2} GB", gib(guard.peak_bytes()));
+    drop(guard);
 
     if send_telemetry {
         tel.send();
     }
 
+    Ok(())
+}
+
+/// `--estimate`: the database the search would build, counted without
+/// building it, and the spectrum files it would read
+fn print_estimate(parameters: &mut sage_cli::input::Search, parallel: usize) -> anyhow::Result<()> {
+    let fasta = sage_cli::runner::read_protein_databases(&mut parameters.database)?;
+    let e = parameters.database.estimate(&fasta);
+    let files = parameters.mzml_paths.len();
+    let on_disk = sage_cli::memory::spectra_bytes(&parameters.mzml_paths);
+    println!("database estimate (counted without building it; an upper bound, as the search merges duplicate forms):");
+    println!("  proteins: {}", e.proteins);
+    println!("  peptide forms (targets and decoys): {} ({} decoys)", e.peptides, e.decoys);
+    println!("  fragments indexed: {}", e.fragments);
+    println!("  database memory: about {:.2} GB", gib(e.bytes));
+    println!(
+        "  spectrum files: {} ({:.2} GB on disk), read {} at a time (--batch-size)",
+        files,
+        gib(on_disk),
+        parallel.min(files.max(1))
+    );
+    if parameters.crosslink.is_some() {
+        println!("  crosslink search: the candidate pairs are formed per spectrum and are not counted here");
+    }
     Ok(())
 }
 

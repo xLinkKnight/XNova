@@ -445,7 +445,7 @@ mod test {
         let (db, ..) = fixture();
         let one = "sp|P11111|ONE_HUMAN";
         let features = vec![psm(&db, "VSTAAMQR", 0, 3.0, one), psm(&db, "AQLR", 1, 2.0, one)];
-        let peak = || Peak { rt: 0, spectral_angle: 1.0, score: 1.0, q_value: 0.0 };
+        let peak = || Peak { rt: 0, spectral_angle: 1.0, score: 1.0, q_value: 0.0, files: Vec::new() };
         let (a, b) = (find(&db, "VSTAAMQR", false), find(&db, "AQLR", false));
         let mut areas = Areas::default();
         areas.insert((PrecursorId::Charged((a, 2)), false), (peak(), vec![10.0, 20.0]));

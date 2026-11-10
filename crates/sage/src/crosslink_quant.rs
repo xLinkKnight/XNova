@@ -69,17 +69,18 @@ fn species_key(m: &CrosslinkMatch) -> (u32, u32) {
 }
 
 fn aligned(a: &Alignment, rt: f32) -> f32 {
-    (rt / a.max_rt) * a.slope + a.intercept
+    a.transform(rt)
 }
 
-/// Linear retention-time alignment of each run onto the average run, fitted on
-/// species identified in at least two runs. `species` holds each species' match
-/// indices, best first.
+/// Retention-time alignment of each run onto the consensus run, fitted on
+/// species identified in at least two runs, by `method`. `species` holds each
+/// species' match indices, best first.
 pub fn align_runs(
     matches: &[CrosslinkMatch],
     species: &[Vec<usize>],
     ms1: &[ProcessedSpectrum],
     n_files: usize,
+    method: crate::ml::retention_alignment::AlignmentMethod,
 ) -> Vec<Alignment> {
     let mut max_rt = vec![0.0f32; n_files];
     for s in ms1 {
@@ -99,7 +100,7 @@ pub fn align_runs(
     }
 
     // Normalized RT of each species in each run (from its best match there)
-    let mut points: Vec<Vec<(f32, f32)>> = vec![Vec::new(); n_files];
+    let mut points: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n_files];
     for csms in species {
         let mut per_file: HashMap<usize, f32> = HashMap::new();
         for &i in csms {
@@ -111,42 +112,21 @@ pub fn align_runs(
         if per_file.len() < 2 {
             continue;
         }
-        let mean = per_file.values().sum::<f32>() / per_file.len() as f32;
+        let consensus = crate::ml::retention_alignment::consensus(
+            &mut per_file.values().map(|&v| v as f64).collect::<Vec<_>>(),
+            method,
+        );
         for (&file, &rt) in &per_file {
-            points[file].push((rt, mean));
+            points[file].push((rt as f64, consensus));
         }
     }
 
-    (0..n_files)
-        .map(|file_id| {
-            let identity = Alignment {
-                file_id,
-                max_rt: max_rt[file_id],
-                slope: 1.0,
-                intercept: 0.0,
-            };
-            let pts = &points[file_id];
-            if pts.len() < MIN_ALIGNMENT_POINTS {
-                return identity;
-            }
-            let n = pts.len() as f32;
-            let mx = pts.iter().map(|p| p.0).sum::<f32>() / n;
-            let my = pts.iter().map(|p| p.1).sum::<f32>() / n;
-            let sxx = pts.iter().map(|p| (p.0 - mx).powi(2)).sum::<f32>();
-            let sxy = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f32>();
-            if sxx <= f32::EPSILON {
-                return identity;
-            }
-            let slope = sxy / sxx;
+    points
+        .into_iter()
+        .enumerate()
+        .map(|(file_id, pts)| {
             // A wild fit from a handful of points is worse than none
-            if !(0.5..=2.0).contains(&slope) {
-                return identity;
-            }
-            Alignment {
-                slope,
-                intercept: my - slope * mx,
-                ..identity
-            }
+            crate::ml::retention_alignment::fit_alignment(file_id, max_rt[file_id], pts, method, MIN_ALIGNMENT_POINTS, Some((0.5, 2.0)))
         })
         .collect()
 }
@@ -190,7 +170,7 @@ pub fn quantify_lfq(
         return Vec::new();
     }
 
-    let alignments = align_runs(matches, &species, ms1, n_files);
+    let alignments = align_runs(matches, &species, ms1, n_files, lfq.alignment);
 
     // Theoretical isotope envelope of each species: both peptides plus linker
     let (linker_c, linker_s) = settings.linker_composition();

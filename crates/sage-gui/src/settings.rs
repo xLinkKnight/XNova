@@ -62,13 +62,14 @@ impl Tolerance {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ModKind {
     Fixed,
+    #[default]
     Variable,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Modification {
     pub target: String,
     pub mass: f64,
@@ -77,6 +78,96 @@ pub struct Modification {
     pub kind: ModKind,
     /// Variable mods only: maximum occurrences per peptide, 0 = no limit
     pub max_count: u32,
+    /// Where on the peptide the residue may be
+    pub position: SitePosition,
+    /// PROSITE-style motif around the site, e.g. `N-{P}-[ST]`; empty: none
+    pub motif: String,
+    /// Neutral losses of fragments containing the site, Da, comma-separated
+    pub losses: String,
+    /// Variable mods only: indexed, at the site library's sites, or a mass offset
+    pub search: ModSearch,
+}
+
+pub use sage_core::site_rules::SitePosition;
+
+/// How a variable modification is searched
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ModSearch {
+    /// Every modified form indexed
+    #[default]
+    Indexed,
+    /// Indexed at the site library's sites only (`site_mode: library`)
+    Library,
+    /// Tried at search time (`search_mode: mass_offset`)
+    Offset,
+}
+
+/// The search choices offered for a variable modification
+pub const MOD_SEARCHES: [(ModSearch, &str); 3] =
+    [(ModSearch::Indexed, "indexed"), (ModSearch::Library, "library sites"), (ModSearch::Offset, "mass offset")];
+
+pub fn search_label(s: ModSearch) -> &'static str {
+    MOD_SEARCHES.iter().find(|(x, _)| *x == s).map_or("indexed", |(_, l)| *l)
+}
+
+/// The position choices offered for a modification
+pub const SITE_POSITIONS: [(SitePosition, &str); 4] = [
+    (SitePosition::Anywhere, "anywhere"),
+    (SitePosition::NotNTerm, "not N-term"),
+    (SitePosition::NotCTerm, "not C-term"),
+    (SitePosition::Internal, "internal"),
+];
+
+pub fn position_label(p: SitePosition) -> &'static str {
+    SITE_POSITIONS.iter().find(|(x, _)| *x == p).map_or("anywhere", |(_, l)| *l)
+}
+
+/// The neutral losses written in `losses` (Da), or what is wrong with them
+pub fn parse_losses(losses: &str) -> Result<Vec<f64>, String> {
+    losses
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .map(|x| match x.parse::<f64>() {
+            Ok(v) if v.is_finite() && v > 0.0 => Ok(v),
+            _ => Err(format!("`{x}` is not a positive mass")),
+        })
+        .collect()
+}
+
+/// What is wrong with a modification's position, motif or neutral losses
+pub fn rule_problem(m: &Modification) -> Option<String> {
+    let target = m.target.trim();
+    let residue = target.chars().last().filter(|c| c.is_ascii_uppercase());
+    if m.position != SitePosition::Anywhere && (target.len() != 1 || residue.is_none()) {
+        return Some(format!("`{target}`: a position (not N-/C-term, internal) needs a single residue as the target"));
+    }
+    if !m.motif.trim().is_empty() {
+        match sage_core::site_rules::Motif::parse(m.motif.trim()) {
+            Err(e) => return Some(format!("`{target}`: {e}")),
+            Ok(motif) => {
+                let Some(r) = residue else {
+                    return Some(format!("`{target}`: a motif needs a residue as the target"));
+                };
+                if !motif.site_residues().contains(&(r as u8)) {
+                    return Some(format!("`{target}`: the site of motif {} is never {r}", motif.pattern()));
+                }
+            }
+        }
+    }
+    if m.kind == ModKind::Variable {
+        match m.search {
+            ModSearch::Offset if !m.motif.trim().is_empty() => {
+                return Some(format!("`{target}`: a mass offset is placed on the peptide alone and cannot have a motif"));
+            }
+            ModSearch::Offset if m.mass == 0.0 => return Some(format!("`{target}`: a mass offset needs a mass")),
+            ModSearch::Library if target.len() != 1 || residue.is_none() => {
+                return Some(format!("`{target}`: library sites need a single residue as the target"));
+            }
+            _ => {}
+        }
+    }
+    parse_losses(&m.losses).err().map(|e| format!("`{target}`: neutral loss {e}"))
 }
 
 /// A common modification offered in the "Add" menu
@@ -120,6 +211,9 @@ impl From<&Preset> for Modification {
             name: p.name.into(),
             kind: p.kind,
             max_count: 0,
+            // phospho: the phosphate leaves S and T fragments as H3PO4
+            losses: if p.name == "UNIMOD:21" && matches!(p.target, "S" | "T") { "97.976896".into() } else { String::new() },
+            ..Default::default()
         }
     }
 }
@@ -588,24 +682,57 @@ impl Tmt {
     }
 }
 
-/// SILAC: no labels, light + heavy, or light + medium + heavy
+/// SILAC: no labels, light + heavy, or light + medium + heavy; or dimethyl
+/// labelling on K and peptide N-termini (light + medium, or all three)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Silac {
     Off,
     Duplex,
     Triplex,
+    DimethylDuplex,
+    DimethylTriplex,
 }
 
 impl Silac {
-    pub const ALL: [Silac; 3] = [Silac::Off, Silac::Duplex, Silac::Triplex];
+    pub const ALL: [Silac; 5] =
+        [Silac::Off, Silac::Duplex, Silac::Triplex, Silac::DimethylDuplex, Silac::DimethylTriplex];
 
     pub fn label(self) -> &'static str {
         match self {
             Silac::Off => "Off",
-            Silac::Duplex => "Duplex (light, heavy)",
-            Silac::Triplex => "Triplex (light, medium, heavy)",
+            Silac::Duplex => "SILAC duplex (light, heavy)",
+            Silac::Triplex => "SILAC triplex (light, medium, heavy)",
+            Silac::DimethylDuplex => "Dimethyl duplex (light, medium)",
+            Silac::DimethylTriplex => "Dimethyl triplex (light, medium, heavy)",
         }
     }
+
+    /// Dimethyl labelling (K and N-termini; light carries a label too)
+    pub fn is_dimethyl(self) -> bool {
+        matches!(self, Silac::DimethylDuplex | Silac::DimethylTriplex)
+    }
+
+    /// SILAC on residues, with editable K / R labels
+    pub fn is_residue_silac(self) -> bool {
+        matches!(self, Silac::Duplex | Silac::Triplex)
+    }
+
+    /// Label states every peptide is searched in
+    pub fn states(self) -> usize {
+        match self {
+            Silac::Off => 1,
+            Silac::Duplex | Silac::DimethylDuplex => 2,
+            Silac::Triplex | Silac::DimethylTriplex => 3,
+        }
+    }
+}
+
+/// The light dimethyl label (K and N-terminus) Sage adds as a static
+/// modification: not shown in the modifications table
+fn is_light_dimethyl(m: &Modification) -> bool {
+    m.kind == ModKind::Fixed
+        && (m.target == "K" || m.target == "^")
+        && (m.mass - f64::from(sage_core::silac::DIMETHYL_LIGHT)).abs() < 1e-3
 }
 
 /// SILAC label presets: (name, residue, mass)
@@ -760,9 +887,15 @@ pub struct Settings {
     pub prefilter: bool,
     pub prefilter_chunk_size: u32,
     pub prefilter_low_memory: bool,
+    /// Also search proteins without their initiator Met (MetAP)
+    pub clip_n_term_met: bool,
 
     // Modifications
     pub mods: Vec<Modification>,
+    /// Known modification sites for "library sites" modifications (empty: none)
+    pub site_library: String,
+    /// With a site_q column: only sites at or below it
+    pub site_library_q: f64,
 
     // Spectra & tolerances
     pub precursor_tol: Tolerance,
@@ -789,6 +922,10 @@ pub struct Settings {
     pub write_report: bool,
     /// `results.annotator.csv` / `crosslinks.annotator.csv` for Annotator
     pub write_annotator: bool,
+    /// Search MS2 spectra for diagnostic ions (diagnostic_ions.tsv)
+    pub diagnostic_ions: bool,
+    /// A custom ion list from a loaded configuration, written back as it was
+    pub diagnostic_ions_list: Option<Value>,
     pub annotate_matches: bool,
     pub lfq: bool,
     /// MS1 mass tolerance (ppm) for LFQ
@@ -796,6 +933,8 @@ pub struct Settings {
     /// Only peptides / crosslinks at or below this q-value are quantified
     pub lfq_q: f64,
     pub lfq_combine_charges: bool,
+    /// Write lfq_long.tsv (one row per precursor and run)
+    pub lfq_long_form: bool,
     /// Minimum isotope-envelope spectral angle of an integrated peak
     pub lfq_spectral_angle: f64,
     pub tmt: Tmt,
@@ -813,6 +952,19 @@ pub struct Settings {
     pub include_unlabelled: bool,
 
     pub crosslink: Crosslink,
+
+    /// timsTOF 1/K0 on timsrust's linear scale instead of the instrument's
+    /// calibration (`bruker_config.ion_mobility_scale`)
+    pub linear_mobility: bool,
+    /// Align runs with a straight line (`retention_time_alignment: linear`)
+    /// instead of the nonlinear warp
+    pub linear_alignment: bool,
+    /// Entrapment proteins: accessions containing this tag (empty = off)
+    pub entrapment_tag: String,
+    /// Localize variable modifications (site probabilities, FLR, sites.tsv)
+    pub localization: bool,
+    /// Residues used as decoy sites for the false localization rate
+    pub localization_decoys: String,
 
     /// Keys from a loaded file the GUI does not edit, written back unchanged
     extra: Map<String, Value>,
@@ -849,7 +1001,10 @@ impl Default for Settings {
             prefilter: false,
             prefilter_chunk_size: 0,
             prefilter_low_memory: true,
+            clip_n_term_met: false,
             mods: vec![(&PRESETS[0]).into(), (&PRESETS[2]).into()],
+            site_library: String::new(),
+            site_library_q: 0.01,
             precursor_tol: Tolerance::ppm(-10.0, 10.0),
             fragment_tol: Tolerance::ppm(-10.0, 10.0),
             precursor_charge: (2, 4),
@@ -870,11 +1025,14 @@ impl Default for Settings {
             write_pin: false,
             write_report: true,
             write_annotator: false,
+            diagnostic_ions: false,
+            diagnostic_ions_list: None,
             annotate_matches: false,
             lfq: false,
             lfq_ppm: 5.0,
             lfq_q: 0.01,
             lfq_combine_charges: true,
+            lfq_long_form: true,
             lfq_spectral_angle: 0.7,
             tmt: Tmt::None,
             tmt_level: 3,
@@ -886,6 +1044,11 @@ impl Default for Settings {
             labelled_proteins: Default::default(),
             include_unlabelled: true,
             crosslink: Crosslink::default(),
+            linear_mobility: false,
+            linear_alignment: false,
+            entrapment_tag: String::new(),
+            localization: false,
+            localization_decoys: "A".into(),
             extra: Map::new(),
             extra_database: Map::new(),
             extra_enzyme: Map::new(),
@@ -900,20 +1063,20 @@ const TOP_KEYS: &[&str] = &[
     "isotope_errors", "deisotope", "chimera", "wide_window", "min_peaks", "max_peaks",
     "max_fragment_charge", "min_matched_peaks", "report_psms", "score_type", "predict_rt",
     "protein_grouping", "protein_grouping_peptide_fdr", "write_pin", "write_report",
-    "write_annotator", "annotate_matches", "quant", "crosslink", "mzml_paths", "output_directory",
+    "write_annotator", "annotate_matches", "diagnostic_ions", "retention_time_alignment", "entrapment", "localization", "quant", "crosslink", "mzml_paths", "output_directory",
 ];
 const DATABASE_KEYS: &[&str] = &[
     "fasta", "enzyme", "peptide_min_mass", "peptide_max_mass", "ion_kinds", "min_ion_index",
     "static_mods", "variable_mods", "max_variable_mods", "max_combinations", "generate_decoys",
     "decoy_tag", "bucket_size", "prefilter", "prefilter_chunk_size", "prefilter_low_memory", "silac",
-    "labelled_proteins", "crosslink_databases",
+    "labelled_proteins", "crosslink_databases", "clip_n_term_met", "site_library",
 ];
 const ENZYME_KEYS: &[&str] = &[
     "missed_cleavages", "min_len", "max_len", "cleave_at", "restrict", "c_terminal", "enzymes",
     "semi_enzymatic",
 ];
 const QUANT_KEYS: &[&str] = &["lfq", "tmt", "tmt_settings", "lfq_settings"];
-const LFQ_KEYS: &[&str] = &["ppm_tolerance", "peptide_q_value", "combine_charge_states", "spectral_angle"];
+const LFQ_KEYS: &[&str] = &["ppm_tolerance", "peptide_q_value", "combine_charge_states", "spectral_angle", "long_form"];
 
 impl Settings {
     /// Two-database crosslink search: Database 1 or 2 set (they replace the
@@ -967,6 +1130,11 @@ fn parse_silac(v: Option<&Value>, d: &Settings) -> (Silac, (f64, f64), (f64, f64
     };
     let channels: Vec<&Value> = silac.get("channels").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
     let mixed = silac.get("mixed_crosslinks").and_then(Value::as_bool).unwrap_or(false);
+    // dimethyl: the light channel is labelled too
+    if silac.get("light").and_then(Value::as_object).is_some_and(|l| !l.is_empty()) {
+        let mode = if channels.len() >= 2 { Silac::DimethylTriplex } else { Silac::DimethylDuplex };
+        return (mode, d.silac_medium, d.silac_heavy, mixed);
+    }
     match channels[..] {
         [heavy] => (Silac::Duplex, d.silac_medium, labels(heavy), mixed),
         [medium, heavy, ..] => (Silac::Triplex, labels(medium), labels(heavy), mixed),
@@ -1042,6 +1210,28 @@ fn mod_entry(m: &Modification) -> Value {
     if !m.name.trim().is_empty() {
         e.insert("name".into(), json!(m.name.trim()));
     }
+    if m.position != SitePosition::Anywhere {
+        e.insert("position".into(), serde_json::to_value(m.position).unwrap_or_default());
+    }
+    if !m.motif.trim().is_empty() {
+        e.insert("motif".into(), json!(m.motif.trim()));
+    }
+    if let Ok(losses) = parse_losses(&m.losses) {
+        if !losses.is_empty() {
+            e.insert("neutral_losses".into(), json!(losses));
+        }
+    }
+    if m.kind == ModKind::Variable {
+        match m.search {
+            ModSearch::Indexed => {}
+            ModSearch::Library => {
+                e.insert("site_mode".into(), json!("library"));
+            }
+            ModSearch::Offset => {
+                e.insert("search_mode".into(), json!("mass_offset"));
+            }
+        }
+    }
     if e.len() == 1 {
         json!(m.mass)
     } else {
@@ -1059,13 +1249,51 @@ fn parse_mod_entry(target: &str, v: &Value, kind: ModKind) -> Option<Modificatio
         ),
         _ => return None,
     };
+    let field = |k: &str| v.as_object().and_then(|o| o.get(k));
     Some(Modification {
         target: target.into(),
         mass,
         name,
         kind,
         max_count,
+        position: field("position").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default(),
+        motif: str_or(field("motif"), ""),
+        losses: field("neutral_losses")
+            .and_then(Value::as_array)
+            .map(|l| l.iter().filter_map(Value::as_f64).map(|x| x.to_string()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default(),
+        search: if field("search_mode").and_then(Value::as_str) == Some("mass_offset") {
+            ModSearch::Offset
+        } else if field("site_mode").and_then(Value::as_str) == Some("library") {
+            ModSearch::Library
+        } else {
+            ModSearch::Indexed
+        },
     })
+}
+
+/// A configuration key's modifications: named and rule keys
+/// (`internal_residue:K`, `motif:N-{P}-[ST]`) become a target with the rule
+fn mods_of_key(key: &str, v: &Value, kind: ModKind) -> Vec<Modification> {
+    let Some(m) = parse_mod_entry(key, v, kind) else { return Vec::new() };
+    match sage_core::site_rules::parse_site_key(key) {
+        Ok(sites) => sites
+            .into_iter()
+            .map(|(specificity, rule)| {
+                let mut m = m.clone();
+                m.target = specificity.to_string();
+                if !rule.position.is_anywhere() {
+                    m.position = rule.position;
+                }
+                if let Some(motif) = rule.motif {
+                    m.motif = motif.pattern().to_string();
+                }
+                m
+            })
+            .collect(),
+        // kept as written; check() reports it
+        Err(_) => vec![m],
+    }
 }
 
 impl Settings {
@@ -1155,6 +1383,16 @@ impl Settings {
             db.insert("max_combinations".into(), json!(n));
         }
         db.insert("generate_decoys".into(), json!(self.generate_decoys));
+        // only when on (off is Sage's default), so configs still run in an older sage.exe
+        if self.clip_n_term_met {
+            db.insert("clip_n_term_met".into(), json!(true));
+        }
+        if !self.site_library.trim().is_empty() {
+            db.insert(
+                "site_library".into(),
+                json!({"path": self.site_library.trim(), "max_q": self.site_library_q}),
+            );
+        }
         db.insert("decoy_tag".into(), json!(self.decoy_tag));
         db.insert("bucket_size".into(), json!(self.bucket_size));
         db.insert("prefilter".into(), json!(self.prefilter));
@@ -1180,6 +1418,10 @@ impl Settings {
         lfq.insert("peptide_q_value".into(), json!(self.lfq_q));
         lfq.insert("combine_charge_states".into(), json!(self.lfq_combine_charges));
         lfq.insert("spectral_angle".into(), json!(self.lfq_spectral_angle));
+        // on by default in sage.exe: written only when off
+        if !self.lfq_long_form {
+            lfq.insert("long_form".into(), json!(false));
+        }
         quant.insert("lfq_settings".into(), Value::Object(lfq));
         if let Some(tmt) = self.tmt.key() {
             quant.insert("tmt".into(), json!(tmt));
@@ -1190,6 +1432,18 @@ impl Settings {
         }
 
         let mut top = self.extra.clone();
+        // the one key of bruker_config the GUI edits; the rest stays as loaded
+        let bruker = top.entry("bruker_config").or_insert_with(|| json!({}));
+        if let Some(bruker) = bruker.as_object_mut() {
+            if self.linear_mobility {
+                bruker.insert("ion_mobility_scale".into(), json!("linear"));
+            } else {
+                bruker.remove("ion_mobility_scale");
+            }
+        }
+        if top.get("bruker_config").and_then(Value::as_object).is_some_and(|b| b.is_empty()) {
+            top.remove("bruker_config");
+        }
         top.insert("database".into(), Value::Object(db));
         top.insert("precursor_tol".into(), self.precursor_tol.to_json());
         top.insert("fragment_tol".into(), self.fragment_tol.to_json());
@@ -1230,6 +1484,22 @@ impl Settings {
         top.insert("write_pin".into(), json!(self.write_pin));
         top.insert("write_report".into(), json!(self.write_report));
         top.insert("write_annotator".into(), json!(self.write_annotator));
+        if self.localization {
+            let decoys: String = self.localization_decoys.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+            let decoys = if decoys.is_empty() { "A".to_string() } else { decoys.to_ascii_uppercase() };
+            top.insert("localization".into(), json!({"decoy_residues": decoys}));
+        }
+        if !self.entrapment_tag.trim().is_empty() {
+            top.insert("entrapment".into(), json!({"tag": self.entrapment_tag.trim()}));
+        }
+        // only when not the default (nonlinear)
+        if self.linear_alignment {
+            top.insert("retention_time_alignment".into(), json!("linear"));
+        }
+        // only when on (off is Sage's default)
+        if self.diagnostic_ions {
+            top.insert("diagnostic_ions".into(), self.diagnostic_ions_list.clone().unwrap_or(json!(true)));
+        }
         top.insert("annotate_matches".into(), json!(self.annotate_matches));
         top.insert("quant".into(), Value::Object(quant));
         if self.crosslink.enabled {
@@ -1258,17 +1528,22 @@ impl Settings {
         let mut mods = Vec::new();
         if let Some(fixed) = dbv("static_mods").and_then(Value::as_object) {
             for (target, entry) in fixed {
-                mods.extend(parse_mod_entry(target, entry, ModKind::Fixed));
+                mods.extend(mods_of_key(target, entry, ModKind::Fixed));
             }
+        }
+        // Sage adds dimethyl's light label as a fixed modification (a search's
+        // own configuration lists it): it is part of the dimethyl setting
+        if silac.0.is_dimethyl() {
+            mods.retain(|m| !is_light_dimethyl(m));
         }
         if let Some(var) = dbv("variable_mods").and_then(Value::as_object) {
             for (target, entries) in var {
                 match entries {
                     Value::Array(list) => mods.extend(
                         list.iter()
-                            .filter_map(|e| parse_mod_entry(target, e, ModKind::Variable)),
+                            .flat_map(|e| mods_of_key(target, e, ModKind::Variable)),
                     ),
-                    e => mods.extend(parse_mod_entry(target, e, ModKind::Variable)),
+                    e => mods.extend(mods_of_key(target, e, ModKind::Variable)),
                 }
             }
         }
@@ -1323,7 +1598,13 @@ impl Settings {
             prefilter: bool_or(dbv("prefilter"), d.prefilter),
             prefilter_chunk_size: u32_or(dbv("prefilter_chunk_size"), d.prefilter_chunk_size),
             prefilter_low_memory: bool_or(dbv("prefilter_low_memory"), d.prefilter_low_memory),
+            clip_n_term_met: bool_or(dbv("clip_n_term_met"), d.clip_n_term_met),
             mods,
+            site_library: str_or(dbv("site_library").and_then(|l| l.get("path")), ""),
+            site_library_q: dbv("site_library")
+                .and_then(|l| l.get("max_q"))
+                .and_then(Value::as_f64)
+                .unwrap_or(d.site_library_q),
             precursor_tol: top
                 .get("precursor_tol")
                 .and_then(Tolerance::from_json)
@@ -1361,11 +1642,18 @@ impl Settings {
             write_report: bool_or(top.get("write_report"), d.write_report),
             // absent from a file means off, as in Sage
             write_annotator: bool_or(top.get("write_annotator"), false),
+            diagnostic_ions: match top.get("diagnostic_ions") {
+                Some(Value::Bool(on)) => *on,
+                Some(Value::Array(_)) => true,
+                _ => false,
+            },
+            diagnostic_ions_list: top.get("diagnostic_ions").filter(|v| v.is_array()).cloned(),
             annotate_matches: bool_or(top.get("annotate_matches"), d.annotate_matches),
             lfq: bool_or(quant.and_then(|q| q.get("lfq")), false),
             lfq_ppm: f64_or(lv("ppm_tolerance"), d.lfq_ppm),
             lfq_q: f64_or(lv("peptide_q_value"), d.lfq_q),
             lfq_combine_charges: bool_or(lv("combine_charge_states"), d.lfq_combine_charges),
+            lfq_long_form: bool_or(lv("long_form"), d.lfq_long_form),
             lfq_spectral_angle: f64_or(lv("spectral_angle"), d.lfq_spectral_angle),
             tmt,
             tmt_level: tmt_settings
@@ -1385,6 +1673,25 @@ impl Settings {
                 .and_then(Value::as_object)
                 .map(Crosslink::from_json)
                 .unwrap_or_default(),
+            linear_alignment: top.get("retention_time_alignment").and_then(Value::as_str) == Some("linear"),
+            localization: top.get("localization").is_some_and(|l| l.is_object()),
+            localization_decoys: top
+                .get("localization")
+                .and_then(|l| l.get("decoy_residues"))
+                .and_then(Value::as_str)
+                .unwrap_or("A")
+                .to_string(),
+            entrapment_tag: top
+                .get("entrapment")
+                .and_then(|e| e.get("tag"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            linear_mobility: top
+                .get("bruker_config")
+                .and_then(|b| b.get("ion_mobility_scale"))
+                .and_then(Value::as_str)
+                == Some("linear"),
             extra: unknown_keys(Some(top), TOP_KEYS),
             extra_database: unknown_keys(db, DATABASE_KEYS),
             extra_enzyme: unknown_keys(enzyme, ENZYME_KEYS),
@@ -1408,6 +1715,19 @@ impl Settings {
             Silac::Off => return None,
             Silac::Duplex => vec![channel("heavy", self.silac_heavy)],
             Silac::Triplex => vec![channel("medium", self.silac_medium), channel("heavy", self.silac_heavy)],
+            Silac::DimethylDuplex | Silac::DimethylTriplex => {
+                // sage_core::silac::SilacSettings::dimethyl, with the masses as written
+                let sites = |mass: f64| json!({ "K": mass, "^": mass });
+                let mut channels = vec![json!({ "name": "medium", "labels": sites(32.056407) })];
+                if self.silac == Silac::DimethylTriplex {
+                    channels.push(json!({ "name": "heavy", "labels": sites(36.07567) }));
+                }
+                return Some(json!({
+                    "light": sites(28.0313),
+                    "channels": channels,
+                    "mixed_crosslinks": self.silac_mixed,
+                }));
+            }
         };
         Some(json!({ "channels": channels, "mixed_crosslinks": self.silac_mixed }))
     }
@@ -1444,7 +1764,37 @@ impl Settings {
                 if self.include_unlabelled { " and unlabelled" } else { " only (not unlabelled)" }
             ));
         }
-        if self.silac != Silac::Off {
+        if self.silac.is_dimethyl() {
+            let clash: Vec<&str> = self
+                .mods
+                .iter()
+                .filter(|m| m.kind == ModKind::Fixed && (m.target == "K" || m.target == "^") && !is_light_dimethyl(m))
+                .map(|m| m.target.as_str())
+                .collect();
+            if !clash.is_empty() {
+                errors.push(format!(
+                    "Dimethyl labelling puts the light label (+28.0313) on K and the peptide N-terminus as a fixed \
+                     modification: remove the other fixed modification on {}.",
+                    clash.join(" and ")
+                ));
+            }
+            warnings.push(format!(
+                "Dimethyl: every peptide is searched in {} label states (light +28.0313, medium +32.0564{} on K and \
+                 the peptide N-terminus), so the search takes about {} times as long. Ratios to light are written to \
+                 silac.sage.tsv and silac_proteins.sage.tsv; they need MS1 spectra.",
+                self.silac.states(),
+                if self.silac == Silac::DimethylTriplex { ", heavy +36.0757" } else { "" },
+                self.silac.states()
+            ));
+            if self.crosslink.enabled {
+                warnings.push(
+                    "Dimethyl with crosslinking: every lysine is searched dimethylated, so crosslinks through \
+                     lysine are not found. Dimethyl labelling suits linkers on other residues."
+                        .into(),
+                );
+            }
+        }
+        if self.silac.is_residue_silac() {
             let mut channels = vec![("heavy", self.silac_heavy)];
             if self.silac == Silac::Triplex {
                 channels.push(("medium", self.silac_medium));
@@ -1457,7 +1807,7 @@ impl Settings {
                     errors.push(format!("SILAC: the {name} channel labels neither K nor R."));
                 }
             }
-            let n = if self.silac == Silac::Triplex { 3 } else { 2 };
+            let n = self.silac.states();
             warnings.push(format!(
                 "SILAC: every peptide is searched in {n} label states, so the search takes about {n} times as long. \
                  Ratios to light are written to silac.sage.tsv and silac_proteins.sage.tsv{}; they need MS1 spectra.",
@@ -1538,10 +1888,64 @@ impl Settings {
             errors.push("Select at least one fragment ion type.".into());
         }
 
+        let variable = |search: ModSearch| -> Vec<&Modification> {
+            self.mods.iter().filter(|m| m.kind == ModKind::Variable && m.search == search).collect()
+        };
+        let (offsets, library_mods) = (variable(ModSearch::Offset), variable(ModSearch::Library));
+        let library = self.site_library.trim();
+        if !library_mods.is_empty() && library.is_empty() {
+            errors.push("Modifications searched at library sites need a site library (Modifications tab).".into());
+        }
+        if !library.is_empty() {
+            if sage_cloudpath::try_parse_url(library).is_none_or(|u| u.scheme() == "file")
+                && !std::path::Path::new(library).is_file()
+            {
+                errors.push(format!("Site library not found: {library}"));
+            }
+            if library_mods.is_empty() {
+                warnings.push(
+                    "A site library is set, but no variable modification is searched at library sites: it is not used."
+                        .into(),
+                );
+            }
+        }
+        if !library_mods.is_empty() && !self.generate_decoys {
+            errors.push(
+                "Library sites need generated decoys (Database & enzyme tab): decoys must carry their targets' sites."
+                    .into(),
+            );
+        }
+        if !offsets.is_empty() {
+            if self.crosslink.enabled {
+                errors.push("Mass offsets are for linear searches: turn crosslinking off, or search the modification indexed.".into());
+            }
+            if self.silac != Silac::Off || !self.labelled_proteins.is_empty() {
+                errors.push("Mass offsets cannot be combined with SILAC, dimethyl or labelled proteins.".into());
+            }
+            for o in &offsets {
+                let indexed = self.mods.iter().any(|m| {
+                    m.kind == ModKind::Variable
+                        && m.search != ModSearch::Offset
+                        && (m.mass - o.mass).abs() < 1e-6
+                        && m.name.trim() == o.name.trim()
+                });
+                if indexed {
+                    errors.push(format!(
+                        "{} ({:+}) is both indexed and a mass offset: search it one way.",
+                        if o.name.trim().is_empty() { "A modification" } else { o.name.trim() },
+                        o.mass
+                    ));
+                }
+            }
+        }
+
         let mut fixed_targets = std::collections::HashSet::new();
         for m in &self.mods {
             if let Err(e) = check_target(&m.target) {
                 errors.push(format!("Modification target {e}"));
+            }
+            if let Some(e) = rule_problem(m) {
+                errors.push(format!("Modification {e}"));
             }
             if m.kind == ModKind::Fixed && !fixed_targets.insert(m.target.clone()) {
                 errors.push(format!(
@@ -1677,18 +2081,70 @@ mod test {
         s.crosslink.custom_cleavable = true;
         s.crosslink.stub_alt = "85.98264".into();
         s.crosslink.backend = Backend::Reflect;
+        s.clip_n_term_met = true;
         let mut v = s.to_json(&["a.mzML".to_string()]);
-        v["bruker_config"] = json!({"ms2": {}});
+        v["bruker_config"] = json!({"ms2": {}, "ion_mobility_scale": "linear"});
         v["database"]["enzyme"]["future_key"] = json!(1);
 
         let back = Settings::from_json(&v).unwrap();
         let v2 = back.to_json(&back.spectra);
         // everything, including keys the GUI does not edit, must survive
         assert_eq!(v, v2);
-        assert_eq!(v["database"]["variable_mods"]["S"], json!([{"mass": 79.966331, "max_count": 2, "name": "UNIMOD:21"}]));
+        assert_eq!(
+            v["database"]["variable_mods"]["S"],
+            json!([{"mass": 79.966331, "max_count": 2, "name": "UNIMOD:21", "neutral_losses": [97.976896]}])
+        );
         assert_eq!(v["database"]["static_mods"]["C"], json!({"mass": 57.021464, "name": "UNIMOD:4"}));
         assert!(v["database"].get("peptide_min_mass").is_none());
         assert_eq!(v["crosslink"]["cleavable"]["alt"], json!([85.98264]));
+        assert_eq!(v["database"]["clip_n_term_met"], json!(true));
+        assert!(back.linear_mobility, "the linear 1/K0 scale is read");
+        let mut linear = Settings::default();
+        linear.linear_alignment = true;
+        assert_eq!(linear.to_json(&[])["retention_time_alignment"], json!("linear"));
+        assert!(Settings::from_json(&linear.to_json(&[])).unwrap().linear_alignment);
+        assert!(Settings::default().to_json(&[]).get("retention_time_alignment").is_none());
+        // the long-form LFQ table is on unless switched off
+        let mut short = Settings::default();
+        assert!(short.to_json(&[])["quant"]["lfq_settings"].get("long_form").is_none());
+        short.lfq_long_form = false;
+        assert_eq!(short.to_json(&[])["quant"]["lfq_settings"]["long_form"], json!(false));
+        assert!(!Settings::from_json(&short.to_json(&[])).unwrap().lfq_long_form);
+        assert!(Settings::from_json(&Settings::default().to_json(&[])).unwrap().lfq_long_form);
+
+        // localization: off by default, {"decoy_residues": ...} when on
+        let mut localized = Settings::default();
+        assert!(localized.to_json(&[]).get("localization").is_none());
+        localized.localization = true;
+        localized.localization_decoys = "al".into();
+        assert_eq!(localized.to_json(&[])["localization"], json!({"decoy_residues": "AL"}));
+        let reread = Settings::from_json(&localized.to_json(&[])).unwrap();
+        assert!(reread.localization && reread.localization_decoys == "AL");
+        let core: sage_core::localization::LocalizationSettings =
+            serde_json::from_value(localized.to_json(&[])["localization"].clone()).unwrap();
+        assert_eq!(core.decoy_residues, "AL");
+
+        let mut entrapment = Settings::default();
+        entrapment.entrapment_tag = "ENTRAP_".into();
+        assert_eq!(entrapment.to_json(&[])["entrapment"], json!({"tag": "ENTRAP_"}));
+        assert_eq!(Settings::from_json(&entrapment.to_json(&[])).unwrap().entrapment_tag, "ENTRAP_");
+        assert!(Settings::default().to_json(&[]).get("entrapment").is_none());
+        let mut calibrated = back.clone();
+        calibrated.linear_mobility = false;
+        assert_eq!(calibrated.to_json(&[])["bruker_config"], json!({"ms2": {}}), "the rest of bruker_config stays");
+        assert!(Settings::default().to_json(&[]).get("bruker_config").is_none());
+        assert!(back.clip_n_term_met);
+        // off is Sage's default: not written
+        assert!(Settings::default().to_json(&[]).get("database").and_then(|d| d.get("clip_n_term_met")).is_none());
+        // diagnostic ions: off by default, true when on, a custom list kept as written
+        assert!(Settings::default().to_json(&[]).get("diagnostic_ions").is_none());
+        let mut on = Settings::default();
+        on.diagnostic_ions = true;
+        assert_eq!(on.to_json(&[])["diagnostic_ions"], json!(true));
+        let list = json!([{"name": "TMT126", "mz": 126.127726}]);
+        let loaded = Settings::from_json(&json!({"diagnostic_ions": list})).unwrap();
+        assert!(loaded.diagnostic_ions);
+        assert_eq!(loaded.to_json(&[])["diagnostic_ions"], list);
     }
 
     #[test]
@@ -1845,6 +2301,158 @@ mod test {
         assert_eq!(v["database"]["silac"]["channels"].as_array().unwrap().len(), 1);
         assert!(v["database"]["silac"]["channels"][0]["labels"].get("R").is_none());
         assert_eq!(Settings::from_json(&v).unwrap().silac_heavy, (8.014199, 0.0));
+    }
+
+    /// Position, motif and neutral losses are written as Sage reads them, and
+    /// named / rule keys of a configuration become rows
+    #[test]
+    fn mass_offsets_and_site_library_round_trip() {
+        let mut s = Settings::default();
+        s.mods.push(Modification {
+            target: "K".into(),
+            mass: 176.01433,
+            name: "DSSO_OH".into(),
+            kind: ModKind::Variable,
+            position: SitePosition::NotCTerm,
+            losses: "122.00377".into(),
+            search: ModSearch::Offset,
+            ..Default::default()
+        });
+        let mut phospho: Modification = PRESETS.iter().find(|p| p.name == "UNIMOD:21" && p.target == "S").unwrap().into();
+        phospho.search = ModSearch::Library;
+        s.mods.push(phospho);
+        let dir = std::env::temp_dir().join(format!("xnova_sites_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sites = dir.join("sites.tsv");
+        std::fs::write(&sites, "protein	position	residue	modification
+P1	3	S	UNIMOD:21
+").unwrap();
+        s.site_library = sites.display().to_string();
+        s.site_library_q = 0.05;
+        let v = s.to_json(&[]);
+        let db = &v["database"];
+        assert_eq!(db["variable_mods"]["K"][0]["search_mode"], json!("mass_offset"));
+        assert_eq!(db["variable_mods"]["S"][0]["site_mode"], json!("library"));
+        assert_eq!(db["site_library"], json!({"path": s.site_library, "max_q": 0.05}));
+        // Sage reads it
+        let builder: sage_core::database::Builder = serde_json::from_value(json!({
+            "fasta": "x",
+            "variable_mods": db["variable_mods"].clone(),
+            "site_library": db["site_library"].clone(),
+        }))
+        .unwrap();
+        let params = builder.make_parameters().unwrap();
+        assert_eq!(params.modifications.offset_mods.len(), 1);
+        assert!(params.modifications.has_library_mods());
+        let back = Settings::from_json(&v).unwrap();
+        assert_eq!(back.mods.iter().find(|m| m.target == "K").unwrap().search, ModSearch::Offset);
+        assert_eq!(back.mods.iter().find(|m| m.target == "S").unwrap().search, ModSearch::Library);
+        assert_eq!((back.site_library.as_str(), back.site_library_q), (s.site_library.as_str(), 0.05));
+        assert!(back.to_json(&[])["database"].get("site_library").is_some());
+        let errors = s.check().0;
+        assert!(!errors.iter().any(|e| e.contains("offset") || e.contains("library") || e.contains("Site library")), "{errors:?}");
+
+        // checked
+        let mut bad = s.clone();
+        bad.site_library.clear();
+        bad.crosslink.enabled = true;
+        bad.mods.push(Modification { target: "K".into(), mass: 176.01433, name: "DSSO_OH".into(), kind: ModKind::Variable, ..Default::default() });
+        bad.mods.push(Modification { target: "^".into(), mass: 42.0106, kind: ModKind::Variable, search: ModSearch::Library, ..Default::default() });
+        bad.mods.push(Modification { target: "N".into(), mass: 1.0, kind: ModKind::Variable, motif: "N-x-[ST]".into(), search: ModSearch::Offset, ..Default::default() });
+        let errors = bad.check().0;
+        for needle in ["need a site library", "linear searches", "both indexed and a mass offset", "library sites need a single residue", "cannot have a motif"] {
+            assert!(errors.iter().any(|e| e.contains(needle)), "{needle}: {errors:?}");
+        }
+        // a fixed modification is always indexed
+        let mut fixed = Modification { target: "C".into(), mass: 57.021464, kind: ModKind::Fixed, search: ModSearch::Offset, ..Default::default() };
+        assert!(mod_entry(&fixed).is_number());
+        fixed.kind = ModKind::Variable;
+        assert_eq!(mod_entry(&fixed)["search_mode"], json!("mass_offset"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn modification_rules_round_trip() {
+        let mut s = Settings::default();
+        s.mods.push(Modification {
+            target: "N".into(),
+            mass: 0.984016,
+            name: "UNIMOD:7".into(),
+            kind: ModKind::Variable,
+            motif: "N-{P}-[ST]".into(),
+            ..Default::default()
+        });
+        s.mods.push(Modification {
+            target: "K".into(),
+            mass: 114.042927,
+            name: "UNIMOD:121".into(),
+            kind: ModKind::Variable,
+            position: SitePosition::NotCTerm,
+            ..Default::default()
+        });
+        s.mods.push(PRESETS.iter().find(|p| p.name == "UNIMOD:21" && p.target == "S").unwrap().into());
+        let v = s.to_json(&[]);
+        let var = &v["database"]["variable_mods"];
+        assert_eq!(var["N"][0]["motif"], json!("N-{P}-[ST]"));
+        assert_eq!(var["K"][0]["position"], json!("not_c_term"));
+        assert_eq!(var["S"][0]["neutral_losses"], json!([97.976896]));
+        // Sage reads it
+        let builder: sage_core::database::Builder =
+            serde_json::from_value(json!({"fasta": "x", "variable_mods": var.clone()})).unwrap();
+        assert!(builder.make_parameters().is_ok());
+        let back = Settings::from_json(&v).unwrap();
+        let n = back.mods.iter().find(|m| m.target == "N").unwrap();
+        assert_eq!(n.motif, "N-{P}-[ST]");
+        assert_eq!(back.mods.iter().find(|m| m.target == "K").unwrap().position, SitePosition::NotCTerm);
+        assert_eq!(parse_losses(&back.mods.iter().find(|m| m.target == "S").unwrap().losses).unwrap(), vec![97.976896]);
+        // keys with rules, from a hand-written configuration
+        let mut cfg = v.clone();
+        cfg["database"]["variable_mods"] = json!({"internal_residue:K": [114.042927], "motif:[ST]-P": [79.966331]});
+        let rows = Settings::from_json(&cfg).unwrap().mods;
+        assert!(rows.iter().any(|m| m.target == "K" && m.position == SitePosition::Internal));
+        assert_eq!(rows.iter().filter(|m| m.motif == "[ST]-P").count(), 2, "S and T");
+        // checked
+        let mut bad = Settings::default();
+        bad.mods.push(Modification { target: "K".into(), mass: 1.0, motif: "N-x-[ST]".into(), ..Default::default() });
+        bad.mods.push(Modification { target: "^".into(), mass: 1.0, position: SitePosition::Internal, ..Default::default() });
+        bad.mods.push(Modification { target: "S".into(), mass: 1.0, losses: "abc".into(), ..Default::default() });
+        let errors = bad.check().0;
+        assert_eq!(errors.iter().filter(|e| e.starts_with("Modification `")).count(), 3, "{errors:?}");
+    }
+
+    /// Dimethyl presets: Sage's settings, read back, light label not in the table
+    #[test]
+    fn dimethyl_round_trips_and_is_checked() {
+        let mut s = Settings::default();
+        s.silac = Silac::DimethylTriplex;
+        let v = s.to_json(&[]);
+        let silac = &v["database"]["silac"];
+        assert_eq!(silac["light"]["^"], json!(28.0313));
+        assert_eq!(silac["channels"][1]["labels"]["K"], json!(36.07567));
+        let core: sage_core::silac::SilacSettings = serde_json::from_value(silac.clone()).unwrap();
+        assert!(core.validate().is_ok());
+        assert_eq!(core, sage_core::silac::SilacSettings::dimethyl(true, true));
+        assert_eq!(core.names(), ["light", "medium", "heavy"]);
+        assert_eq!(Settings::from_json(&v).unwrap().silac, Silac::DimethylTriplex);
+        // a search's own configuration lists the light label as fixed: not shown as a modification
+        let mut echoed = v.clone();
+        echoed["database"]["static_mods"]["K"] = json!({"mass": 28.0313, "name": "UNIMOD:36"});
+        echoed["database"]["static_mods"]["^"] = json!({"mass": 28.0313, "name": "UNIMOD:36"});
+        let back = Settings::from_json(&echoed).unwrap();
+        assert!(back.mods.iter().all(|m| m.target != "K" && m.target != "^"), "{:?}", back.mods);
+        assert_eq!(back.mods.len(), s.mods.len());
+        let (errors, warnings) = s.check();
+        assert!(errors.iter().all(|e| !e.contains("Dimethyl")), "{errors:?}");
+        assert!(warnings.iter().any(|w| w.contains("Dimethyl") && w.contains("3 label states")));
+        // another fixed modification on K clashes
+        s.mods.push(Modification { target: "K".into(), mass: 229.1629, name: String::new(), kind: ModKind::Fixed, max_count: 0, ..Default::default() });
+        assert!(s.check().0.iter().any(|e| e.contains("Dimethyl") && e.contains('K')));
+        // duplex: light and medium
+        s.silac = Silac::DimethylDuplex;
+        let v = s.to_json(&[]);
+        assert_eq!(v["database"]["silac"]["channels"].as_array().unwrap().len(), 1);
+        assert_eq!(v["database"]["silac"]["channels"][0]["name"], json!("medium"));
+        assert_eq!(Settings::from_json(&v).unwrap().silac, Silac::DimethylDuplex);
     }
 
     #[test]

@@ -51,6 +51,16 @@ pub struct LfqSettings {
     pub mobility_pct_tolerance: f32,
     pub combine_charge_states: bool,
     pub peptide_q_value: f32,
+    /// How runs are aligned for tracing (also SILAC and crosslink quantification)
+    #[serde(default)]
+    pub alignment: crate::ml::retention_alignment::AlignmentMethod,
+    /// Write `lfq_long.tsv`: one row per precursor and run
+    #[serde(default = "default_long_form")]
+    pub long_form: bool,
+}
+
+fn default_long_form() -> bool {
+    true
 }
 
 impl Default for LfqSettings {
@@ -63,6 +73,8 @@ impl Default for LfqSettings {
             mobility_pct_tolerance: 1.0,
             combine_charge_states: true,
             peptide_q_value: 0.01,
+            alignment: Default::default(),
+            long_form: true,
         }
     }
 }
@@ -237,8 +249,7 @@ impl FeatureMap {
             log::warn!("no MS1 spectra found for quantification");
         } else {
             spectra.par_iter().for_each(|spectrum| {
-                let a = alignments[spectrum.file_id];
-                let rt = (spectrum.scan_start_time / a.max_rt) * a.slope + a.intercept;
+                let rt = alignments[spectrum.file_id].transform(spectrum.scan_start_time);
                 let query = self.rt_slice(rt, RT_TOL);
 
                 let add_entry = |entry: &PrecursorRange, intensity: f32| {
@@ -330,6 +341,11 @@ pub struct Traces {
     pub spectral_angle: Matrix,
     /// File with the most confident PSM
     reference_file_id: usize,
+    /// Aligned retention time of bin 0, and the width of a bin
+    rt_min: f32,
+    rt_step: f32,
+    /// Each file's time warp (bins): warped bin `i` holds the file's bin `i + warp`
+    warps: Vec<isize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -342,6 +358,30 @@ pub struct Peak {
     pub score: f64,
 
     pub q_value: f32,
+    /// Each run's view of the peak (`lfq_long.tsv`)
+    pub files: Vec<PeakFile>,
+}
+
+/// One run's view of an integrated peak (adapted from Sage Plus, MIT). Times
+/// are aligned (the runs' common scale); [`Alignment::inverse`] turns them
+/// back into the run's own retention times.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeakFile {
+    /// This run's apex inside the shared integration window
+    pub apex_rt: f32,
+    /// The shared integration window, in this run's (time-warped) frame
+    pub start_rt: f32,
+    pub end_rt: f32,
+    /// Where the smoothed trace crosses half the apex height (FWHM bounds)
+    pub half_start_rt: f32,
+    pub half_end_rt: f32,
+    /// Intensity-weighted normalized spectral angle in the window
+    pub spectral_angle: f64,
+    /// Extraction score, `spectral_angle * ln(1 + area)`: compared with the
+    /// paired decoy's in the same run for the row-level q-value
+    pub score: f64,
+    /// Row-level extraction q-value (see `fdr::picked_precursor_rows`)
+    pub q_value: f32,
 }
 
 impl Traces {
@@ -350,6 +390,59 @@ impl Traces {
         let time_warps = self.find_time_warps(&self.dot_product, 75);
         Self::apply_time_warps(&mut self.spectral_angle, &time_warps);
         Self::apply_time_warps(&mut self.dot_product, &time_warps);
+        self.warps = time_warps;
+    }
+
+    /// This run's view of the peak integrated over `left..=right` (warped
+    /// bins) around the shared apex `apex`
+    fn peak_file(&self, file: usize, apex: usize, left: usize, right: usize, area: f64) -> PeakFile {
+        let row = self.dot_product.row_slice(file);
+        let angles = self.spectral_angle.row_slice(file);
+        // this run's own apex in the window (the shared one without signal)
+        let (apex, height) = (left..=right).fold((apex, 0.0f64), |(best, top), i| {
+            if row[i] > top {
+                (i, row[i])
+            } else {
+                (best, top)
+            }
+        });
+        let warp = self.warps.get(file).copied().unwrap_or(0) as f64;
+        let rt = |bin: f64| self.rt_min + ((bin + warp) as f32) * self.rt_step;
+
+        // half-height crossings, linearly interpolated between bins
+        let (mut half_lo, mut half_hi) = (apex as f64, apex as f64);
+        if height > 0.0 {
+            let half = height / 2.0;
+            let mut i = apex;
+            while i > 0 && row[i - 1] >= half {
+                i -= 1;
+            }
+            half_lo = match i {
+                0 => 0.0,
+                i => (i - 1) as f64 + (half - row[i - 1]) / (row[i] - row[i - 1]),
+            };
+            let mut j = apex;
+            while j + 1 < row.len() && row[j + 1] >= half {
+                j += 1;
+            }
+            half_hi = match j + 1 < row.len() {
+                true => j as f64 + (row[j] - half) / (row[j] - row[j + 1]),
+                false => j as f64,
+            };
+        }
+
+        let (weighted, summed) = (left..=right).fold((0.0, 0.0), |(w, s), i| (w + angles[i] * row[i], s + row[i]));
+        let spectral_angle = if summed > 0.0 { weighted / summed } else { 0.0 };
+        PeakFile {
+            apex_rt: rt(apex as f64),
+            start_rt: rt(left as f64),
+            end_rt: rt(right as f64),
+            half_start_rt: rt(half_lo),
+            half_end_rt: rt(half_hi),
+            spectral_angle,
+            score: spectral_angle * area.max(0.0).ln_1p(),
+            q_value: 1.0,
+        }
     }
 
     /// Find time warping offsets for each file that maximize the dot product
@@ -510,6 +603,11 @@ impl Traces {
             summed_int += dotp;
         }
         best.spectral_angle = weighted / summed_int;
+        best.files = areas
+            .iter()
+            .enumerate()
+            .map(|(file, &area)| self.peak_file(file, best.rt, left, right, area))
+            .collect();
         Some((best, areas))
     }
 }
@@ -625,6 +723,9 @@ impl Grid {
             dot_product,
             spectral_angle,
             reference_file_id: self.reference_file_id,
+            rt_min: self.rt_min,
+            rt_step: self.rt_step,
+            warps: vec![0; self.files],
         }
     }
 }
@@ -758,7 +859,40 @@ mod alignment_integration_tests {
             dot_product: Matrix::new(rows.into_iter().flatten().collect::<Vec<_>>(), n, cols),
             spectral_angle: Matrix::new(vec![1.0; n * cols], n, cols),
             reference_file_id: 0,
+            rt_min: 0.0,
+            rt_step: 0.01,
+            warps: vec![0; n],
         }
+    }
+
+    /// Each run's apex, bounds and FWHM, in that run's own (unwarped) frame
+    #[test]
+    fn per_run_peak_details() {
+        // a triangle peak at bin 50 (height 100, half height at 45 and 55),
+        // and the same peak 10 bins later in the second run
+        let triangle = |center: usize| {
+            let mut row = vec![0.0; 100];
+            for (i, x) in row.iter_mut().enumerate() {
+                *x = (100.0 - 10.0 * (i as f64 - center as f64).abs()).max(0.0);
+            }
+            row
+        };
+        let mut t = traces(vec![triangle(50), triangle(60), vec![0.0; 100]]);
+        let (peak, areas) = t.integrate(&settings()).unwrap();
+        assert_eq!(peak.files.len(), 3);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        let (first, second, empty) = (&peak.files[0], &peak.files[1], &peak.files[2]);
+        assert!(close(first.apex_rt, 0.50) && close(second.apex_rt, 0.60), "{first:?} {second:?}");
+        assert!(close(first.half_start_rt, 0.45) && close(first.half_end_rt, 0.55), "{first:?}");
+        assert!(close(second.half_start_rt, 0.55) && close(second.half_end_rt, 0.65), "{second:?}");
+        assert!(first.start_rt <= first.apex_rt && first.apex_rt <= first.end_rt);
+        assert!(close(second.start_rt - first.start_rt, 0.10));
+        assert!((first.spectral_angle - 1.0).abs() < 1e-9);
+        assert!((first.score - areas[0].ln_1p()).abs() < 1e-9);
+        // a run without signal: no width, no score
+        assert_eq!(empty.score, 0.0);
+        assert!(close(empty.half_start_rt, empty.half_end_rt));
+        assert!(peak.files.iter().all(|f| f.q_value == 1.0));
     }
 
     fn settings() -> LfqSettings {

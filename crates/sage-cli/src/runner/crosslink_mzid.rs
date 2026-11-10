@@ -592,6 +592,10 @@ pub fn mzid_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Strin
                 ms("MS:1001062", "Mascot MGF format", None),
                 ms("MS:1000774", "multiple peak list nativeID format", None),
             ),
+            SpectrumKind::ThermoRaw => (
+                ms("MS:1000563", "Thermo RAW format", None),
+                ms("MS:1000768", "Thermo nativeID format", None),
+            ),
             SpectrumKind::Other => (ms("MS:1002817", "Bruker TDF format", None), ms("MS:1000824", "no nativeID format", None)),
         };
         let _ = write!(

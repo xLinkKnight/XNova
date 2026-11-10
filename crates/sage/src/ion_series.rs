@@ -92,6 +92,41 @@ impl<'p> Iterator for IonSeries<'p> {
     }
 }
 
+/// Modified sites whose fragments lose a neutral mass (phospho on S/T):
+/// `(position, loss)`, the position a residue index, `-1` for the
+/// N-terminus or the peptide length for the C-terminus. A prefix (a/b/c)
+/// fragment at index `i` contains the sites at positions `<= i`, a suffix
+/// (x/y/z) fragment those `> i`.
+pub fn lossy_sites(peptide: &Peptide, mods: &Modifications) -> Vec<(isize, f32)> {
+    let mut out = Vec::new();
+    if let Some(m) = peptide.nterm {
+        out.extend(mods.neutral_losses(m, 0).map(|l| (-1, l)));
+    }
+    for (i, (m, &r)) in peptide.modifications.iter().zip(peptide.sequence.iter()).enumerate() {
+        if let Some(m) = m {
+            out.extend(mods.neutral_losses(*m, r).map(|l| (i as isize, l)));
+        }
+    }
+    if let Some(m) = peptide.cterm {
+        let n = peptide.sequence.len() as isize;
+        out.extend(mods.neutral_losses(m, 0).map(|l| (n, l)));
+    }
+    out
+}
+
+/// The distinct losses of fragment `idx` of `kind`, from [`lossy_sites`]
+pub fn fragment_losses(kind: Kind, idx: usize, lossy: &[(isize, f32)]) -> Vec<f32> {
+    let prefix = matches!(kind, Kind::A | Kind::B | Kind::C);
+    let mut losses: Vec<f32> = lossy
+        .iter()
+        .filter(|(site, _)| if prefix { *site <= idx as isize } else { *site > idx as isize })
+        .map(|&(_, loss)| loss)
+        .collect();
+    losses.sort_by(f32::total_cmp);
+    losses.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    losses
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -418,5 +453,24 @@ mod test {
             ions!(&peptide, Kind::ZRadical, 1.0, &mods),
             &expected_z_radical,
         );
+    }
+
+    /// Lossy sites and the losses of each fragment
+    #[test]
+    fn neutral_loss_fragments() {
+        let mut mods = Modifications::default();
+        let phospho = mods.insert(79.966331, None).unwrap();
+        mods.add_neutral_loss(phospho, b'S', 97.976896);
+        let mut p = peptide("PESTIDEK");
+        p.modifications[2] = Some(phospho); // S
+        p.modifications[3] = Some(phospho); // T: no loss configured
+        let lossy = lossy_sites(&p, &mods);
+        assert_eq!(lossy.len(), 1);
+        assert_eq!(lossy[0].0, 2);
+        // b1, b2 do not contain S; b3 does; y ions from the C-terminal side up to S
+        assert!(fragment_losses(Kind::B, 1, &lossy).is_empty());
+        assert_eq!(fragment_losses(Kind::B, 2, &lossy).len(), 1);
+        assert_eq!(fragment_losses(Kind::Y, 1, &lossy).len(), 1, "y fragment after index 1 holds S");
+        assert!(fragment_losses(Kind::Y, 2, &lossy).is_empty());
     }
 }

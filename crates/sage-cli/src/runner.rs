@@ -30,6 +30,11 @@ mod annotator_export;
 mod crosslink_export;
 mod crosslink_mzid;
 mod crosslink_runner;
+mod entrapment;
+mod lfq_long;
+mod qc;
+mod sites;
+pub use qc::QcReport;
 mod silac_tables;
 mod summary_tables;
 
@@ -39,6 +44,8 @@ pub struct Runner {
     start: Instant,
     /// Total MS2 spectra searched (summed over all chunks), reported in telemetry
     spectra_searched: AtomicUsize,
+    /// Quality control gathered while the spectra are read
+    qc: std::sync::Mutex<qc::QcCollector>,
 }
 
 #[derive(Default)]
@@ -147,6 +154,7 @@ impl Runner {
                         parameters: parameters.clone(),
                         start,
                         spectra_searched: AtomicUsize::new(0),
+                        qc: Default::default(),
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
                     parameters.database.clone().build_from_peptides(peptides)
@@ -165,7 +173,29 @@ impl Runner {
             parameters,
             start,
             spectra_searched: AtomicUsize::new(0),
+            qc: Default::default(),
         })
+    }
+
+    /// The prefilter's scorer for one database chunk
+    fn prefilter_scorer<'db>(&self, db: &'db IndexedDatabase) -> Scorer<'db> {
+        Scorer {
+            db,
+            precursor_tol: self.parameters.precursor_tol,
+            fragment_tol: self.parameters.fragment_tol,
+            min_matched_peaks: self.parameters.min_matched_peaks,
+            min_isotope_err: self.parameters.isotope_errors.0,
+            max_isotope_err: self.parameters.isotope_errors.1,
+            min_precursor_charge: self.parameters.precursor_charge.0,
+            max_precursor_charge: self.parameters.precursor_charge.1,
+            override_precursor_charge: self.parameters.override_precursor_charge,
+            max_fragment_charge: self.parameters.max_fragment_charge,
+            chimera: self.parameters.chimera,
+            report_psms: self.parameters.report_psms + 1,
+            wide_window: self.parameters.wide_window,
+            annotate_matches: self.parameters.annotate_matches,
+            score_type: self.parameters.score_type,
+        }
     }
 
     pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
@@ -177,6 +207,9 @@ impl Runner {
                 ),
                 false => None,
             };
+        if spectra.is_none() {
+            return self.streamed_prefilter_peptides(parallel, fasta);
+        }
 
         let db_params = self.parameters.database.clone();
         // TODO: Don't generate decoys for fast searching
@@ -267,6 +300,63 @@ impl Runner {
         all_peptides
     }
 
+    /// The prefilter when the spectra do not fit in memory at once (more
+    /// files than `--batch-size`): each batch of files is read once and
+    /// searched against every database chunk in turn (each chunk is rebuilt
+    /// per batch, and once more to collect its peptides), instead of reading
+    /// every file again for every chunk. Building a chunk is deterministic, so
+    /// its peptides keep their indices across rebuilds. (Streamed prefilter,
+    /// after Sage Plus, MIT.)
+    fn streamed_prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let db_params = self.parameters.database.clone();
+        let chunks: Vec<Fasta> = fasta.iter_chunks(self.parameters.database.prefilter_chunk_size).collect();
+        let mut keep: Vec<Vec<AtomicBool>> = (0..chunks.len()).map(|_| Vec::new()).collect();
+        let batches = self.parameters.mzml_paths.len().div_ceil(parallel.max(1));
+        info!(
+            "streaming the prefilter: {} file batches, each searched against {} database chunks",
+            batches,
+            chunks.len()
+        );
+        for (batch, files) in self.parameters.mzml_paths.chunks(parallel.max(1)).enumerate() {
+            let spectra = self.read_processed_spectra(files, batch, parallel).1;
+            for (chunk_id, chunk) in chunks.iter().enumerate() {
+                let start = Instant::now();
+                let db = db_params.clone().build(chunk.clone());
+                if keep[chunk_id].is_empty() {
+                    keep[chunk_id] = (0..db.peptides.len()).map(|_| AtomicBool::new(false)).collect();
+                }
+                debug_assert_eq!(keep[chunk_id].len(), db.peptides.len());
+                log::trace!(
+                    "file batch {batch}, fasta chunk {chunk_id}: {} peptides in {}ms",
+                    db.peptides.len(),
+                    start.elapsed().as_millis()
+                );
+                let scorer = self.prefilter_scorer(&db);
+                self.peptide_filter_processed_spectra(&scorer, &spectra, &keep[chunk_id]);
+            }
+        }
+        let mut all_peptides: Vec<Peptide> = chunks
+            .into_iter()
+            .enumerate()
+            .flat_map(|(chunk_id, chunk)| {
+                let mut db = db_params.clone().build(chunk);
+                let flags = &keep[chunk_id];
+                let peptides: Vec<Peptide> = db
+                    .peptides
+                    .drain(..)
+                    .enumerate()
+                    .filter(|(ix, _)| flags.get(*ix).is_some_and(|f| f.load(Ordering::Relaxed)))
+                    .map(|(_, p)| p)
+                    .collect();
+                info!("found {} pre-filtered peptides for fasta chunk {}", peptides.len(), chunk_id);
+                peptides
+            })
+            .collect();
+        Parameters::reorder_peptides(&mut all_peptides);
+        all_peptides
+    }
+
     fn peptide_filter_processed_spectra(
         &self,
         scorer: &Scorer,
@@ -335,6 +425,11 @@ impl Runner {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counter = AtomicUsize::new(0);
         let start = Instant::now();
+        let localizer = self
+            .parameters
+            .localization
+            .as_ref()
+            .map(|s| sage_core::localization::Localizer::new(&self.parameters.database.modifications, s));
 
         let features: Vec<_> = msn_spectra
             .par_iter()
@@ -349,7 +444,13 @@ impl Runner {
                 }
                 x
             })
-            .flat_map(|spec| scorer.score(spec))
+            .flat_map(|spec| {
+                let mut features = scorer.score(spec);
+                if let Some(localizer) = &localizer {
+                    localizer.localize(scorer, spec, &mut features);
+                }
+                features
+            })
             .collect();
 
         let duration = Instant::now().duration_since(start).as_millis() as usize;
@@ -446,14 +547,16 @@ impl Runner {
             .iter()
             .all(|path| FileFormat::from(path.as_ref()).within_file_parallel());
         log::trace!("file serial read: {}", file_serial_read);
-        let inner_closure = |(idx, path)| {
+        let inner_closure = |(idx, path): (usize, &Url)| {
             let file_id = chunk_idx * batch_size + idx;
+            // Thermo .raw: MS1 scans too, for the polymer check (mzML gives them anyway)
+            let thermo = FileFormat::from(path.as_ref()) == FileFormat::ThermoRaw;
             let res = sage_cloudpath::util::read_spectra(
                 path,
                 file_id,
                 sn,
                 self.parameters.bruker_config,
-                self.requires_ms1(),
+                self.requires_ms1() || thermo,
             );
 
             match res {
@@ -483,6 +586,11 @@ impl Runner {
                 .flatten()
                 .collect()
         };
+
+        // quality control on the raw spectra, before deisotoping and trimming
+        if let Ok(mut qc) = self.qc.lock() {
+            qc.collect(&spectra.ms1, &spectra.msn, self.parameters.diagnostic_ions.as_deref());
+        }
 
         let msn_spectra = spectra
             .msn
@@ -577,6 +685,15 @@ impl Runner {
 
         //Collect all results into a single container
         let mut outputs = self.batch_files(&scorer, parallel);
+        // PSMs with a mass offset: their placed peptides get indices of their own
+        if !self.database.mass_offsets.is_empty() {
+            let placed = self.database.materialize_mass_offsets(&mut outputs.features);
+            log::trace!(
+                "mass offsets: {} PSMs with an offset, {} peptide forms",
+                placed,
+                self.database.offset_peptides.len()
+            );
+        }
 
         let alignments = if self.parameters.predict_rt {
             // Poisson probability is usually the best single feature for refining FDR.
@@ -587,9 +704,10 @@ impl Runner {
                 .par_sort_unstable_by(|a, b| a.poisson.total_cmp(&b.poisson));
             sage_core::ml::qvalue::spectrum_q_value(&mut outputs.features);
 
-            let alignments = sage_core::ml::retention_alignment::global_alignment(
+            let alignments = sage_core::ml::retention_alignment::global_alignment_with_method(
                 &mut outputs.features,
                 self.parameters.mzml_paths.len(),
+                self.parameters.quant.lfq_settings.alignment,
             );
             let _ = sage_core::ml::retention_model::predict(&self.database, &mut outputs.features);
             let _ = sage_core::ml::mobility_model::predict(&self.database, &mut outputs.features);
@@ -599,6 +717,18 @@ impl Runner {
         };
 
         let q_spectrum = self.spectrum_fdr(&mut outputs.features);
+        if !self.database.mass_offsets.is_empty() {
+            let indexed = self.database.peptides.len();
+            let with_offset = outputs
+                .features
+                .iter()
+                .filter(|f| f.label == 1 && f.spectrum_q <= 0.01 && f.peptide_idx.0 as usize >= indexed)
+                .count();
+            info!("- mass offsets: {with_offset} target PSMs at 1% FDR carry one");
+        }
+        if self.parameters.localization.is_some() {
+            sage_core::localization::assign_localization_q(&mut outputs.features, 0.01);
+        }
         let q_peptide = sage_core::fdr::picked_peptide(&self.database, &mut outputs.features);
         // Protein FDR is based exclusively on proteotypic (unique, non-shared) peptides. Shared peptides
         // are reported with protein FDR = 1.0
@@ -627,7 +757,7 @@ impl Runner {
             })
             .collect::<Vec<_>>();
 
-        let areas = alignments.and_then(|alignments| {
+        let areas = alignments.as_ref().and_then(|alignments| {
             if self.parameters.quant.lfq {
                 log::trace!("performing LFQ");
                 let mut areas = sage_core::lfq::build_feature_map(
@@ -635,11 +765,18 @@ impl Runner {
                     self.parameters.precursor_charge,
                     &outputs.features,
                 )
-                .quantify(&self.database, &outputs.ms1, &alignments);
+                .quantify(&self.database, &outputs.ms1, alignments);
 
                 let q_precursor = sage_core::fdr::picked_precursor(&mut areas);
 
                 log::info!("discovered {} target MS1 peaks at 5% FDR", q_precursor);
+                if self.parameters.quant.lfq_settings.long_form {
+                    let rows = sage_core::fdr::picked_precursor_rows(&mut areas);
+                    log::info!(
+                        "- {} precursor-run extractions at 1% row-level q (lfq_long.tsv; a diagnostic, not a match-between-runs FDR)",
+                        rows
+                    );
+                }
                 Some(areas)
             } else {
                 None
@@ -713,6 +850,12 @@ impl Runner {
                     .output_paths
                     .push(self.write_lfq(areas, &filenames)?);
             }
+            if let (Some(areas), Some(alignments)) = (&areas, &alignments) {
+                if self.parameters.quant.lfq_settings.long_form {
+                    let path = self.write_lfq_long(areas, &outputs.features, &filenames, alignments)?;
+                    self.parameters.output_paths.push(path);
+                }
+            }
         }
 
         // Peptide- and protein-level tables (1% FDR)
@@ -746,6 +889,16 @@ impl Runner {
                 &filenames,
             )?);
         }
+
+        // localized modification sites on proteins
+        if self.parameters.localization.is_some() {
+            if let Some(path) = self.write_sites(&outputs.features)? {
+                self.parameters.output_paths.push(path);
+            }
+        }
+
+        // digestion summary, polymer check, diagnostic ions
+        self.finish_qc(Some(&outputs.features), &filenames)?;
         Ok(())
     }
     pub fn serialize_feature(&self, feature: &Feature, filenames: &[String]) -> csv::ByteRecord {
@@ -851,6 +1004,25 @@ impl Runner {
         if self.database.protein_labels.is_some() {
             let label = self.database.isotope_label(feature.peptide_idx);
             record.push_field(label.map_or("", |l| l.name()).as_bytes());
+        }
+        if self.parameters.localization.is_some() {
+            match &feature.localization {
+                Some(loc) => {
+                    let proforma = sage_core::localization::localized_proforma(
+                        &self.database[feature.peptide_idx],
+                        loc,
+                        &self.database.modifications,
+                    );
+                    record.push_field(proforma.as_bytes());
+                    record.push_field(format!("{:.4}", loc.probability).as_bytes());
+                    record.push_field(ryu::Buffer::new().format(loc.q).as_bytes());
+                }
+                None => {
+                    record.push_field(b"");
+                    record.push_field(b"");
+                    record.push_field(b"");
+                }
+            }
         }
         record
     }
@@ -966,6 +1138,9 @@ impl Runner {
         }
         if self.database.protein_labels.is_some() {
             csv_headers.push("isotope_label");
+        }
+        if self.parameters.localization.is_some() {
+            csv_headers.extend(["localized_peptide", "localization_probability", "localization_q"]);
         }
 
         let headers = csv::ByteRecord::from(csv_headers);

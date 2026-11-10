@@ -1,3 +1,4 @@
+use crate::site_rules::{SiteContext, SiteRule};
 use std::{fmt::Debug, sync::Arc};
 
 use crate::modification::{ModId, ModificationSpecificity, Modifications};
@@ -218,17 +219,55 @@ impl Peptide {
     /// `max_combinations` caps total variants (unmodified + modified); fewer-PTM
     /// variants are always generated first so they are preferred when truncating.
     pub fn apply(
-        mut self,
+        self,
         variable_mods: &[(ModificationSpecificity, ModId, Option<usize>)],
         static_mods: &[(ModificationSpecificity, ModId)],
         mods: &Modifications,
         combinations: usize,
         max_combinations: Option<usize>,
     ) -> Vec<Peptide> {
-        if variable_mods.is_empty() {
-            for (target, id) in static_mods {
-                self.static_mods(*target, *id);
+        self.apply_with_rules(variable_mods, &[], static_mods, &[], mods, combinations, max_combinations, None)
+    }
+
+    /// [`Peptide::apply`], where modification `i` of `variable_mods` may sit
+    /// only where `variable_rules[i]` allows (likewise static ones; missing
+    /// rules allow every site). `context`: the peptide in its protein, for
+    /// motifs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_with_rules(
+        mut self,
+        variable_mods: &[(ModificationSpecificity, ModId, Option<usize>)],
+        variable_rules: &[SiteRule],
+        static_mods: &[(ModificationSpecificity, ModId)],
+        static_rules: &[SiteRule],
+        mods: &Modifications,
+        combinations: usize,
+        max_combinations: Option<usize>,
+        context: Option<&SiteContext>,
+    ) -> Vec<Peptide> {
+        let sequence = self.sequence.clone();
+        let allowed = |rule: Option<&SiteRule>, site: &Site| match (rule, site) {
+            (Some(rule), Site::Sequence(idx)) => rule.allows(*idx as usize, &sequence, context),
+            _ => true,
+        };
+        let apply_static = |peptide: &mut Peptide| {
+            for (i, (target, id)) in static_mods.iter().enumerate() {
+                match static_rules.get(i).filter(|r| !r.is_any()) {
+                    None => peptide.static_mods(*target, *id),
+                    Some(rule) => {
+                        let mut sites = Vec::new();
+                        peptide.push_resi(&mut sites, *target, *id, i);
+                        for (site, id, _) in sites {
+                            if allowed(Some(rule), &site) {
+                                peptide.apply_site(site, id);
+                            }
+                        }
+                    }
+                }
             }
+        };
+        if variable_mods.is_empty() {
+            apply_static(&mut self);
             self.monoisotopic += self.modification_mass(mods);
             vec![self]
         } else {
@@ -236,6 +275,7 @@ impl Peptide {
             for (mod_idx, (residue, id, _limit)) in variable_mods.iter().enumerate() {
                 self.push_resi(&mut sites, *residue, *id, mod_idx);
             }
+            sites.retain(|(site, _, mod_idx)| allowed(variable_rules.get(*mod_idx), site));
 
             let mut modified = Vec::new();
             modified.push(self.clone());
@@ -284,14 +324,54 @@ impl Peptide {
 
             // Apply static mods to all peptides
             for peptide in modified.iter_mut() {
-                for (target, id) in static_mods {
-                    peptide.static_mods(*target, *id);
-                }
+                apply_static(peptide);
                 peptide.monoisotopic += peptide.modification_mass(mods);
             }
 
             modified
         }
+    }
+
+    /// Unmodified sites where a mass offset with these site rules can go
+    /// (a motif is matched against the peptide alone)
+    pub fn offset_sites(&self, sites: &[(ModificationSpecificity, SiteRule)], id: ModId) -> Vec<Site> {
+        let mut found: Vec<(Site, ModId, usize)> = Vec::new();
+        for (i, (specificity, _)) in sites.iter().enumerate() {
+            self.push_resi(&mut found, *specificity, id, i);
+        }
+        let mut out: Vec<Site> = found
+            .into_iter()
+            .filter(|(site, _, i)| match site {
+                Site::Nterm => self.nterm.is_none(),
+                Site::Cterm => self.cterm.is_none(),
+                Site::Sequence(idx) => {
+                    let idx = *idx as usize;
+                    self.modifications[idx].is_none() && sites[*i].1.allows(idx, &self.sequence, None)
+                }
+            })
+            .map(|(site, _, _)| site)
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// This peptide with a mass offset of `mass` (modification `id`) at an
+    /// unmodified `site`
+    pub fn with_offset(&self, site: Site, id: ModId, mass: f32) -> Peptide {
+        let mut peptide = self.clone();
+        peptide.apply_site(site, id);
+        peptide.monoisotopic += mass;
+        peptide
+    }
+
+    /// The same peptide form: sequence, modifications and decoy status
+    pub fn same_form(&self, other: &Peptide) -> bool {
+        self.decoy == other.decoy
+            && self.sequence == other.sequence
+            && self.modifications == other.modifications
+            && self.nterm == other.nterm
+            && self.cterm == other.cterm
     }
 
     pub fn reverse(&self) -> Peptide {
@@ -322,8 +402,9 @@ fn no_duplicates(combination: &Vec<&(Site, ModId, usize)>) -> bool {
     n <= 1 && c <= 1
 }
 
+/// A place on a peptide a modification can go
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Site {
+pub enum Site {
     Nterm,
     Cterm,
     Sequence(u32),

@@ -16,6 +16,13 @@
 //! and time warping of LFQ, and integrates all channels over one shared peak,
 //! so their ratios compare like with like. Species identified in one channel
 //! are quantified in the others too.
+//!
+//! Chemical labels (dimethyl labelling) also label the peptide N-terminus
+//! (`"^"`), and the light channel carries a label of its own
+//! ([`SilacSettings::light`]), added as a static modification; each channel's
+//! label is then registered as its difference to light, combined with the
+//! light label into one modification (`Dimethyl:2H(4)`, UNIMOD:199). A
+//! blocked N-terminus (e.g. protein N-terminal acetylation) stays unlabelled.
 
 use crate::lfq::{Grid, LfqSettings, Peak, GRID_SIZE, N_ISOTOPES, RT_TOL};
 use crate::mass::{Tolerance, NEUTRON};
@@ -28,18 +35,26 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-/// One labelled channel (light, unlabelled, is implicit)
+/// One labelled channel (light is implicit)
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SilacChannel {
     /// `heavy`, `medium`
     pub name: String,
-    /// Residue (one letter) → label mass: `{"K": 8.014199, "R": 10.008269}`
+    /// Site → label mass: a residue (one letter) or `^` (the peptide
+    /// N-terminus): `{"K": 8.014199, "R": 10.008269}`, or for dimethyl
+    /// labelling `{"K": 32.056407, "^": 32.056407}`
     pub labels: BTreeMap<String, f32>,
 }
 
 /// `database.silac`: the labelled channels
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SilacSettings {
+    /// Labels of the light channel itself, for chemical labelling (dimethyl
+    /// light, `{"K": 28.0313, "^": 28.0313}`): added as static modifications.
+    /// The channels' labels are their own full masses on those sites (each
+    /// must label every light site). Empty for SILAC (light is unlabelled).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub light: BTreeMap<String, f32>,
     pub channels: Vec<SilacChannel>,
     /// Crosslinks between peptides of different channels (populations mixed
     /// before crosslinking). Off: a crosslink's peptides share a channel.
@@ -58,6 +73,17 @@ impl SilacSettings {
         if self.channels.len() > MAX_CHANNELS {
             return Err(format!("silac: at most {MAX_CHANNELS} labelled channels"));
         }
+        let site_ok = |site: &str| {
+            site == NTERM || (site.len() == 1 && site.bytes().all(|b| crate::mass::VALID_AA.contains(&b)))
+        };
+        for (site, &mass) in &self.light {
+            if !site_ok(site) {
+                return Err(format!("silac: light label site {site:?} is not a residue (one letter) or \"^\""));
+            }
+            if !mass.is_finite() || mass <= 0.0 {
+                return Err(format!("silac: light label mass of {site} must be positive"));
+            }
+        }
         let mut names = vec!["light".to_string()];
         let mut seen: Vec<&BTreeMap<String, f32>> = Vec::new();
         for c in &self.channels {
@@ -70,13 +96,23 @@ impl SilacSettings {
                 return Err(format!("silac: channel {} labels no residue", c.name));
             }
             for (residue, &mass) in &c.labels {
-                let ok = residue.len() == 1 && residue.bytes().all(|b| crate::mass::VALID_AA.contains(&b));
-                if !ok {
-                    return Err(format!("silac: {residue:?} is not a residue (one letter, e.g. \"K\")"));
+                if !site_ok(residue) {
+                    return Err(format!(
+                        "silac: {residue:?} is not a residue (one letter, e.g. \"K\") or the N-terminus (\"^\")"
+                    ));
                 }
                 if !mass.is_finite() || mass <= 0.0 {
                     return Err(format!("silac: label mass of {residue} in {} must be positive", c.name));
                 }
+                if self.light.get(residue).is_some_and(|light| (light - mass).abs() < 1e-4) {
+                    return Err(format!("silac: channel {} labels {residue} with the light label's mass", c.name));
+                }
+            }
+            if let Some(site) = self.light.keys().find(|site| !c.labels.contains_key(*site)) {
+                return Err(format!(
+                    "silac: channel {} must label every site the light channel labels ({site})",
+                    c.name
+                ));
             }
             if seen.contains(&&c.labels) {
                 return Err(format!("silac: channel {} has the same labels as another", c.name));
@@ -90,12 +126,59 @@ impl SilacSettings {
     pub fn names(&self) -> Vec<String> {
         std::iter::once("light".to_string()).chain(self.channels.iter().map(|c| c.name.clone())).collect()
     }
+
+    /// The light labels as static modifications (named with their UNIMOD
+    /// accession when known)
+    pub fn light_static_mods(&self) -> Vec<(ModificationSpecificity, crate::modification::ModEntry)> {
+        self.light
+            .iter()
+            .filter_map(|(site, &mass)| {
+                let specificity: ModificationSpecificity = site.parse().ok()?;
+                let name: Option<ModName> = accession(mass).and_then(|a| a.parse().ok());
+                let entry = match name {
+                    Some(name) => crate::modification::ModEntry::Detailed(crate::modification::DetailedMod {
+                        mass,
+                        max_count: None,
+                        name: Some(name),
+                        ..Default::default()
+                    }),
+                    None => crate::modification::ModEntry::Mass(mass),
+                };
+                Some((specificity, entry))
+            })
+            .collect()
+    }
+
+    /// Dimethyl labelling (Boersema et al. 2009): light (CH2O), and medium
+    /// (CD2O) and/or heavy (13CD2O with NaBD3CN) on K and the N-terminus
+    pub fn dimethyl(medium: bool, heavy: bool) -> SilacSettings {
+        let sites = |mass: f32| [("K".to_string(), mass), (NTERM.to_string(), mass)].into();
+        let mut channels = Vec::new();
+        if medium {
+            channels.push(SilacChannel { name: "medium".into(), labels: sites(DIMETHYL_MEDIUM) });
+        }
+        if heavy {
+            channels.push(SilacChannel { name: "heavy".into(), labels: sites(DIMETHYL_HEAVY) });
+        }
+        SilacSettings { light: sites(DIMETHYL_LIGHT), channels, mixed_crosslinks: false }
+    }
 }
+
+/// The peptide N-terminus as a label site
+pub const NTERM: &str = "^";
+/// Dimethyl (UNIMOD:36), Dimethyl:2H(4) (UNIMOD:199), Dimethyl:2H(6)13C(2) (UNIMOD:330)
+pub const DIMETHYL_LIGHT: f32 = 28.0313;
+pub const DIMETHYL_MEDIUM: f32 = 32.056407;
+pub const DIMETHYL_HEAVY: f32 = 36.07567;
 
 /// UNIMOD accessions of the usual labels, which ProForma readers (Annotator)
 /// know
 fn accession(mass: f32) -> Option<&'static str> {
-    const KNOWN: [(f32, &str); 4] = [
+    const KNOWN: [(f32, &str); 7] = [
+        // dimethyl labelling: light, medium (CD2O), heavy (13CD2O, NaBD3CN)
+        (DIMETHYL_LIGHT, "UNIMOD:36"),
+        (DIMETHYL_MEDIUM, "UNIMOD:199"),
+        (DIMETHYL_HEAVY, "UNIMOD:330"),
         // Label:13C(6)15N(2): Lys8
         (8.014199, "UNIMOD:259"),
         // Label:13C(6)15N(4): Arg10
@@ -131,6 +214,12 @@ pub struct Labels {
     reverse: HashMap<(ModId, u8), (u8, Option<ModId>)>,
     /// Residues labelled in some channel
     residues: Vec<u8>,
+    /// Per labelled channel: the N-terminal label (its difference to light)
+    nterm: Vec<Option<(ModId, f32)>>,
+    /// (channel, N-terminal modification already there) → both together
+    combined_nterm: HashMap<(u8, ModId), ModId>,
+    /// N-terminal modification → (channel, the modification without the label)
+    reverse_nterm: HashMap<ModId, (u8, Option<ModId>)>,
     pub mixed_crosslinks: bool,
 }
 
@@ -147,13 +236,44 @@ impl Labels {
             mixed_crosslinks: settings.mixed_crosslinks,
             ..Default::default()
         };
+        let named = |mass: f32| -> Option<ModName> { accession(mass).and_then(|a| a.parse().ok()) };
+        let light_nterm = settings.light.get(NTERM).copied();
         for (k, channel) in settings.channels.iter().enumerate() {
             let c = k as u8 + 1;
             let mut map = HashMap::new();
-            for (residue, &mass) in &channel.labels {
-                let r = residue.as_bytes()[0];
-                let name: Option<ModName> = accession(mass).and_then(|a| a.parse().ok());
-                let id = registry.insert(mass, name.as_ref())?;
+            let mut nterm = None;
+            for (site, &full) in &channel.labels {
+                // registered as the difference to light (all of it for SILAC)
+                let mass = full - settings.light.get(site).copied().unwrap_or(0.0);
+                let id = registry.insert(mass, named(mass).as_ref())?;
+                if site == NTERM {
+                    nterm = Some((id, mass));
+                    labels.reverse_nterm.insert(id, (c, None));
+                    for &(specificity, base) in configured {
+                        let n_terminal = matches!(
+                            specificity,
+                            ModificationSpecificity::PeptideN(_) | ModificationSpecificity::ProteinN(_)
+                        );
+                        // with a light N-terminal label, only it is relabelled:
+                        // another N-terminal modification blocks the amine
+                        let relabels = match light_nterm {
+                            Some(light) => {
+                                specificity == ModificationSpecificity::PeptideN(None)
+                                    && (registry.get(base).mass - light).abs() < 1e-4
+                            }
+                            None => true,
+                        };
+                        if !n_terminal || !relabels {
+                            continue;
+                        }
+                        let total = registry.get(base).mass + mass;
+                        let both = registry.insert(total, named(total).as_ref())?;
+                        labels.combined_nterm.insert((c, base), both);
+                        labels.reverse_nterm.insert(both, (c, Some(base)));
+                    }
+                    continue;
+                }
+                let r = site.as_bytes()[0];
                 map.insert(r, (id, mass));
                 labels.reverse.insert((id, r), (c, None));
                 if !labels.residues.contains(&r) {
@@ -163,14 +283,27 @@ impl Labels {
                     if !on_residue(specificity, r) {
                         continue;
                     }
-                    let both = registry.insert(registry.get(base).mass + mass, None)?;
+                    let total = registry.get(base).mass + mass;
+                    let both = registry.insert(total, named(total).as_ref())?;
                     labels.combined.insert((c, r, base), both);
                     labels.reverse.insert((both, r), (c, Some(base)));
                 }
             }
             labels.channels.push(map);
+            labels.nterm.push(nterm);
         }
         Ok(labels)
+    }
+
+    /// The N-terminal modification of channel `c` on a light N-terminus
+    /// carrying `nterm`, and the mass it adds; `None` if the channel has no
+    /// N-terminal label or the N-terminus is blocked
+    fn nterm_label(&self, c: u8, nterm: Option<ModId>) -> Option<(ModId, f32)> {
+        let (id, mass) = self.nterm.get(c as usize - 1).copied().flatten()?;
+        match nterm {
+            None => Some((id, mass)),
+            Some(base) => self.combined_nterm.get(&(c, base)).map(|&both| (both, mass)),
+        }
     }
 
     /// Light channel plus labelled ones
@@ -184,7 +317,12 @@ impl Labels {
 
     /// The label modifications themselves (not combined with another)
     pub fn label_ids(&self) -> Vec<ModId> {
-        let mut ids: Vec<ModId> = self.channels.iter().flat_map(|m| m.values().map(|v| v.0)).collect();
+        let mut ids: Vec<ModId> = self
+            .channels
+            .iter()
+            .flat_map(|m| m.values().map(|v| v.0))
+            .chain(self.nterm.iter().flatten().map(|v| v.0))
+            .collect();
         ids.sort();
         ids.dedup();
         ids
@@ -222,6 +360,13 @@ impl Labels {
                     }
                 }
             }
+            if ok {
+                if let Some((id, mass)) = self.nterm_label(c, p.nterm) {
+                    p.nterm = Some(id);
+                    p.monoisotopic += mass;
+                    any = true;
+                }
+            }
             if any && ok {
                 out.push(p);
             }
@@ -234,6 +379,12 @@ impl Labels {
     /// any channel labels (all channels look the same)
     pub fn channel(&self, peptide: &Peptide) -> Option<u8> {
         let mut labellable = false;
+        if !self.reverse_nterm.is_empty() {
+            if let Some(&(c, _)) = peptide.nterm.and_then(|m| self.reverse_nterm.get(&m)) {
+                return Some(c);
+            }
+            labellable = (1..self.len() as u8).any(|c| self.nterm_label(c, peptide.nterm).is_some());
+        }
         for (i, aa) in peptide.sequence.iter().enumerate() {
             if !self.residues.contains(aa) {
                 continue;
@@ -251,6 +402,10 @@ impl Labels {
     /// The light form of a peptide (labels removed)
     pub fn unlabel(&self, peptide: &Peptide) -> Peptide {
         let mut p = peptide.clone();
+        if let Some(&(c, base)) = p.nterm.and_then(|m| self.reverse_nterm.get(&m)) {
+            p.nterm = base;
+            p.monoisotopic -= self.nterm[c as usize - 1].map_or(0.0, |l| l.1);
+        }
         for i in 0..p.sequence.len() {
             let aa = p.sequence[i];
             let Some(m) = p.modifications[i] else { continue };
@@ -268,7 +423,8 @@ impl Labels {
             return 0.0;
         }
         let labels = &self.channels[channel as usize - 1];
-        peptide.sequence.iter().filter_map(|aa| labels.get(aa).map(|l| l.1)).sum()
+        let residues: f32 = peptide.sequence.iter().filter_map(|aa| labels.get(aa).map(|l| l.1)).sum();
+        residues + self.nterm_label(channel, peptide.nterm).map_or(0.0, |l| l.1)
     }
 }
 
@@ -304,12 +460,18 @@ pub struct SilacQuant {
 const MIN_ALIGNMENT_POINTS: usize = 3;
 
 fn aligned(a: &Alignment, rt: f32) -> f32 {
-    (rt / a.max_rt) * a.slope + a.intercept
+    a.transform(rt)
 }
 
-/// Linear retention-time alignment of each run onto the average run, fitted
-/// on species identified in at least two runs (as crosslink LFQ)
-fn align(ids: &[Identified], species: &[Vec<usize>], ms1: &[ProcessedSpectrum], n_files: usize) -> Vec<Alignment> {
+/// Retention-time alignment of each run onto the consensus run, fitted on
+/// species identified in at least two runs (as crosslink LFQ), by `method`
+fn align(
+    ids: &[Identified],
+    species: &[Vec<usize>],
+    ms1: &[ProcessedSpectrum],
+    n_files: usize,
+    method: crate::ml::retention_alignment::AlignmentMethod,
+) -> Vec<Alignment> {
     let mut max_rt = vec![0.0f32; n_files];
     for s in ms1 {
         if let Some(x) = max_rt.get_mut(s.file_id) {
@@ -326,7 +488,7 @@ fn align(ids: &[Identified], species: &[Vec<usize>], ms1: &[ProcessedSpectrum], 
             *x = 1.0;
         }
     }
-    let mut points: Vec<Vec<(f32, f32)>> = vec![Vec::new(); n_files];
+    let mut points: Vec<Vec<(f64, f64)>> = vec![Vec::new(); n_files];
     for members in species {
         let mut per_file: HashMap<usize, f32> = HashMap::new();
         for &i in members {
@@ -335,31 +497,20 @@ fn align(ids: &[Identified], species: &[Vec<usize>], ms1: &[ProcessedSpectrum], 
         if per_file.len() < 2 {
             continue;
         }
-        let mean = per_file.values().sum::<f32>() / per_file.len() as f32;
+        let consensus = crate::ml::retention_alignment::consensus(
+            &mut per_file.values().map(|&v| v as f64).collect::<Vec<_>>(),
+            method,
+        );
         for (&file, &rt) in &per_file {
-            points[file].push((rt, mean));
+            points[file].push((rt as f64, consensus));
         }
     }
-    (0..n_files)
-        .map(|file_id| {
-            let identity = Alignment { file_id, max_rt: max_rt[file_id], slope: 1.0, intercept: 0.0 };
-            let pts = &points[file_id];
-            if pts.len() < MIN_ALIGNMENT_POINTS {
-                return identity;
-            }
-            let n = pts.len() as f32;
-            let mx = pts.iter().map(|p| p.0).sum::<f32>() / n;
-            let my = pts.iter().map(|p| p.1).sum::<f32>() / n;
-            let sxx = pts.iter().map(|p| (p.0 - mx).powi(2)).sum::<f32>();
-            let sxy = pts.iter().map(|p| (p.0 - mx) * (p.1 - my)).sum::<f32>();
-            if sxx <= f32::EPSILON {
-                return identity;
-            }
-            let slope = sxy / sxx;
-            if !(0.5..=2.0).contains(&slope) {
-                return identity;
-            }
-            Alignment { slope, intercept: my - slope * mx, ..identity }
+    points
+        .into_iter()
+        .enumerate()
+        .map(|(file_id, pts)| {
+            // a wild fit from a handful of points is worse than none
+            crate::ml::retention_alignment::fit_alignment(file_id, max_rt[file_id], pts, method, MIN_ALIGNMENT_POINTS, Some((0.5, 2.0)))
         })
         .collect()
 }
@@ -403,7 +554,7 @@ pub fn quantify(
         });
         species[slot].push(i);
     }
-    let alignments = align(ids, &species, ms1, n_files);
+    let alignments = align(ids, &species, ms1, n_files, lfq.alignment);
 
     let ppm = Tolerance::Ppm(-lfq.ppm_tolerance, lfq.ppm_tolerance);
     let mut ranges = Vec::new();
@@ -509,7 +660,66 @@ mod test {
                 labels: [("K".to_string(), 8.014199), ("R".to_string(), 10.008269)].into(),
             }],
             mixed_crosslinks: false,
+            ..Default::default()
         }
+    }
+
+    /// Dimethyl triplex: light on every K and N-terminus (static), medium and
+    /// heavy as combined modifications of the full label masses; a blocked
+    /// (acetylated) protein N-terminus stays unlabelled
+    #[test]
+    fn dimethyl_channels() {
+        let dimethyl = SilacSettings::dimethyl(true, true);
+        assert!(dimethyl.validate().is_ok());
+        let mut partial = dimethyl.clone();
+        partial.channels[0].labels.remove(NTERM);
+        assert!(partial.validate().is_err(), "a channel must label every light site");
+        let mut same = dimethyl.clone();
+        same.channels[0].labels.insert("K".into(), DIMETHYL_LIGHT);
+        assert!(same.validate().is_err(), "a channel label equal to light");
+
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "static_mods": {"C": 57.021465},
+            "variable_mods": {"[": [42.010565]},
+            "silac": serde_json::to_value(&dimethyl).unwrap(),
+        }))
+        .unwrap();
+        let params = builder.make_parameters().unwrap();
+        let labels = params.labels.clone().unwrap();
+        assert_eq!(labels.names, ["light", "medium", "heavy"]);
+        let fasta = crate::fasta::Fasta::parse(">p\nMACDKEFGHRLMNPQRSTWYAG\n".into(), "rev_", false);
+        let peptides = params.digest(&fasta);
+        let show = |p: &Peptide| p.display(&params.modifications.registry).to_string();
+        let names: Vec<String> = peptides.iter().map(show).collect();
+        let find = |name: &str| peptides.iter().find(|p| show(p) == name).unwrap_or_else(|| panic!("{name} in {names:?}"));
+        // no K: only the N-terminus is labelled, by name
+        let light = find("[UNIMOD:36]-EFGHR");
+        let medium = find("[UNIMOD:199]-EFGHR");
+        let heavy = find("[UNIMOD:330]-EFGHR");
+        assert!((medium.monoisotopic - light.monoisotopic - (DIMETHYL_MEDIUM - DIMETHYL_LIGHT)).abs() < 1e-3);
+        assert!((heavy.monoisotopic - light.monoisotopic - (DIMETHYL_HEAVY - DIMETHYL_LIGHT)).abs() < 1e-3);
+        assert_eq!(labels.channel(light), Some(0));
+        assert_eq!(labels.channel(medium), Some(1));
+        assert_eq!(labels.channel(heavy), Some(2));
+        assert_eq!(show(&labels.unlabel(heavy)), show(light));
+        assert!((labels.unlabel(heavy).monoisotopic - light.monoisotopic).abs() < 1e-3);
+        assert!((labels.shift(light, 2) - (DIMETHYL_HEAVY - DIMETHYL_LIGHT)).abs() < 1e-4);
+        // K and the N-terminus both carry the label
+        let mack = peptides
+            .iter()
+            .filter(|p| p.sequence.as_ref() == b"MACDK" && labels.channel(p) == Some(2))
+            .find(|p| p.nterm.is_some_and(|m| (params.modifications.registry.get(m).mass - DIMETHYL_HEAVY).abs() < 1e-3))
+            .unwrap_or_else(|| panic!("heavy MACDK in {names:?}"));
+        assert!((params.modifications.registry.mass(mack.modifications[4]) - DIMETHYL_HEAVY).abs() < 1e-3);
+        assert!((labels.shift(&labels.unlabel(mack), 2) - 2.0 * (DIMETHYL_HEAVY - DIMETHYL_LIGHT)).abs() < 1e-3);
+        // acetylated protein N-terminus: blocked, only its K is labelled
+        let acetyl = |p: &&Peptide| p.nterm.is_some_and(|m| (params.modifications.registry.get(m).mass - 42.010565).abs() < 1e-3);
+        let blocked: Vec<&Peptide> = peptides.iter().filter(|p| p.sequence.as_ref() == b"MACDK").filter(acetyl).collect();
+        assert_eq!(blocked.len(), 3, "acetyl-MACDK light, medium, heavy: {names:?}");
+        let heavy_blocked = blocked.iter().find(|p| labels.channel(p) == Some(2)).expect("heavy acetyl-MACDK");
+        assert!((params.modifications.registry.mass(heavy_blocked.modifications[4]) - DIMETHYL_HEAVY).abs() < 1e-3);
+        assert!((labels.shift(&labels.unlabel(heavy_blocked), 2) - (DIMETHYL_HEAVY - DIMETHYL_LIGHT)).abs() < 1e-3);
     }
 
     #[test]

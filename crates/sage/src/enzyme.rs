@@ -108,6 +108,10 @@ impl std::hash::Hash for Digest {
     }
 }
 
+/// Second residues after which methionine aminopeptidase removes the
+/// initiator Met
+pub const CLIPPED_AFTER_MET: &[u8] = b"GASTCPV";
+
 pub struct EnzymeParameters {
     /// Number of missed cleavages to produce
     pub missed_cleavages: u8,
@@ -350,6 +354,23 @@ impl EnzymeParameters {
         sites.append(&mut semi_enzymatic_sites);
     }
 
+    /// The peptides a protein gives without its initiator methionine, which
+    /// methionine aminopeptidase removes when the second residue is small
+    /// (G, A, S, T, C, P or V): the digests starting at residue 2, protein
+    /// N-terminal. Their missed cleavages and enzymatic state are those of the
+    /// digest of the clipped protein. None for a non-specific digest, which
+    /// has every peptide from residue 2 already.
+    pub fn clipped_digests(&self, sequence: &str, protein: Arc<str>) -> Vec<Digest> {
+        let residues = sequence.as_bytes();
+        if self.enzyme.is_none() || residues.len() < 2 || residues[0] != b'M' || !CLIPPED_AFTER_MET.contains(&residues[1]) {
+            return Vec::new();
+        }
+        self.digest(&sequence[1..], protein)
+            .into_iter()
+            .filter(|digest| matches!(digest.position, Position::Nterm | Position::Full))
+            .collect()
+    }
+
     pub fn digest(&self, sequence: &str, protein: Arc<str>) -> Vec<Digest> {
         let n = sequence.len();
         let mut digests = Vec::new();
@@ -412,6 +433,46 @@ mod test {
     use std::collections::HashSet;
 
     use super::*;
+
+    fn clip_enzyme(missed_cleavages: u8, cleave: &str) -> EnzymeParameters {
+        EnzymeParameters {
+            missed_cleavages,
+            min_len: 1,
+            max_len: 50,
+            enzyme: Enzyme::new(cleave, "P", true, false),
+        }
+    }
+
+    #[test]
+    fn initiator_methionine_clipping() {
+        let tryp = clip_enzyme(1, "KR");
+        let clipped = |sequence: &str| -> Vec<(String, Position, u8)> {
+            let mut v: Vec<_> = tryp
+                .clipped_digests(sequence, Arc::default())
+                .into_iter()
+                .map(|d| (d.sequence, d.position, d.missed_cleavages))
+                .collect();
+            v.sort();
+            v
+        };
+        // MSDER...: S is small, so SDER and SDEREVAEAK are added, protein N-terminal
+        assert_eq!(
+            clipped("MSDEREVAEAKLLR"),
+            vec![("SDER".into(), Position::Nterm, 0), ("SDEREVAEAK".into(), Position::Nterm, 1)]
+        );
+        // only after G A S T C P V
+        assert!(clipped("MKDEREVAEAK").is_empty());
+        assert!(clipped("MLDEREVAEAK").is_empty());
+        assert!(clipped("ASDEREVAEAK").is_empty(), "no initiator Met");
+        assert_eq!(clipped("MPEPTIDEK"), vec![("PEPTIDEK".into(), Position::Full, 0)]);
+        // a non-specific digest has every peptide from residue 2 already
+        let nonspecific = EnzymeParameters { missed_cleavages: 0, min_len: 1, max_len: 50, enzyme: None };
+        assert!(nonspecific.clipped_digests("MSDEREVAEAK", Arc::default()).is_empty());
+        // no digestion: the whole protein without its Met
+        let whole = clip_enzyme(0, "$");
+        let v: Vec<_> = whole.clipped_digests("MSDEREVAEAK", Arc::default()).into_iter().map(|d| (d.sequence, d.position)).collect();
+        assert_eq!(v, vec![("SDEREVAEAK".to_string(), Position::Full)]);
+    }
 
     #[test]
     fn hash_digest() {

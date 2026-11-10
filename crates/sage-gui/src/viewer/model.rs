@@ -556,7 +556,13 @@ impl Results {
             .files
             .get(file)
             .ok_or_else(|| format!("{file} is not among the searched files in results.json"))?;
-        let bruker = sage_cloudpath::util::FileFormat::from(url.as_str()) == sage_cloudpath::util::FileFormat::TDF;
+        let format = sage_cloudpath::util::FileFormat::from(url.as_str());
+        if format == sage_cloudpath::util::FileFormat::ThermoRaw && url.scheme() == "file" {
+            let path = url.to_file_path().map_err(|_| format!("{file}: not a local path"))?;
+            let run = sage_cloudpath::thermoraw::ThermoRaw::open(&path, 0).map_err(|e| format!("{file}: {e}"))?;
+            return Ok(SpectrumFile::Thermo(run));
+        }
+        let bruker = format == sage_cloudpath::util::FileFormat::TDF;
         if bruker && url.scheme() == "file" {
             let path = url.to_file_path().map_err(|_| format!("{file}: not a local path"))?;
             let run = sage_cloudpath::tdf::TdfSpectra::open(&path, 0, self.bruker).map_err(|e| format!("{file}: {e}"))?;
@@ -565,11 +571,13 @@ impl Results {
         Ok(SpectrumFile::Whole(url.clone(), self.bruker))
     }
 
-    /// Is `file` read whole (mzML, MGF), not spectrum by spectrum (Bruker)?
+    /// Is `file` read whole (mzML, MGF), not spectrum by spectrum (Bruker,
+    /// Thermo RAW)?
     pub fn read_whole(&self, file: &str) -> bool {
+        use sage_cloudpath::util::FileFormat;
         self.files
             .get(file)
-            .is_none_or(|url| sage_cloudpath::util::FileFormat::from(url.as_str()) != sage_cloudpath::util::FileFormat::TDF)
+            .is_none_or(|url| !matches!(FileFormat::from(url.as_str()), FileFormat::TDF | FileFormat::ThermoRaw))
     }
 }
 
@@ -578,6 +586,9 @@ pub enum SpectrumFile {
     /// Bruker .d: each spectrum read on its own, by its id, exactly as the
     /// search read it, without decoding the rest of the run
     Bruker(sage_cloudpath::tdf::TdfSpectra),
+    /// Thermo .raw: opened once (header and scan index), each spectrum then
+    /// decoded on its own by its scan number, as the search read it
+    Thermo(sage_cloudpath::thermoraw::ThermoRaw),
     /// mzML, MGF: read whole (they have no index of spectra by id)
     Whole(Url, BrukerProcessingConfig),
 }
@@ -586,6 +597,7 @@ impl std::fmt::Debug for SpectrumFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SpectrumFile::Bruker(_) => f.write_str("timsTOF run"),
+            SpectrumFile::Thermo(_) => f.write_str("Thermo run"),
             SpectrumFile::Whole(url, _) => write!(f, "{url}"),
         }
     }
@@ -599,6 +611,7 @@ impl SpectrumFile {
                 let numbers: Vec<usize> = ids.iter().filter_map(|id| id.parse().ok()).collect();
                 run.read(&numbers)
             }
+            SpectrumFile::Thermo(run) => run.read_ids(ids).map_err(|e| e.to_string())?,
             SpectrumFile::Whole(url, bruker) => sage_cloudpath::util::read_spectra_with_ids(url, 0, None, *bruker, ids)
                 .map_err(|e| e.to_string())?,
         };
@@ -2370,6 +2383,36 @@ mod real_data {
                 println!("figures for {} written", m.title());
             }
         }
+    }
+
+    /// A search of a Thermo .raw file read directly: the viewer opens the run,
+    /// reads each match's spectrum by its scan and annotates it.
+    /// `SAGE_GUI_RAW_RESULTS=<folder>` (the output of such a search)
+    #[test]
+    #[ignore]
+    fn thermo_raw_spectra_open_in_the_viewer() {
+        let folder = std::env::var("SAGE_GUI_RAW_RESULTS").expect("set SAGE_GUI_RAW_RESULTS");
+        let results = Results::load(Path::new(&folder)).unwrap();
+        let m = results.matches.iter().find(|m| m.target).expect("a target match");
+        assert!(m.file.to_ascii_lowercase().ends_with(".raw"), "{}", m.file);
+        assert!(!results.read_whole(&m.file), "a .raw file is read scan by scan");
+        let source = results.open_file(&m.file).unwrap();
+        assert!(matches!(source, SpectrumFile::Thermo(_)));
+        let spectra = source.read(&HashSet::from([m.scan.clone()])).unwrap();
+        assert_eq!(spectra.len(), 1);
+        let (id, peaks) = &spectra[0];
+        assert_eq!(id, &m.scan);
+        let a = annotate(peaks, &results.proforma(m), m.charge, Model::All, results.fragment_tol, None).unwrap();
+        assert!(a.explained_peaks > 0);
+        println!(
+            "{} {} in {}: {} peaks, {} explained, precursor {:?}",
+            m.title(),
+            m.scan,
+            m.file,
+            peaks.mz.len(),
+            a.explained_peaks,
+            peaks.precursor_mz
+        );
     }
 }
 

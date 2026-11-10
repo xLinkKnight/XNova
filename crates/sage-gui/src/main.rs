@@ -95,6 +95,9 @@ struct SageGui {
     tab: Tab,
     sage_exe: String,
     converter_exe: String,
+    /// Convert Thermo .raw files to mzML before the search, instead of
+    /// letting sage.exe read them directly
+    convert_raw: bool,
     parquet: bool,
     telemetry: bool,
     job: Option<Job>,
@@ -124,6 +127,9 @@ struct SageGui {
     gpus: Vec<system::Gpu>,
     gpu_support: Option<system::GpuSupport>,
     gpu_probe: Option<std::sync::mpsc::Receiver<system::GpuSupport>>,
+    /// `sage.exe --estimate` running in the background, and its last answer
+    estimate: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    estimate_text: Option<Result<String, String>>,
     /// sage.exe path the GPU support was checked for
     probed_sage: String,
     /// The "Annotated spectra" tab
@@ -153,6 +159,7 @@ impl SageGui {
             tab: Tab::Files,
             sage_exe: String::new(),
             converter_exe: String::new(),
+            convert_raw: false,
             parquet: false,
             telemetry: true,
             job: None,
@@ -173,6 +180,8 @@ impl SageGui {
             gpus: system::gpus(),
             gpu_support: None,
             gpu_probe: None,
+            estimate: None,
+            estimate_text: None,
             probed_sage: String::new(),
             viewer: Default::default(),
             xiview: None,
@@ -188,6 +197,7 @@ impl SageGui {
             let text = |k: &str| state.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
             app.sage_exe = text("sage_exe");
             app.converter_exe = text("converter_exe");
+            app.convert_raw = state.get("convert_raw").and_then(|v| v.as_bool()).unwrap_or(false);
             app.parquet = state.get("parquet").and_then(|v| v.as_bool()).unwrap_or(false);
             app.telemetry = state.get("telemetry").and_then(|v| v.as_bool()).unwrap_or(true);
             app.dark = state.get("dark").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -216,6 +226,7 @@ impl SageGui {
         let state = serde_json::json!({
             "sage_exe": self.sage_exe,
             "converter_exe": self.converter_exe,
+            "convert_raw": self.convert_raw,
             "parquet": self.parquet,
             "telemetry": self.telemetry,
             "dark": self.dark,
@@ -415,10 +426,28 @@ impl SageGui {
             }
         }
         let has_raw = self.s.spectra.iter().any(|f| Settings::is_thermo_raw(f));
-        if has_raw && !Path::new(&self.converter_exe).is_file() {
+        let convert = has_raw && self.convert_raw;
+        if convert && !Path::new(&self.converter_exe).is_file() {
             errors.push(
-                "Thermo .raw files need a converter: install ProteoWizard (msconvert) or \
-                 ThermoRawFileParser and set it under Files > Programs."
+                "Thermo .raw files are set to be converted to mzML first, but no converter is set: \
+                 install ProteoWizard (msconvert) or ThermoRawFileParser and set it under Files > \
+                 Programs, or let sage.exe read the .raw files directly."
+                    .into(),
+            );
+        }
+        let tmt_sn = self.s.tmt != Tmt::None && self.s.tmt_sn;
+        if has_raw && !self.convert_raw && self.s.tmt != Tmt::None {
+            if tmt_sn {
+                errors.push(TMT_SN_RAW.into());
+            } else {
+                warnings.push(TMT_RAW.into());
+            }
+        }
+        if convert && tmt_sn && !runner::is_thermorawfileparser(Path::new(&self.converter_exe)) {
+            warnings.push(
+                "TMT signal-to-noise: Sage divides each reporter intensity by the mzML's noise array. \
+                 sage-gui asks ThermoRawFileParser for its noise data (-N); with msconvert, check that \
+                 the converted files carry noise arrays, or S/N is not applied."
                     .into(),
             );
         }
@@ -436,17 +465,20 @@ impl SageGui {
             self.problems.push((true, format!("Could not create {}: {e}", out.display())));
             return;
         }
-        let converted_dir = out.join("converted_mzML");
+        // files converted with noise data are kept apart: a file converted
+        // earlier without it is not reused for a signal-to-noise search
+        let converted_dir = out.join(if tmt_sn { "converted_mzML_noise" } else { "converted_mzML" });
         let mut steps = Vec::new();
         let mut spectra = Vec::new();
         for f in &self.s.spectra {
-            if Settings::is_thermo_raw(f) {
+            if convert && Settings::is_thermo_raw(f) {
                 let raw = Path::new(f);
                 let _ = std::fs::create_dir_all(&converted_dir);
                 steps.push(runner::conversion_step(
                     Path::new(&self.converter_exe),
                     raw,
                     &converted_dir,
+                    tmt_sn,
                 ));
                 spectra.push(runner::converted_path(raw, &converted_dir).display().to_string());
             } else {
@@ -468,6 +500,11 @@ impl SageGui {
         if !self.telemetry {
             args.push("--disable-telemetry-i-dont-want-to-improve-sage".into());
         }
+        // sage.exe stops itself at the limit, with a message (Windows' cap stays as a backstop)
+        if self.max_ram_gb > 0.0 {
+            args.push("--max-memory".into());
+            args.push(format!("{:.2}", self.max_ram_gb).into());
+        }
         steps.push(Step {
             title: "Sage search".into(),
             program: PathBuf::from(&self.sage_exe),
@@ -479,7 +516,7 @@ impl SageGui {
         let xl = &self.s.crosslink;
         self.tracker = Some(progress::Tracker::new(progress::Plan {
             files: spectra.len(),
-            raw_files: self.s.spectra.iter().filter(|f| Settings::is_thermo_raw(f)).count(),
+            raw_files: if convert { self.s.spectra.iter().filter(|f| Settings::is_thermo_raw(f)).count() } else { 0 },
             crosslink: xl.enabled,
             linear: xl.enabled && xl.linear_search,
             quant: self.s.lfq || self.s.tmt != Tmt::None || self.s.silac != Silac::Off,
@@ -689,8 +726,8 @@ impl SageGui {
                 let run = ui
                     .add_enabled(!running, theme::tone_button(ui, "▶ Run search", theme::Tone::Accent))
                     .on_hover_text(
-                        "Check the settings, convert any Thermo .raw files to mzML, write \
-                         sage_search.json into the output folder and run sage.exe.",
+                        "Check the settings, write sage_search.json into the output folder and run \
+                         sage.exe (converting Thermo .raw files to mzML first if set under Files > Programs).",
                     );
                 if run.clicked() {
                     self.start_run(ctx);
@@ -1003,8 +1040,8 @@ fn crosslink_databases(ui: &mut Ui, s: &mut Settings) {
 const SPECTRA_TIP: &str = "Mass spectrometry runs to search.\n\
     • mzML / mzML.gz and MGF / MGF.gz: read directly\n\
     • Bruker timsTOF .d: add the .d FOLDER (\"Add Bruker .d folder…\")\n\
-    • Thermo .raw: converted to mzML with msconvert or ThermoRawFileParser before the \
-    search, into <output>\\converted_mzML (already converted files are reused)\n\
+    • Thermo .raw: read directly by sage.exe; or, if set under Files > Programs, converted to \
+    mzML with msconvert or ThermoRawFileParser before the search (needed for TMT signal-to-noise)\n\
     You can also drag files onto this window.";
 
 impl SageGui {
@@ -1178,27 +1215,43 @@ impl SageGui {
                     })
                 },
             );
-            row(
-                ui,
-                "RAW converter",
-                "Only needed for Thermo .raw files, which Sage cannot read directly.\n\
-                 • ProteoWizard msconvert.exe (found automatically if installed), run with vendor \
-                 peak picking: --mzML --zlib --filter \"peakPicking vendor msLevel=1-\"\n\
-                 • or ThermoRawFileParser.exe, run with -f 2 (indexed mzML)",
-                |ui| {
-                    let mut r = path_field(ui, &mut self.converter_exe, "C:\\Program Files\\ProteoWizard\\…\\msconvert.exe", || {
-                        rfd::FileDialog::new().add_filter("Programs", &["exe"]).pick_file()
-                    });
-                    let find = ui.button("Find msconvert");
-                    if find.clicked() {
-                        if let Some(p) = runner::find_msconvert() {
-                            self.converter_exe = p.display().to_string();
+            row(ui, "Thermo .raw files", RAW_TIP, |ui| {
+                let r = ui.radio_value(&mut self.convert_raw, false, "read directly (sage.exe)");
+                r | ui.radio_value(&mut self.convert_raw, true, "convert to mzML first")
+            });
+            if self.convert_raw {
+                row(
+                    ui,
+                    "RAW converter",
+                    "The program that converts Thermo .raw files to mzML before the search:\n\
+                     • ProteoWizard msconvert.exe (found automatically if installed), run with vendor \
+                     peak picking: --mzML --zlib --filter \"peakPicking vendor msLevel=1-\"\n\
+                     • or ThermoRawFileParser.exe, run with -f 2 (indexed mzML), and -N (noise data) \
+                     for TMT signal-to-noise",
+                    |ui| {
+                        let mut r = path_field(ui, &mut self.converter_exe, "C:\\Program Files\\ProteoWizard\\…\\msconvert.exe", || {
+                            rfd::FileDialog::new().add_filter("Programs", &["exe"]).pick_file()
+                        });
+                        let find = ui.button("Find msconvert");
+                        if find.clicked() {
+                            if let Some(p) = runner::find_msconvert() {
+                                self.converter_exe = p.display().to_string();
+                            }
                         }
-                    }
-                    r |= find;
-                    r
-                },
-            );
+                        r |= find;
+                        r
+                    },
+                );
+            }
+            let raw_files = self.s.spectra.iter().any(|f| Settings::is_thermo_raw(f));
+            if raw_files && !self.convert_raw && self.s.tmt != Tmt::None {
+                let (color, text) = if self.s.tmt_sn {
+                    (Color32::from_rgb(210, 60, 60), TMT_SN_RAW)
+                } else {
+                    (Color32::from_rgb(220, 135, 30), TMT_RAW)
+                };
+                ui.label(RichText::new(format!("⚠ {text}")).color(color));
+            }
             row(
                 ui,
                 "Usage statistics",
@@ -1588,6 +1641,50 @@ impl SageGui {
                 ui.label(RichText::new(text).color(theme::muted(ui)));
                 r
             });
+            row(ui, "Database size", "Count the peptides and fragments the search would index, and the memory \
+                they take, without searching (sage.exe --estimate on the current settings). Variable modifications, \
+                missed cleavages, semi-enzymatic digestion, SILAC channels and the FASTA size decide it. The spectra \
+                and, for crosslink searches, the candidate pairs need memory on top.", |ui| {
+                if let Some(rx) = &self.estimate {
+                    if let Ok(result) = rx.try_recv() {
+                        self.estimate_text = Some(result);
+                        self.estimate = None;
+                    }
+                }
+                let busy = self.estimate.is_some();
+                let button = ui.add_enabled(!busy, egui::Button::new("Estimate"));
+                if button.clicked() {
+                    let config = std::env::temp_dir().join(format!("xnova_estimate_{}.json", std::process::id()));
+                    let text = serde_json::to_string_pretty(&self.s.to_json(&self.s.spectra)).unwrap_or_default();
+                    match std::fs::write(&config, text) {
+                        Err(e) => self.estimate_text = Some(Err(format!("could not write {}: {e}", config.display()))),
+                        Ok(()) => {
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            let (sage, ctx) = (PathBuf::from(&self.sage_exe), ui.ctx().clone());
+                            std::thread::spawn(move || {
+                                let _ = tx.send(system::estimate_database(&sage, &config));
+                                let _ = std::fs::remove_file(&config);
+                                ctx.request_repaint();
+                            });
+                            self.estimate = Some(rx);
+                            self.estimate_text = None;
+                        }
+                    }
+                }
+                if busy {
+                    ui.spinner();
+                    ui.label(RichText::new("counting…").color(theme::muted(ui)));
+                }
+                button
+            });
+            if let Some(result) = &self.estimate_text {
+                ui.label("");
+                match result {
+                    Ok(text) => ui.label(RichText::new(text).monospace().size(12.0)),
+                    Err(e) => ui.label(RichText::new(format!("✖ {e}")).color(Color32::from_rgb(210, 60, 60))),
+                };
+                ui.end_row();
+            }
             row(ui, "GPU", "Graphics adapters Windows reports, with their dedicated video memory (vRAM). \
                 Integrated graphics have no vRAM of their own and borrow system RAM.", |ui| {
                 ui.vertical(|ui| {
@@ -1657,13 +1754,35 @@ impl SageGui {
     }
 }
 
+/// Thermo .raw files: read directly, or converted first
+const RAW_TIP: &str = "How Thermo .raw files are searched.\n\
+    • Read directly (default): sage.exe reads each scan's centroid peaks with a built-in reader \
+    (sage-plus-raw, pure Rust; no Thermo software or converter needed). Precursors are Thermo's \
+    monoisotopic m/z, spectrum ids are the native ids msconvert writes, and results read the same \
+    as those of a converted mzML.\n\
+    • Convert to mzML first: msconvert or ThermoRawFileParser converts each file into \
+    <output>\\converted_mzML before the search (converted files are reused). Needed for TMT \
+    signal-to-noise, which divides reporter intensities by the noise arrays ThermoRawFileParser \
+    writes; also a fallback for files the built-in reader cannot decode, or to match an existing \
+    mzML pipeline.";
+
+/// TMT with Thermo .raw files read directly
+const TMT_RAW: &str = "TMT with Thermo .raw files read directly: reporter ions are quantified from the \
+    instrument's centroid intensities, as in a converted mzML. To quantify signal-to-noise, or to match \
+    a ThermoRawFileParser-based workflow, choose \"convert to mzML first\" under Files > Programs.";
+
+/// TMT signal-to-noise with Thermo .raw files read directly
+const TMT_SN_RAW: &str = "TMT signal-to-noise needs the noise arrays of a converted mzML, which Thermo .raw \
+    files read directly do not have: choose \"convert to mzML first\" with ThermoRawFileParser under \
+    Files > Programs (sage-gui asks it for its noise data), or turn S/N off (Scoring & output).";
+
 fn spectrum_kind(path: &str) -> (&'static str, &'static str) {
     let lower = path.to_ascii_lowercase();
     let trimmed = lower.trim_end_matches(['\\', '/']);
     if trimmed.ends_with(".d") {
         ("Bruker .d", "Bruker timsTOF folder, read directly")
     } else if Settings::is_thermo_raw(path) {
-        ("Thermo RAW", "Converted to mzML before the search")
+        ("Thermo RAW", "Read directly by sage.exe, or converted to mzML first if set under Files > Programs")
     } else if lower.ends_with(".mzml") || lower.ends_with(".mzml.gz") {
         ("mzML", "Read directly")
     } else if lower.ends_with(".mgf") || lower.ends_with(".mgf.gz") {
@@ -1766,6 +1885,13 @@ fn database_tab(ui: &mut Ui, s: &mut Settings) {
         row(ui, "Semi-enzymatic", "Also allow peptides with only one enzymatic end. Finds in-source fragments \
             and degradation products, but the database grows ~10x and searches get slower.",
             |ui| ui.checkbox(&mut s.semi_enzymatic, "semi-specific digestion"));
+        row(ui, "Initiator methionine", "Methionine aminopeptidase removes a protein's initiator Met when the \
+            second residue is small (G, A, S, T, C, P or V). With this on, each such protein is also digested \
+            without its Met: the peptides starting at residue 2 are added as protein N-terminal, so protein \
+            N-terminal modifications (e.g. acetylation) and crosslinks to the protein N-terminus apply to them. \
+            The unclipped peptides stay, as clipping is often incomplete. Decoys are made the same way. \
+            Recommended, especially with protein N-terminal acetylation searched.",
+            |ui| ui.checkbox(&mut s.clip_n_term_met, "also search proteins without their initiator Met"));
     });
 
     heading(ui, "Precursor charge states");
@@ -2116,6 +2242,7 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
                                 name: entry.proforma(),
                                 kind,
                                 max_count: 0,
+                                ..Default::default()
                             });
                         }
                     }
@@ -2124,6 +2251,60 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
             }
         });
     });
+}
+
+pub const SITE_RULE_TIP: &str = "Where the modification may sit (named modifications):\n• position: anywhere, not the peptide's first residue (not N-term), not its last (not C-term, e.g. GlyGly or acetyl on K, which block trypsin), or neither (internal)\n• motif (optional): a PROSITE-style pattern around the site, matched against the protein, so it may reach past the peptide: N-{P}-[ST] (N-glycosylation sequon), [ST]-P (proline-directed). Elements: a residue, x (any), [..] (one of), {..} (none of), x(2) (repeated); the site is the first element, or the one marked * (R-x-x-[ST]*). Decoys keep their target's sites.";
+pub const SEARCH_TIP: &str = "How a variable modification is searched:\n• indexed (default): every modified form is a peptide of the search index\n• library sites: indexed, but only at the protein sites the site library (below the table) lists for it, e.g. the sites.tsv of an earlier search with site localization\n• mass offset: not indexed. Every spectrum is also searched at its precursor mass less the modification, with fragments matched shifted and not, and the modification is placed on each residue it may take. At most one per peptide, on a residue without another modification. For large or rare modifications that would grow the index too much, e.g. a crosslinker's monolinks (DSSO hydrolysed, 176.01433 on K). Linear searches only.\nFixed modifications are always indexed.";
+pub const NEUTRAL_LOSS_TIP: &str = "Neutral losses (Da, comma-separated) of fragments that contain the modified residue: those fragments are also matched less the loss, e.g. 97.976896 (H3PO4) for phospho on S and T (filled in by the phospho presets). Leave empty for none.";
+
+/// Position and motif of a modification (Modifications table, saved modifications)
+pub fn site_rule_ui(
+    ui: &mut Ui,
+    id: impl std::hash::Hash,
+    position: &mut settings::SitePosition,
+    motif: &mut String,
+    bad: bool,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ComboBox::from_id_salt(id)
+            .width(95.0)
+            .selected_text(settings::position_label(*position))
+            .show_ui(ui, |ui| {
+                for (p, label) in settings::SITE_POSITIONS {
+                    ui.selectable_value(position, p, label);
+                }
+            });
+        ui.add(
+            TextEdit::singleline(motif)
+                .hint_text("motif, e.g. N-{P}-[ST]")
+                .desired_width(120.0)
+                .text_color_opt(bad.then_some(Color32::RED)),
+        );
+    })
+    .response
+}
+
+/// How a variable modification is searched (indexed, library sites, mass offset)
+pub fn search_ui(ui: &mut Ui, id: impl std::hash::Hash, search: &mut settings::ModSearch, enabled: bool) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        ComboBox::from_id_salt(id)
+            .width(105.0)
+            .selected_text(if enabled { settings::search_label(*search) } else { "indexed" })
+            .show_ui(ui, |ui| {
+                for (x, label) in settings::MOD_SEARCHES {
+                    ui.selectable_value(search, x, label);
+                }
+            })
+            .response
+    })
+    .inner
+}
+
+/// Neutral losses of a modification, Da
+pub fn neutral_loss_ui(ui: &mut Ui, losses: &mut String) -> egui::Response {
+    let bad = settings::parse_losses(losses).is_err();
+    ui.add(TextEdit::singleline(losses).hint_text("Da, e.g. 97.976896").desired_width(110.0).text_color_opt(bad.then_some(Color32::RED)))
+        .on_hover_text(NEUTRAL_LOSS_TIP)
 }
 
 fn modifications_tab(
@@ -2166,6 +2347,7 @@ fn modifications_tab(
                 name: String::new(),
                 kind: ModKind::Variable,
                 max_count: 0,
+                ..Default::default()
             });
         }
         library::mod_menu(ui, &mut s.mods, lib);
@@ -2175,12 +2357,15 @@ fn modifications_tab(
     ui.add_space(6.0);
 
     let mut remove = None;
-    egui::Grid::new("mods").num_columns(6).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
+    egui::Grid::new("mods").num_columns(9).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
         ui.label(theme::bold("Type")).on_hover_text("Fixed: always applied. Variable: searched with and without.");
         ui.label(theme::bold("Target")).on_hover_text(TARGET_TIP);
         ui.label(theme::bold("Mass shift")).on_hover_text("Monoisotopic mass added to the residue, in Da. Negative values allowed (e.g. -17.026549 for pyro-Glu from Q).");
         ui.label(theme::bold("Max per peptide")).on_hover_text("Variable modifications only: how often this modification may occur on one peptide. 0 = only limited by 'Max variable mods'.");
         ui.label(theme::bold("Name (optional)")).on_hover_text("ProForma name written to the results, e.g. UNIMOD:35 for oxidation. Leave empty to report the mass.");
+        ui.label(theme::bold("Site rule")).on_hover_text(SITE_RULE_TIP);
+        ui.label(theme::bold("Neutral loss")).on_hover_text(NEUTRAL_LOSS_TIP);
+        ui.label(theme::bold("Search")).on_hover_text(SEARCH_TIP);
         ui.label("");
         ui.end_row();
 
@@ -2201,6 +2386,12 @@ fn modifications_tab(
                 .on_hover_text("0 = no per-modification limit.");
             ui.add(TextEdit::singleline(&mut m.name).hint_text("UNIMOD:…").desired_width(110.0))
                 .on_hover_text("e.g. UNIMOD:4 (carbamidomethyl), UNIMOD:35 (oxidation), UNIMOD:21 (phospho)");
+            let bad_rule = settings::rule_problem(m);
+            let bad_motif = bad_rule.is_some() && !m.motif.trim().is_empty();
+            site_rule_ui(ui, ("rule", i), &mut m.position, &mut m.motif, bad_motif)
+                .on_hover_text(bad_rule.as_deref().unwrap_or(SITE_RULE_TIP));
+            neutral_loss_ui(ui, &mut m.losses);
+            search_ui(ui, ("search", i), &mut m.search, m.kind == ModKind::Variable).on_hover_text(SEARCH_TIP);
             ui.horizontal(|ui| {
                 library::mod_save_button(ui, i, m, ed);
                 if ui.small_button("✖").on_hover_text("Remove this modification").clicked() {
@@ -2224,6 +2415,25 @@ fn modifications_tab(
         row(ui, "Max combinations", "Hard cap on modified forms generated per peptide (including the unmodified \
             one). Unset = no cap. Useful against combinatorial explosion, e.g. 64.",
             |ui| optional(ui, &mut s.max_combinations, 64, "no limit", 1..=100_000, 16.0));
+    });
+
+    heading(ui, "Site library");
+    note(ui, "Known modification sites, for variable modifications searched at library sites (Search column): a \
+        tab-separated table with protein, position (1-based), residue and modification columns, such as the sites.tsv \
+        of an earlier search with site localization.");
+    grid(ui, "site_library", |ui| {
+        row(ui, "Site library", "The table of sites (optional). Its modification column names a modification by its \
+            name (UNIMOD:21) or mass (+79.96633). Sites are found on a peptide in each protein it belongs to; decoys \
+            keep their targets' sites.",
+            |ui| path_field(ui, &mut s.site_library, "sites.tsv (optional)", || {
+                rfd::FileDialog::new()
+                    .add_filter("Tables", &["tsv", "txt", "gz"])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+            }));
+        row(ui, "Max site q-value", "With a site_q column (as sites.tsv has): use only the sites at or below this \
+            q-value. Default 0.01. A table without that column is used whole.",
+            |ui| theme::number(ui, &mut s.site_library_q, 0.0..=1.0, 0.01, |d| d.max_decimals(3)));
     });
 }
 
@@ -2273,6 +2483,13 @@ fn spectra_tab(ui: &mut Ui, s: &mut Settings) {
             |ui| optional(ui, &mut s.max_peaks, 150, "automatic (150; 300 for DSSO/DSBU)", 10..=5000, 10.0));
         row(ui, "Min matched peaks", "A PSM needs at least this many matched b/y (etc.) ions. Default 4.",
             |ui| num(ui, &mut s.min_matched_peaks, 1..=50, 1.0));
+        row(ui, "timsTOF ion mobility", "How scan numbers of Bruker timsTOF data become 1/K0 (precursor mobility,             MS1 traces for LFQ and SILAC):
+            • calibrated (default): each frame's calibration in analysis.tdf (TimsCalibration), as Bruker's software             reports it
+            • linear: a straight line between the acquisition limits, as XNova 1.2 and earlier and upstream Sage             report it (off by up to about 0.02 1/K0)",
+            |ui| {
+                let r = ui.radio_value(&mut s.linear_mobility, false, "calibrated (instrument model)");
+                r | ui.radio_value(&mut s.linear_mobility, true, "linear")
+            });
     });
 }
 
@@ -2305,6 +2522,13 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             • Crosslink search: per crosslinked peptide pair (link-site isomers can't be told apart in MS1), \
             in crosslinks.lfq.tsv. Runs are aligned on crosslinks identified in several runs.",
             |ui| ui.checkbox(&mut s.lfq, "label-free quantification"));
+        row(ui, "Retention-time alignment", "How the runs' retention times are put on one scale (LFQ, SILAC and             crosslink quantification trace each peptide around its aligned time; the aligned time is also a             rescoring feature):
+            • nonlinear (default): the median time of each peptide shared by several runs; landmarks that disagree             are rejected by a robust fit, then a smooth monotone warp follows local gradient changes. Runs with             fewer than 16 shared peptides keep the robust straight line.
+            • linear: one straight line per run, as XNova 1.2 and earlier and upstream Sage.",
+            |ui| {
+                let r = ui.radio_value(&mut s.linear_alignment, false, "nonlinear");
+                r | ui.radio_value(&mut s.linear_alignment, true, "linear")
+            });
         if s.lfq || s.silac != Silac::Off {
             row(ui, "LFQ q-value cutoff", "Only peptides (or crosslinks, by crosslink q-value) at or below this \
                 q-value are quantified, by LFQ and SILAC. Default 0.01 (1% FDR).",
@@ -2318,6 +2542,16 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             row(ui, "Charge states", "On: sum all charge states into one intensity per peptide / crosslink \
                 (default). Off: report each charge state separately.",
                 |ui| ui.checkbox(&mut s.lfq_combine_charges, "combine charge states"));
+        }
+        if s.lfq {
+            row(ui, "Long-form table", "lfq_long.tsv, next to lfq.tsv: one row per peptide and run, with the \
+                run's intensity, whether that run identified the peptide by MS2 itself (ms2_confirmed; otherwise \
+                the intensity was found by matching between runs), the peak's apex, integration bounds and FWHM \
+                in the run's own retention times, its isotope spectral angle, and a row-level extraction q-value \
+                from a decoy traced the same way in the same run (a diagnostic of each run's extraction, not a \
+                calibrated match-between-runs FDR). Default on; switch off for very large studies \
+                (peptides × runs rows).",
+                |ui| ui.checkbox(&mut s.lfq_long_form, "write lfq_long.tsv"));
         }
         row(ui, "TMT", "Isobaric labelling kit used. Reporter ions are integrated into tmt.tsv \
             (crosslink searches: columns tmt_1 … of crosslinks.sage.tsv).\n\
@@ -2337,12 +2571,18 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
         if s.tmt != Tmt::None {
             row(ui, "TMT MS level", "MS level of the reporter ions: 2 for MS2 methods, 3 for SPS-MS3 (default 3).",
                 |ui| num(ui, &mut s.tmt_level, 2..=3, 1.0));
-            row(ui, "Signal-to-noise", "Report reporter signal-to-noise instead of intensity (Thermo files with noise data).",
+            row(ui, "Signal-to-noise", "Report reporter signal-to-noise instead of intensity. Needs mzML files with \
+                noise arrays: convert Thermo .raw files first with ThermoRawFileParser (Files > Programs > Thermo .raw \
+                files: convert to mzML first), as .raw files read directly have no noise data.",
                 |ui| ui.checkbox(&mut s.tmt_sn, "use S/N"));
         }
-        row(ui, "SILAC", "Stable isotope labels in cell culture. Every peptide is searched light and in each \
+        row(ui, "SILAC / dimethyl", "Stable isotope labels in cell culture. Every peptide is searched light and in each \
             labelled channel, with all of its K and R labelled (no mixed states), so the search takes 2 or 3 times \
             as long. A labelled lysine still crosslinks.\n\
+            Dimethyl labelling (Boersema et al. 2009): light +28.0313 (CH2O), medium +32.0564 (CD2O) and heavy \
+            +36.0757 (13CD2O with NaBD3CN) on every K and peptide N-terminus. The light label is added as a fixed \
+            modification (leave it out of the Modifications tab); an acetylated protein N-terminus stays \
+            unlabelled. A dimethylated lysine does not crosslink.\n\
             Each identified peptide (and crosslinked species) is traced in MS1 in every channel at once, over one \
             shared peak, with the MS1 tolerance and spectral angle above: silac.sage.tsv (intensities and ratios \
             to light per run), silac_proteins.sage.tsv (median ratio of each protein's unique peptides) and \
@@ -2357,13 +2597,24 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
                     })
                     .response
             });
+        if s.silac.is_dimethyl() {
+            let labels = if s.silac == Silac::DimethylTriplex {
+                "light +28.0313, medium +32.0564, heavy +36.0757 Da on K and the N-terminus"
+            } else {
+                "light +28.0313, medium +32.0564 Da on K and the N-terminus"
+            };
+            row(ui, "Dimethyl labels", "Dimethyl (UNIMOD:36), Dimethyl:2H(4) (UNIMOD:199) and \
+                Dimethyl:2H(6)13C(2) (UNIMOD:330).", |ui| ui.label(labels));
+        }
         if s.silac == Silac::Triplex {
             row(ui, "Medium labels", "Label masses of the medium channel on K and R (Da); 0: not labelled.",
                 |ui| silac_labels(ui, "silac_medium", &mut s.silac_medium));
         }
-        if s.silac != Silac::Off {
+        if s.silac.is_residue_silac() {
             row(ui, "Heavy labels", "Label masses of the heavy channel on K and R (Da); 0: not labelled.",
                 |ui| silac_labels(ui, "silac_heavy", &mut s.silac_heavy));
+        }
+        if s.silac != Silac::Off {
             if s.crosslink.enabled {
                 row(ui, "Mixed crosslinks", "Off (default): a crosslink joins peptides of one channel, since they \
                     come from the same cells. On: also light-heavy crosslinks, e.g. when lysates were mixed before \
@@ -2388,6 +2639,39 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             each spectrum's position in its file. Open them in Annotator together with the \
             spectrum files.",
             |ui| ui.checkbox(&mut s.write_annotator, "write .annotator.csv files"));
+    });
+
+    heading(ui, "Quality control");
+    note(ui, "Every search writes digestion.tsv: the missed-cleavage, semi- and non-enzymatic rates of the \
+        peptides at 1% FDR (decoy-corrected), and checks MS1 spectra for polymer contamination (PEG, PPG and \
+        polysiloxane ladders; a warning above 5% of the MS1 signal). Both are summarised on the Progress tab \
+        and in results.json.");
+    grid(ui, "qc", |ui| {
+        let custom = s.diagnostic_ions_list.is_some();
+        row(ui, "Diagnostic ions", "Search every MS2 spectrum, before peak processing, for low-mass ions that mark a \
+            modification: glycan oxonium ions (HexNAc 204.0867, its fragment 138.055, Hex 163.0601, NeuAc 292.1027), \
+            the acetyl-lysine immonium ion (126.0913) and the phosphotyrosine immonium ion (216.0426), at 20 ppm. \
+            Writes diagnostic_ions.tsv (file, scan, ion, m/z, relative intensity) and each ion's share of MS2 \
+            spectra per file. A configuration file may list its own ions instead.",
+            |ui| ui.checkbox(&mut s.diagnostic_ions, if custom { "search MS2 spectra for the configuration's diagnostic ions" } else { "search MS2 spectra for diagnostic ions" }));
+        row(ui, "Entrapment proteins", "Estimate how many false discoveries the reported FDR lets through. Add             proteins that cannot be in the sample (another species' proteome, or shuffled sequences) to the FASTA             with this tag in their accession (e.g. >ENTRAP_sp|P12345|...). Every discovery that maps only to them is             false: entrapment.tsv gives, at 1% and 5% FDR, for PSMs, peptides, proteins and crosslink-spectrum             matches, a lower bound and the combined estimate of Wen et al. 2025 (the database ratio is taken from             the search). Leave empty for a normal search.",
+            |ui| ui.add(TextEdit::singleline(&mut s.entrapment_tag).hint_text("tag, e.g. ENTRAP_").desired_width(140.0)));
+        row(ui, "Site localization", "Localize variable modifications (phospho, acetyl, ...) on the best PSM of every \
+            spectrum: each modification is moved over the residues that could carry it, and over decoy residues \
+            that cannot, and every arrangement is rescored. results.sage.tsv gets localized_peptide (ProForma 2.0 \
+            with localization scores where a site is uncertain, e.g. S[UNIMOD:21#g1(0.90)]T[#g1(0.10)]), \
+            localization_probability and localization_q (false localization rate from arrangements won by a decoy \
+            residue, for each modification on its own). sites.tsv lists the sites on proteins with a site-level q-value. Decoy residues: residues \
+            none of the modifications can sit on (default A).",
+            |ui| {
+                let r = ui.checkbox(&mut s.localization, "localize modifications");
+                ui.add_enabled(
+                    s.localization,
+                    TextEdit::singleline(&mut s.localization_decoys).hint_text("decoy residues").desired_width(60.0),
+                )
+                .on_hover_text("Residues used as decoy sites, e.g. A (default) or AL.");
+                r
+            });
     });
 }
 
@@ -3180,6 +3464,54 @@ mod screenshots {
             assert!(found, "{input}: none of {expected:?} shown");
             assert!(harness.query_by_label_contains("Downloading").is_none(), "{input}: nothing downloaded");
         }
+    }
+
+    /// Thermo .raw files are read directly by default; converting them first
+    /// is a choice under Files > Programs, and TMT with .raw files read
+    /// directly is warned about (an error for signal-to-noise)
+    #[test]
+    fn thermo_raw_read_directly_or_converted() {
+        use egui_kittest::kittest::Queryable;
+        // (Settings::is_thermo_raw wants an existing file)
+        let dir = std::env::temp_dir().join(format!("sage_gui_thermo_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("run1.raw");
+        std::fs::write(&raw, b"").unwrap();
+        let raw_path = raw.display().to_string();
+        let state = std::rc::Rc::new(std::cell::RefCell::new(None::<SageGui>));
+        let shared = state.clone();
+        let mut harness = Harness::builder().with_size(egui::vec2(1100.0, 3000.0)).build_ui(move |ui| {
+            let mut app = shared.borrow_mut();
+            let Some(app) = app.as_mut() else {
+                theme::install(ui.ctx(), false);
+                let mut new = SageGui::new(ui.ctx());
+                // (new() restores the saved choice: start from the default)
+                new.convert_raw = false;
+                new.s.spectra = vec![raw_path.clone()];
+                new.s.tmt = Tmt::Tmt10;
+                new.s.tmt_sn = false;
+                *app = Some(new);
+                return;
+            };
+            app.files_tab(ui);
+        });
+        harness.run_steps(4);
+        let warning = "TMT with Thermo .raw files read directly";
+        assert!(harness.query_by_label("read directly (sage.exe)").is_some());
+        assert!(harness.query_by_label("RAW converter").is_none(), "no converter needed to read .raw files");
+        assert!(harness.query_by_label_contains(warning).is_some(), "TMT with .raw read directly is pointed out");
+        // signal-to-noise cannot use .raw files read directly
+        state.borrow_mut().as_mut().unwrap().s.tmt_sn = true;
+        harness.run_steps(4);
+        assert!(harness.query_by_label_contains("TMT signal-to-noise needs the noise arrays").is_some());
+        // converting first: the converter is asked for, the warnings go
+        harness.get_by_label("convert to mzML first").click();
+        harness.run_steps(4);
+        assert!(state.borrow().as_ref().unwrap().convert_raw);
+        assert!(harness.query_by_label("RAW converter").is_some());
+        assert!(harness.query_by_label_contains(warning).is_none());
+        assert!(harness.query_by_label_contains("TMT signal-to-noise needs the noise arrays").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// "Open in xiVIEW" with the choice of crosslinks, for a folder with

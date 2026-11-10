@@ -9,6 +9,8 @@ pub use url::Url;
 pub mod mgf;
 pub mod mzml;
 pub mod tdf;
+pub mod thermoraw;
+pub mod tims_calibration;
 pub mod util;
 pub use util::FileFormat;
 
@@ -167,6 +169,8 @@ pub enum Error {
     TDF(#[from] timsrust::TimsRustError),
     #[error("MGF error: {0}")]
     MGF(#[from] mgf::MgfError),
+    #[error("Thermo RAW error: {0}")]
+    ThermoRaw(#[from] sage_plus_raw::Error),
 }
 
 #[cfg(test)]

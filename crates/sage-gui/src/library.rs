@@ -264,6 +264,13 @@ pub struct SavedMod {
     pub kind: ModKind,
     /// Variable mods only: maximum occurrences per peptide, 0 = no limit
     pub max_count: u32,
+    /// Where on the peptide, a motif around the site, neutral losses (Da,
+    /// comma-separated), as in the Modifications table
+    pub position: settings::SitePosition,
+    pub motif: String,
+    pub losses: String,
+    /// Variable mods only: indexed, library sites or mass offset
+    pub search: settings::ModSearch,
 }
 
 impl SavedMod {
@@ -275,6 +282,10 @@ impl SavedMod {
             proforma: m.name.trim().to_string(),
             kind: m.kind,
             max_count: m.max_count,
+            position: m.position,
+            motif: m.motif.trim().to_string(),
+            losses: m.losses.trim().to_string(),
+            search: m.search,
         }
     }
 
@@ -285,6 +296,32 @@ impl SavedMod {
             name: self.proforma.clone(),
             kind: self.kind,
             max_count: self.max_count,
+            position: self.position,
+            motif: self.motif.clone(),
+            losses: self.losses.clone(),
+            search: self.search,
+        }
+    }
+
+    /// Position, motif and losses in a few words ("-" for none)
+    pub fn rule_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.position != settings::SitePosition::Anywhere {
+            parts.push(settings::position_label(self.position).to_string());
+        }
+        if !self.motif.is_empty() {
+            parts.push(format!("motif {}", self.motif));
+        }
+        if !self.losses.is_empty() {
+            parts.push(format!("loss {} Da", self.losses));
+        }
+        if self.kind == ModKind::Variable && self.search != settings::ModSearch::Indexed {
+            parts.push(settings::search_label(self.search).to_string());
+        }
+        if parts.is_empty() {
+            "-".into()
+        } else {
+            parts.join(", ")
         }
     }
 
@@ -298,6 +335,10 @@ impl SavedMod {
         let mut s = format!("{:+.6} Da on {}, {kind}", self.mass, self.target);
         if self.kind == ModKind::Variable && self.max_count > 0 {
             s += &format!(", at most {} per peptide", self.max_count);
+        }
+        let rule = self.rule_summary();
+        if rule != "-" {
+            s += &format!(", {rule}");
         }
         if !self.proforma.is_empty() {
             s += &format!(" ({})", self.proforma);
@@ -313,6 +354,14 @@ impl SavedMod {
             "proforma": self.proforma,
             "kind": if self.kind == ModKind::Fixed { "fixed" } else { "variable" },
             "max_count": self.max_count,
+            "position": serde_json::to_value(self.position).unwrap_or_default(),
+            "motif": self.motif,
+            "neutral_losses": self.losses,
+            "search": match self.search {
+                settings::ModSearch::Indexed => "indexed",
+                settings::ModSearch::Library => "library",
+                settings::ModSearch::Offset => "mass_offset",
+            },
         })
     }
 
@@ -330,6 +379,14 @@ impl SavedMod {
             proforma: v.get("proforma").and_then(Value::as_str).unwrap_or("").trim().to_string(),
             kind: if v.get("kind").and_then(Value::as_str) == Some("fixed") { ModKind::Fixed } else { ModKind::Variable },
             max_count: v.get("max_count").and_then(Value::as_u64).unwrap_or(0).min(u32::MAX as u64) as u32,
+            position: v.get("position").and_then(|p| serde_json::from_value(p.clone()).ok()).unwrap_or_default(),
+            motif: v.get("motif").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            losses: v.get("neutral_losses").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+            search: match v.get("search").and_then(Value::as_str) {
+                Some("library") => settings::ModSearch::Library,
+                Some("mass_offset") => settings::ModSearch::Offset,
+                _ => settings::ModSearch::Indexed,
+            },
         })
     }
 }
@@ -460,6 +517,9 @@ impl Library {
         settings::check_target(&m.target)?;
         if !m.mass.is_finite() {
             return Err("The mass shift is not a number.".into());
+        }
+        if let Some(problem) = settings::rule_problem(&m.to_modification()) {
+            return Err(problem);
         }
         match index {
             Some(i) if i < self.modifications.len() => self.modifications[i] = m,
@@ -811,13 +871,14 @@ pub fn mod_panel(ui: &mut Ui, mods: &mut Vec<Modification>, lib: &mut Library, e
 
     let editing = ed.mod_edit.is_some();
     let mut action = None;
-    egui::Grid::new("saved_mods").num_columns(7).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
+    egui::Grid::new("saved_mods").num_columns(8).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
         ui.label(theme::bold("Name"));
         ui.label(theme::bold("Type"));
         ui.label(theme::bold("Target")).on_hover_text(crate::TARGET_TIP);
         ui.label(theme::bold("Mass shift"));
         ui.label(theme::bold("Max per peptide"));
         ui.label(theme::bold("ProForma name"));
+        ui.label(theme::bold("Site rule, loss")).on_hover_text(crate::SITE_RULE_TIP);
         ui.label("");
         ui.end_row();
         for (i, saved) in lib.modifications.iter().enumerate() {
@@ -843,6 +904,14 @@ pub fn mod_panel(ui: &mut Ui, mods: &mut Vec<Modification>, lib: &mut Library, e
                         theme::number(ui, &mut draft.max_count, 0..=10, 1.0, |d| d)
                     });
                     ui.add(TextEdit::singleline(&mut draft.proforma).hint_text("UNIMOD:…").desired_width(110.0));
+                    ui.vertical(|ui| {
+                        crate::site_rule_ui(ui, ("saved_mod_rule", i), &mut draft.position, &mut draft.motif, false)
+                            .on_hover_text(crate::SITE_RULE_TIP);
+                        crate::neutral_loss_ui(ui, &mut draft.losses);
+                        let variable = draft.kind == ModKind::Variable;
+                        crate::search_ui(ui, ("saved_mod_search", i), &mut draft.search, variable)
+                            .on_hover_text(crate::SEARCH_TIP);
+                    });
                     ui.horizontal(|ui| {
                         if ui.small_button("Save").on_hover_text("Keep these changes.").clicked() {
                             action = Some(("save", i));
@@ -863,6 +932,7 @@ pub fn mod_panel(ui: &mut Ui, mods: &mut Vec<Modification>, lib: &mut Library, e
                         (_, n) => n.to_string(),
                     });
                     ui.label(if saved.proforma.is_empty() { "-" } else { saved.proforma.as_str() });
+                    ui.label(saved.rule_summary());
                     ui.horizontal(|ui| {
                         if ed.mod_delete == Some(i) {
                             ui.label(format!("Delete \"{}\"?", saved.name));
@@ -1029,7 +1099,7 @@ mod test {
         lib.put_linker(SavedLinker::from_crosslink("DSSO-d8", &with(Reagent::Dsso)), None).unwrap();
         lib.put_linker(SavedLinker::from_crosslink("clix", &with(Reagent::Clixlink)), None).unwrap();
         lib.put_linker(SavedLinker::from_crosslink("EDC", &with(Reagent::Edc)), None).unwrap();
-        let m = Modification { target: "K".into(), mass: 42.010565, name: "UNIMOD:1".into(), kind: ModKind::Variable, max_count: 2 };
+        let m = Modification { target: "K".into(), mass: 42.010565, name: "UNIMOD:1".into(), kind: ModKind::Variable, max_count: 2, ..Default::default() };
         lib.put_mod(SavedMod::from_modification("Acetyl (K)", &m), None).unwrap();
 
         let back = Library::load_from(&path);
@@ -1069,7 +1139,7 @@ mod test {
         lib.put_linker(same, Some(0)).unwrap();
         assert_eq!(lib.crosslinkers.len(), 1);
         // modifications: the target is checked too
-        let m = Modification { target: "K".into(), mass: 1.0, name: String::new(), kind: ModKind::Fixed, max_count: 0 };
+        let m = Modification { target: "K".into(), mass: 1.0, name: String::new(), kind: ModKind::Fixed, max_count: 0, ..Default::default() };
         let mut bad = SavedMod::from_modification("x", &m);
         bad.target = "KK".into();
         assert!(lib.put_mod(bad, None).is_err());
@@ -1098,6 +1168,7 @@ mod test {
             name: name.into(),
             kind: ModKind::Variable,
             max_count: 0,
+            ..Default::default()
         };
         assert_eq!(default_mod_name(&m("UNIMOD:35", "M", 15.994915)), "Oxidation (M)");
         assert_eq!(default_mod_name(&m("", "K", 156.078644)), "+156.0786 Da (K)");

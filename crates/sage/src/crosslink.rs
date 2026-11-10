@@ -2882,14 +2882,16 @@ mod test {
             ProcessedSpectrum { file_id: 0, scan_start_time: 100.0, ..Default::default() },
             ProcessedSpectrum { file_id: 1, scan_start_time: 100.0, ..Default::default() },
         ];
-        let al = align_runs(&matches, &species, &ms1, 2);
-        let aligned = |f: usize, rt: f32| (rt / al[f].max_rt) * al[f].slope + al[f].intercept;
-        for rt in [20.0f32, 40.0, 60.0, 80.0] {
-            assert!((aligned(0, rt) - aligned(1, rt * 1.1)).abs() < 1e-3);
+        use crate::ml::retention_alignment::AlignmentMethod;
+        for method in [AlignmentMethod::Linear, AlignmentMethod::Nonlinear] {
+            let al = align_runs(&matches, &species, &ms1, 2, method);
+            for rt in [20.0f32, 40.0, 60.0, 80.0] {
+                assert!((al[0].transform(rt) - al[1].transform(rt * 1.1)).abs() < 1e-3, "{method:?}");
+            }
+            // a single shared species is too little to fit: identity
+            let al = align_runs(&matches[..2], &[vec![0, 1]], &ms1, 2, method);
+            assert_eq!((al[1].slope, al[1].intercept), (1.0, 0.0));
         }
-        // a single shared species is too little to fit: identity
-        let al = align_runs(&matches[..2], &[vec![0, 1]], &ms1, 2);
-        assert_eq!((al[1].slope, al[1].intercept), (1.0, 0.0));
     }
 
     #[test]
@@ -3670,6 +3672,7 @@ mod test {
                     labels: [("K".to_string(), 8.014199), ("R".to_string(), 10.008269)].into(),
                 }],
                 mixed_crosslinks: mixed,
+                ..Default::default()
             }),
             ..Default::default()
         }

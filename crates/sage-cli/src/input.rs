@@ -58,6 +58,27 @@ pub struct Search {
     pub annotate_matches: bool,
 
     pub score_type: ScoreType,
+
+    /// Diagnostic ions searched in every MS2 spectrum (`diagnostic_ions.tsv`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_ions: Option<Vec<sage_core::diagnostic::DiagnosticIon>>,
+
+    /// Stop the search when sage.exe uses more memory than this (GB)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_memory_gb: Option<f64>,
+
+    /// Entrapment proteins (accessions containing a tag) for an estimate of
+    /// the false discoveries at the reported FDR
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrapment: Option<sage_core::entrapment::EntrapmentConfig>,
+
+    /// Localize variable modifications: site probabilities, FLR, sites.tsv
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localization: Option<sage_core::localization::LocalizationSettings>,
+
+    /// Quality control: digestion summary, polymer check, diagnostic ions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qc: Option<crate::runner::QcReport>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +113,16 @@ pub struct Input {
     pub write_report: Option<bool>,
     pub write_annotator: Option<bool>,
     pub score_type: Option<ScoreType>,
+    /// `true` for the built-in diagnostic ions, or a list of ions
+    pub diagnostic_ions: Option<sage_core::diagnostic::DiagnosticIonsConfig>,
+    /// `nonlinear` (default) or `linear` retention-time alignment across runs
+    pub retention_time_alignment: Option<sage_core::ml::retention_alignment::AlignmentMethod>,
+    /// Stop the search when sage.exe uses more memory than this (GB)
+    pub max_memory_gb: Option<f64>,
+    /// Entrapment proteins: `{"tag": "ENTRAP_"}`
+    pub entrapment: Option<sage_core::entrapment::EntrapmentConfig>,
+    /// Modification site localization: `{}` (or `{"decoy_residues": "A"}`)
+    pub localization: Option<sage_core::localization::LocalizationSettings>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -103,6 +134,8 @@ pub struct LfqOptions {
     pub mobility_pct_tolerance: Option<f32>,
     pub combine_charge_states: Option<bool>,
     pub peptide_q_value: Option<f32>,
+    /// Write `lfq_long.tsv`, one row per precursor and run (default true)
+    pub long_form: Option<bool>,
 }
 
 impl From<LfqOptions> for LfqSettings {
@@ -120,6 +153,9 @@ impl From<LfqOptions> for LfqSettings {
             combine_charge_states: value
                 .combine_charge_states
                 .unwrap_or(default.combine_charge_states),
+            // set from the top-level `retention_time_alignment`
+            alignment: default.alignment,
+            long_form: value.long_form.unwrap_or(default.long_form),
         };
         if settings.ppm_tolerance > 20.0 {
             log::warn!("lfq_settings.ppm_tolerance is higher than expected");
@@ -409,10 +445,35 @@ impl Input {
             }
         }
 
-        let database = self
+        let mut database = self
             .database
             .make_parameters()
             .context("invalid modification configuration")?;
+        ensure!(
+            self.crosslink.is_none() || database.modifications.offset_mods.is_empty(),
+            "mass offsets (`search_mode: mass_offset`) are for linear searches and cannot be combined with `crosslink`"
+        );
+        if let Some(settings) = database.site_library.clone() {
+            let url = sage_cloudpath::to_url(&settings.path)?;
+            let text = sage_cloudpath::util::read_text(&url)
+                .with_context(|| format!("Failed to read the site library `{}`", settings.path))?;
+            let library = database
+                .load_site_library(&text)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("invalid site library `{}`", settings.path))?;
+            log::info!(
+                "site library {}: {} sites, {} of them for modifications with site_mode library",
+                settings.path,
+                library.rows,
+                library.used
+            );
+            if library.used == 0 && database.modifications.has_library_mods() {
+                log::warn!(
+                    "no site of the site library names a modification with site_mode library (by its name or \
+                     mass, on its residue): those modifications will not be searched"
+                );
+            }
+        }
 
         Self::check_mass_tolerances(&self.fragment_tol);
         Self::check_mass_tolerances(&self.precursor_tol);
@@ -450,6 +511,26 @@ impl Input {
             .map(|s| sage_cloudpath::to_url(s))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // TMT signal-to-noise divides each intensity by the mzML's noise array;
+        // a Thermo .raw file read directly has none, so its S/N would be wrong
+        let tmt_sn = self.quant.as_ref().is_some_and(|q| {
+            q.tmt.is_some() && q.tmt_options.as_ref().and_then(|t| t.sn).unwrap_or(false)
+        });
+        if tmt_sn {
+            use sage_cloudpath::util::FileFormat;
+            if let Some(raw) = mzml_paths
+                .iter()
+                .find(|url| FileFormat::from(url.as_str()) == FileFormat::ThermoRaw)
+            {
+                anyhow::bail!(
+                    "TMT signal-to-noise (quant.tmt_settings.sn) needs the noise arrays of an mzML, which \
+                     a Thermo .raw file read directly does not have ({raw}). Convert the .raw files to \
+                     mzML with ThermoRawFileParser and its noise data (-N), or set sn to false to \
+                     quantify reporter intensities."
+                );
+            }
+        }
+
         let output_directory = match self.output_directory {
             Some(path) => {
                 match sage_cloudpath::try_parse_url(&path) {
@@ -485,7 +566,11 @@ impl Input {
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
-            quant: self.quant.map(Into::into).unwrap_or_default(),
+            quant: {
+                let mut quant: QuantSettings = self.quant.map(Into::into).unwrap_or_default();
+                quant.lfq_settings.alignment = self.retention_time_alignment.unwrap_or_default();
+                quant
+            },
             mzml_paths,
             output_directory,
             precursor_tol: self.precursor_tol,
@@ -512,6 +597,11 @@ impl Input {
             protein_grouping_peptide_fdr: self.protein_grouping_peptide_fdr.unwrap_or(0.01),
             crosslink: self.crosslink,
             score_type,
+            diagnostic_ions: self.diagnostic_ions.and_then(|d| d.resolve()),
+            max_memory_gb: self.max_memory_gb.filter(|gb| *gb > 0.0),
+            entrapment: self.entrapment.filter(|e| !e.tag.is_empty()),
+            localization: self.localization,
+            qc: None,
         })
     }
 }

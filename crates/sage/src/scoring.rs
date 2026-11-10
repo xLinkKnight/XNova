@@ -1,7 +1,8 @@
-use crate::database::{IndexedDatabase, PeptideIx};
+use crate::database::{IndexedDatabase, OffsetPlacement, PeptideIx, Theoretical};
 use crate::heap::bounded_min_heapify;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
+use crate::peptide::Peptide;
 use crate::spectrum::{Precursor, ProcessedSpectrum};
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
@@ -50,7 +51,14 @@ struct PreScore {
     peptide: PeptideIx,
     precursor_charge: u8,
     isotope_error: i8,
+    /// Mass offset tried (1-based into [`IndexedDatabase::mass_offsets`]), 0
+    /// for none
+    offset: u8,
 }
+
+/// A fully scored candidate: score, matched fragments, and the mass offset
+/// placed on the peptide (if any)
+type Scored = (Score, Option<Fragments>, Option<OffsetPlacement>);
 
 /// Store preliminary scores & stats for first pass search for a query spectrum
 #[derive(Clone, Default)]
@@ -150,6 +158,17 @@ pub struct Feature {
     pub num_protein_groups: u32,
 
     pub fragments: Option<Fragments>,
+
+    /// Site localization of the variable modifications (rank 1, with
+    /// `localization` on)
+    #[serde(skip_serializing)]
+    pub localization: Option<crate::localization::Localization>,
+
+    /// The mass offset placed on `peptide_idx` (until
+    /// [`IndexedDatabase::materialize_mass_offsets`] gives the placed peptide
+    /// an index of its own)
+    #[serde(skip_serializing)]
+    pub mass_offset: Option<OffsetPlacement>,
 }
 
 /// Matching Fragment details
@@ -280,7 +299,7 @@ impl<'db> Scorer<'db> {
                     if pre.peptide == PeptideIx::default() {
                         return None;
                     }
-                    let (score, _) = self.score_candidate(query, pre);
+                    let score = self.score_hypotheses(query, pre, false).into_iter().map(|s| s.0).max()?;
                     if (score.matched_b + score.matched_y) < self.min_matched_peaks {
                         return None;
                     }
@@ -333,6 +352,24 @@ impl<'db> Scorer<'db> {
         hits.preliminary.truncate(k);
     }
 
+    /// [`Scorer::trim_hits`] for each mass offset tried on its own: an
+    /// offset's candidates match fragments both shifted and not, so their
+    /// counts do not compare with those of the plain search
+    fn trim_hits_by_offset(&self, hits: &mut InitialHits) {
+        if self.db.mass_offsets.is_empty() {
+            return self.trim_hits(hits);
+        }
+        let mut preliminary = std::mem::take(&mut hits.preliminary);
+        preliminary.sort_unstable_by_key(|p| p.offset);
+        let mut trimmed = Vec::with_capacity(preliminary.len());
+        for group in preliminary.chunk_by_mut(|a, b| a.offset == b.offset) {
+            let k = 50.clamp((self.report_psms * 2).min(group.len()), group.len());
+            bounded_min_heapify(group, k);
+            trimmed.extend_from_slice(&group[..k]);
+        }
+        hits.preliminary = trimmed;
+    }
+
     /// Preliminary Score, return # of matched peaks per candidate
     /// Returned hits are guaranteed to be the top-K hits (see above comment)
     /// from among all potential candidates, but the returned vector is not
@@ -344,12 +381,21 @@ impl<'db> Scorer<'db> {
         precursor_charge: u8,
         precursor_tol: Tolerance,
         isotope_error: i8,
+        offset: u8,
     ) -> InitialHits {
-        let candidates = self.db.query(
-            precursor_mass - isotope_error as f32 * NEUTRON,
-            precursor_tol,
-            self.fragment_tol,
-        );
+        let observed = precursor_mass - isotope_error as f32 * NEUTRON;
+        // a mass offset: candidates at the precursor mass less the offset (the
+        // window as wide as at the observed mass), and fragments carrying it
+        // shifted by it
+        let (mass, tolerance, shift) = match offset {
+            0 => (observed, precursor_tol, None),
+            o => {
+                let o = &self.db.mass_offsets[o as usize - 1];
+                let (lo, hi) = precursor_tol.bounds(observed);
+                (observed - o.mass, Tolerance::Da(lo - observed, hi - observed), Some(o.mass))
+            }
+        };
+        let candidates = self.db.query(mass, tolerance, self.fragment_tol);
 
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
         // Allocate space for all potential candidates - many potential candidates
@@ -360,21 +406,26 @@ impl<'db> Scorer<'db> {
             preliminary: vec![PreScore::default(); potential],
         };
 
+        let mut count = |frag: &Theoretical| {
+            let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
+            let sc = &mut hits.preliminary[idx];
+            if sc.matched == 0 {
+                hits.scored_candidates += 1;
+                sc.precursor_charge = precursor_charge;
+                sc.peptide = frag.peptide_index;
+                sc.isotope_error = isotope_error;
+                sc.offset = offset;
+            }
+
+            sc.matched += 1;
+            hits.matched_peaks += 1;
+        };
         for peak_mass in query.masses.iter() {
             for charge in 1..max_fragment_charge {
                 let mass = peak_mass * charge as f32;
-                for frag in candidates.page_search(mass) {
-                    let idx = frag.peptide_index.0 as usize - candidates.pre_idx_lo;
-                    let sc = &mut hits.preliminary[idx];
-                    if sc.matched == 0 {
-                        hits.scored_candidates += 1;
-                        sc.precursor_charge = precursor_charge;
-                        sc.peptide = frag.peptide_index;
-                        sc.isotope_error = isotope_error;
-                    }
-
-                    sc.matched += 1;
-                    hits.matched_peaks += 1;
+                candidates.page_search(mass).for_each(&mut count);
+                if let Some(shift) = shift {
+                    candidates.page_search(mass - shift).for_each(&mut count);
                 }
             }
         }
@@ -386,12 +437,28 @@ impl<'db> Scorer<'db> {
         hits
     }
 
+    /// Preliminary scores without a mass offset, then with each
     fn matched_peaks(
         &self,
         query: &ProcessedSpectrum,
         precursor_mass: f32,
         precursor_charge: u8,
         precursor_tol: Tolerance,
+    ) -> InitialHits {
+        let mut hits = InitialHits::default();
+        for offset in 0..=self.db.mass_offsets.len() as u8 {
+            hits += self.matched_peaks_with_offset(query, precursor_mass, precursor_charge, precursor_tol, offset);
+        }
+        hits
+    }
+
+    fn matched_peaks_with_offset(
+        &self,
+        query: &ProcessedSpectrum,
+        precursor_mass: f32,
+        precursor_charge: u8,
+        precursor_tol: Tolerance,
+        offset: u8,
     ) -> InitialHits {
         if self.min_isotope_err != self.max_isotope_err {
             let mut hits = (self.min_isotope_err..=self.max_isotope_err).fold(
@@ -403,6 +470,7 @@ impl<'db> Scorer<'db> {
                         precursor_charge,
                         precursor_tol,
                         isotope,
+                        offset,
                     );
                     hits
                 },
@@ -416,6 +484,7 @@ impl<'db> Scorer<'db> {
                 precursor_charge,
                 precursor_tol,
                 0,
+                offset,
             )
         }
     }
@@ -462,7 +531,7 @@ impl<'db> Scorer<'db> {
                 },
             )
         };
-        self.trim_hits(&mut hits);
+        self.trim_hits_by_offset(&mut hits);
         hits
     }
 
@@ -492,7 +561,7 @@ impl<'db> Scorer<'db> {
             .preliminary
             .iter()
             .filter(|score| score.peptide != PeptideIx::default())
-            .map(|pre| self.score_candidate(query, pre))
+            .flat_map(|pre| self.score_hypotheses(query, pre, self.annotate_matches))
             .filter(|s| (s.0.matched_b + s.0.matched_y) >= self.min_matched_peaks)
             .collect::<Vec<_>>();
 
@@ -509,9 +578,11 @@ impl<'db> Scorer<'db> {
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
             let fragments: Option<Fragments> = score_vector[idx].1.take();
+            let mass_offset = score_vector[idx].2;
             let psm_id = increment_psm_counter();
 
-            let peptide = &self.db[score.peptide];
+            let placed = mass_offset.map(|p| self.db.place(&self.db[score.peptide], p));
+            let peptide = placed.as_ref().unwrap_or(&self.db[score.peptide]);
             let precursor_mass = mz * score.precursor_charge as f32;
 
             let next = score_vector
@@ -595,18 +666,20 @@ impl<'db> Scorer<'db> {
                 num_protein_groups: 0,
                 fragments,
                 protein_group_q: 1.0,
+                localization: None,
+                mass_offset,
             })
         }
     }
 
     /// Remove peaks matching a PSM from a query spectrum
     fn remove_matched_peaks(&self, query: &mut ProcessedSpectrum, psm: &Feature) {
-        let peptide = &self.db[psm.peptide_idx];
+        let peptide = self.db.resolve(psm);
         let fragments = self
             .db
             .ion_kinds
             .iter()
-            .flat_map(|kind| IonSeries::new(peptide, *kind, &self.db.modifications));
+            .flat_map(|kind| IonSeries::new(&peptide, *kind, &self.db.modifications));
 
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, psm.charge);
 
@@ -687,11 +760,50 @@ impl<'db> Scorer<'db> {
         candidates
     }
 
+    /// Score a preliminary candidate: as it is, or, for a mass offset, with
+    /// the offset on each site it may take (each a candidate of its own, as
+    /// an indexed modification's forms would be)
+    fn score_hypotheses(&self, query: &ProcessedSpectrum, pre: &PreScore, annotate: bool) -> Vec<Scored> {
+        if pre.offset == 0 {
+            let (score, fragments) = self.score_peptide(query, pre, &self.db[pre.peptide], annotate);
+            return vec![(score, fragments, None)];
+        }
+        let offset = pre.offset - 1;
+        let base = &self.db[pre.peptide];
+        self.db
+            .offset_sites(base, offset as usize)
+            .into_iter()
+            .map(|site| {
+                let placement = OffsetPlacement { offset, site };
+                let (score, fragments) = self.score_peptide(query, pre, &self.db.place(base, placement), annotate);
+                (score, fragments, Some(placement))
+            })
+            .collect()
+    }
+
     /// Calculate full hyperscore for a given PSM
+    #[allow(dead_code)]
     fn score_candidate(
         &self,
         query: &ProcessedSpectrum,
         pre_score: &PreScore,
+    ) -> (Score, Option<Fragments>) {
+        self.score_peptide(query, pre_score, &self.db[pre_score.peptide], self.annotate_matches)
+    }
+
+    /// Hyperscore of any `peptide` (e.g. a modification moved to another
+    /// residue) against `query`, as the search scores its candidates
+    pub fn rescore(&self, query: &ProcessedSpectrum, peptide: &Peptide, precursor_charge: u8) -> f64 {
+        let pre = PreScore { precursor_charge, ..Default::default() };
+        self.score_peptide(query, &pre, peptide, false).0.hyperscore
+    }
+
+    fn score_peptide(
+        &self,
+        query: &ProcessedSpectrum,
+        pre_score: &PreScore,
+        peptide: &Peptide,
+        annotate: bool,
     ) -> (Score, Option<Fragments>) {
         let mut score = Score {
             peptide: pre_score.peptide,
@@ -699,7 +811,6 @@ impl<'db> Scorer<'db> {
             isotope_error: pre_score.isotope_error,
             ..Default::default()
         };
-        let peptide = &self.db[score.peptide];
         let max_fragment_charge =
             max_fragment_charge(self.max_fragment_charge, score.precursor_charge);
 
@@ -716,6 +827,13 @@ impl<'db> Scorer<'db> {
 
         let mut fragments_details = Fragments::default();
 
+        // modifications whose fragments lose a neutral mass (phospho S/T)
+        let lossy = match self.db.modifications.has_neutral_losses() {
+            true => crate::ion_series::lossy_sites(peptide, &self.db.modifications),
+            false => Vec::new(),
+        };
+        let mut matched: Vec<usize> = Vec::new();
+
         for (idx, frag) in fragments {
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
@@ -731,6 +849,9 @@ impl<'db> Scorer<'db> {
                     let peak_mass = query.masses[peak_idx];
                     let peak_intensity = query.intensities[peak_idx];
                     let fragment_charge = query.charges[peak_idx].max(charge);
+                    if !lossy.is_empty() {
+                        matched.push(peak_idx);
+                    }
 
                     score.ppm_difference +=
                         peak_intensity * (mz - peak_mass).abs() * 2E6 / (mz + peak_mass);
@@ -751,7 +872,7 @@ impl<'db> Scorer<'db> {
                         }
                     }
 
-                    if self.annotate_matches {
+                    if annotate {
                         let idx = match frag.kind {
                             Kind::A | Kind::B | Kind::C => idx as i32 + 1,
                             Kind::X | Kind::Y | Kind::Z | Kind::ZRadical => {
@@ -769,12 +890,53 @@ impl<'db> Scorer<'db> {
             }
         }
 
+        // fragments containing a lossy site, less the loss: matched peaks
+        // and intensity (not ion ladders, nor annotations); a peak counts once
+        if !lossy.is_empty() {
+            let fragments = self.db.ion_kinds.iter().flat_map(|kind| {
+                IonSeries::new(peptide, *kind, &self.db.modifications).enumerate()
+            });
+            for (idx, frag) in fragments {
+                for loss in crate::ion_series::fragment_losses(frag.kind, idx, &lossy) {
+                    for charge in 1..max_fragment_charge {
+                        let mz = (frag.monoisotopic_mass - loss) / charge as f32;
+                        let Some(peak_idx) = crate::spectrum::select_most_intense_peak(
+                            &query.masses,
+                            &query.intensities,
+                            mz,
+                            self.fragment_tol,
+                            None,
+                        ) else {
+                            continue;
+                        };
+                        if matched.contains(&peak_idx) {
+                            continue;
+                        }
+                        matched.push(peak_idx);
+                        let peak_mass = query.masses[peak_idx];
+                        let peak_intensity = query.intensities[peak_idx];
+                        score.ppm_difference += peak_intensity * (mz - peak_mass).abs() * 2E6 / (mz + peak_mass);
+                        match frag.kind {
+                            Kind::A | Kind::B | Kind::C => {
+                                score.matched_b += 1;
+                                score.summed_b += peak_intensity;
+                            }
+                            Kind::X | Kind::Y | Kind::Z | Kind::ZRadical => {
+                                score.matched_y += 1;
+                                score.summed_y += peak_intensity;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         score.hyperscore = score.hyperscore(self.score_type);
         score.longest_b = b_run.longest;
         score.longest_y = y_run.longest;
         score.ppm_difference /= score.summed_b + score.summed_y;
 
-        if self.annotate_matches {
+        if annotate {
             (score, Some(fragments_details))
         } else {
             // drop(fragments_details);
@@ -862,5 +1024,173 @@ mod tests {
             .collect::<Vec<_>>();
         retained.sort_by(f64::total_cmp);
         assert_eq!(retained, vec![50.0, 100.0]);
+    }
+}
+
+#[cfg(test)]
+mod mass_offset_tests {
+    use super::*;
+    use crate::database::{Builder, OffsetPlacement, Parameters};
+    use crate::peptide::Site;
+
+    fn parameters(variable: serde_json::Value) -> Result<Parameters, crate::modification::ModificationError> {
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 1, "min_len": 5},
+            "static_mods": {"C": 57.021465},
+            "variable_mods": variable,
+        }))
+        .unwrap();
+        builder.make_parameters()
+    }
+
+    fn dsso() -> serde_json::Value {
+        serde_json::json!({
+            "M": [15.9949],
+            "K": [{"mass": 176.01433, "name": "DSSO-OH", "search_mode": "mass_offset", "position": "not_c_term"}],
+            "[": [{"mass": 176.01433, "name": "DSSO-OH", "search_mode": "mass_offset"}]
+        })
+    }
+
+    fn scorer(db: &IndexedDatabase) -> Scorer<'_> {
+        Scorer {
+            db,
+            precursor_tol: Tolerance::Ppm(-10.0, 10.0),
+            fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+            min_matched_peaks: 4,
+            min_isotope_err: 0,
+            max_isotope_err: 0,
+            min_precursor_charge: 2,
+            max_precursor_charge: 3,
+            override_precursor_charge: false,
+            max_fragment_charge: Some(1),
+            chimera: false,
+            report_psms: 2,
+            wide_window: false,
+            annotate_matches: false,
+            score_type: ScoreType::SageHyperScore,
+        }
+    }
+
+    /// A doubly charged spectrum of `peptide`'s b and y ions, with noise
+    fn spectrum(db: &IndexedDatabase, peptide: &Peptide) -> ProcessedSpectrum {
+        let mut peaks: Vec<(f32, f32)> = [Kind::B, Kind::Y]
+            .iter()
+            .flat_map(|kind| IonSeries::new(peptide, *kind, &db.modifications))
+            .map(|ion| (ion.monoisotopic_mass, 100.0))
+            .collect();
+        peaks.extend((0..40).map(|k| (150.31 + k as f32 * 23.137, 10.0)));
+        peaks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        ProcessedSpectrum {
+            level: 2,
+            id: "scan=1".into(),
+            precursors: vec![Precursor {
+                mz: peptide.monoisotopic / 2.0 + PROTON,
+                charge: Some(2),
+                ..Default::default()
+            }],
+            total_ion_current: peaks.iter().map(|p| p.1).sum(),
+            masses: peaks.iter().map(|p| p.0).collect(),
+            intensities: peaks.iter().map(|p| p.1).collect(),
+            charges: vec![1; peaks.len()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn configuration() {
+        let params = parameters(dsso()).unwrap();
+        let mods = &params.modifications;
+        assert_eq!(mods.variable_mods.len(), 1, "only M is indexed");
+        assert_eq!(mods.offset_mods.len(), 2);
+        // written back as configured
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["variable_mods"]["K"][0]["search_mode"], "mass_offset");
+        assert_eq!(json["variable_mods"]["K"][0]["position"], "not_c_term");
+        assert_eq!(json["variable_mods"]["["][0]["search_mode"], "mass_offset");
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "static_mods": json["static_mods"],
+            "variable_mods": json["variable_mods"],
+        }))
+        .unwrap();
+        assert_eq!(builder.make_parameters().unwrap().modifications.offset_mods.len(), 2);
+
+        for bad in [
+            serde_json::json!({"N": [{"mass": 1.0, "search_mode": "mass_offset", "motif": "N-x-[ST]"}]}),
+            serde_json::json!({"K": [{"mass": 0.0, "search_mode": "mass_offset"}]}),
+            serde_json::json!({"K": [{"mass": 42.0106, "search_mode": "mass_offset"}], "^": [42.0106]}),
+            serde_json::json!({"K": [{"mass": 42.0106, "search_mode": "mass_offset", "site_mode": "library"}]}),
+        ] {
+            assert!(parameters(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// An offset is not indexed; the search finds it on the right lysine,
+    /// and materializing gives the placed peptide an index of its own
+    #[test]
+    fn offsets_are_searched_and_materialized() {
+        let params = parameters(dsso()).unwrap();
+        let fasta = crate::fasta::Fasta::parse(">p\nMAGEKVLDSGAPIKAYRWNNPEDLLGFR\n".into(), "rev_", true);
+        let mut db = params.build(fasta);
+        assert_eq!(db.mass_offsets.len(), 1, "one offset with two kinds of site");
+        assert_eq!(db.mass_offsets[0].sites.len(), 2);
+        let offset = db.mass_offsets[0].id;
+        assert!(db.peptides.iter().all(|p| !p.modifications.contains(&Some(offset)) && p.nterm != Some(offset)));
+
+        let base = db.peptides.iter().position(|p| !p.decoy && p.sequence.as_ref() == b"VLDSGAPIKAYR").unwrap();
+        let base = PeptideIx(base as u32);
+        // K8, not the C-terminal residue (there is none here), nor the protein N-terminus
+        assert_eq!(db.offset_sites(&db[base], 0), vec![Site::Sequence(8)]);
+        // MAGEK: the protein N-terminus only (its K is C-terminal)
+        let first = db.peptides.iter().find(|p| !p.decoy && p.sequence.as_ref() == b"MAGEK").unwrap();
+        assert_eq!(db.offset_sites(first, 0), vec![Site::Nterm]);
+        // a decoy has as many sites as its target
+        let reversed = db[base].reverse();
+        assert_eq!(reversed.sequence.as_ref(), b"VYAKIPAGSDLR");
+        let decoy = db.peptides.iter().find(|p| p.decoy && p.sequence == reversed.sequence).expect("decoy");
+        assert_eq!(db.offset_sites(decoy, 0).len(), 1);
+
+        let placement = OffsetPlacement { offset: 0, site: Site::Sequence(8) };
+        let placed = db.place(&db[base], placement);
+        assert!((placed.monoisotopic - db[base].monoisotopic - 176.01433).abs() < 1e-3);
+        let query = spectrum(&db, &placed);
+        let mut features = {
+            let scorer = scorer(&db);
+            let features = scorer.score(&query);
+            assert!(!features.is_empty());
+            let best = &features[0];
+            assert_eq!(best.mass_offset, Some(placement), "{features:?}");
+            assert!(db.resolve(best).same_form(&placed));
+            assert!(best.delta_mass.abs() < 1.0, "{}", best.delta_mass);
+            assert!((best.calcmass - placed.monoisotopic).abs() < 1e-3);
+            // chimeric search removes the placed peptide's peaks
+            let chimeric = Scorer { chimera: true, ..scorer }.score(&query);
+            assert_eq!(chimeric[0].mass_offset, Some(placement));
+            features
+        };
+        // without the offset, nothing explains the precursor
+        let plain = parameters(serde_json::json!({"M": [15.9949]})).unwrap();
+        let plain_db = plain.build(crate::fasta::Fasta::parse(
+            ">p\nMAGEKVLDSGAPIKAYRWNNPEDLLGFR\n".into(),
+            "rev_",
+            true,
+        ));
+        assert!(scorer(&plain_db).score(&query).iter().all(|f| f.delta_mass.abs() > 10.0));
+
+        features.push(features[0].clone());
+        let last = features.len() - 1;
+        let n = db.peptides.len();
+        let with_offsets = features.iter().filter(|f| f.mass_offset.is_some()).count();
+        assert_eq!(db.materialize_mass_offsets(&mut features), with_offsets);
+        assert!(features[0].peptide_idx.0 as usize >= n);
+        assert_eq!(features[0].peptide_idx, features[last].peptide_idx, "one index per placed peptide");
+        assert!(features[0].mass_offset.is_none());
+        assert!(db[features[0].peptide_idx].same_form(&placed));
+        assert_eq!(db.offset_peptides.len(), with_offsets - 1);
+        assert_eq!(
+            db[features[0].peptide_idx].display(&db.modifications).to_string(),
+            "VLDSGAPIK[DSSO-OH]AYR"
+        );
     }
 }

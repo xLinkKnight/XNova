@@ -108,6 +108,10 @@ pub struct Tracker {
     candidates: u64,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+    /// The highest polymer share of any file's MS1 signal: (percent, text)
+    polymer_max: Option<(f64, String)>,
+    /// Each diagnostic ion's highest share of any file's MS2 spectra
+    diagnostic_max: Vec<(String, f64)>,
     pub start: Instant,
     pub end: Option<Duration>,
     pub state: State,
@@ -223,6 +227,8 @@ impl Tracker {
             candidates: 0,
             warnings: Vec::new(),
             errors: Vec::new(),
+            polymer_max: None,
+            diagnostic_max: Vec::new(),
             start: Instant::now(),
             end: None,
             state: State::Running,
@@ -255,6 +261,73 @@ impl Tracker {
         }
         self.current = i;
         self.started[i] = Some(now);
+    }
+
+    /// The quality-control summary lines: digestion, MS1 polymers, diagnostic
+    /// ions. True when `msg` was one.
+    fn quality_control(&mut self, msg: &str) -> bool {
+        let percent = |text: &str| text.trim().trim_end_matches('%').parse::<f64>().ok();
+        if let Some(rest) = msg.strip_prefix("peak memory use: ") {
+            self.set_metric("Peak memory", rest.trim().to_string());
+            return true;
+        }
+        if let Some(rest) = msg.strip_prefix("- digestion of ") {
+            // "- digestion of 812 peptides at 1% FDR: 12.3% with missed cleavages, 1.0% semi-enzymatic (N 0.5%, C 0.5%), 0.0% non-enzymatic"
+            if let Some((_, tail)) = rest.split_once(": ") {
+                let parts: Vec<&str> = tail.split(", ").collect();
+                if let Some(v) = parts.first().and_then(|p| p.split_once('%')).and_then(|(v, _)| percent(v)) {
+                    self.set_metric("Missed cleavages", format!("{v:.1}% of peptides"));
+                }
+                if let Some(v) = parts.get(1).and_then(|p| p.split_once('%')).and_then(|(v, _)| percent(v)) {
+                    self.set_metric("Semi-enzymatic peptides", format!("{v:.1}%"));
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = msg.strip_prefix("- MS1 polymer signal in ") {
+            // "- MS1 polymer signal in run1.raw: PEG 0.40%, PPG 0.00%, polysiloxane 1.20% of the MS1 ion current (1234 spectra)"
+            if let Some((file, tail)) = rest.split_once(": ") {
+                let tail = tail.split(" of the MS1").next().unwrap_or(tail);
+                for part in tail.split(", ") {
+                    if let Some((name, value)) = part.rsplit_once(' ') {
+                        if let Some(v) = percent(value) {
+                            if self.polymer_max.as_ref().is_none_or(|(max, _)| v > *max) {
+                                self.polymer_max = Some((v, format!("{name} {v:.2}% of MS1 signal ({file})")));
+                            }
+                        }
+                    }
+                }
+                if let Some((_, text)) = self.polymer_max.clone() {
+                    self.set_metric("Most polymer in MS1", text);
+                }
+            }
+            return true;
+        }
+        if let Some(rest) = msg.strip_prefix("- diagnostic ions in ") {
+            // "- diagnostic ions in run1.raw (share of 900 MS2 spectra): HexNAc 1.2%, Hex 0.0%"
+            if let Some((_, tail)) = rest.split_once("): ") {
+                for part in tail.split(", ") {
+                    if let Some((name, value)) = part.rsplit_once(' ') {
+                        if let Some(v) = percent(value) {
+                            match self.diagnostic_max.iter_mut().find(|(n, _)| n == name) {
+                                Some(slot) => slot.1 = slot.1.max(v),
+                                None => self.diagnostic_max.push((name.to_string(), v)),
+                            }
+                        }
+                    }
+                }
+                let found: Vec<String> = self
+                    .diagnostic_max
+                    .iter()
+                    .filter(|(_, v)| *v > 0.0)
+                    .map(|(n, v)| format!("{n} {v:.1}%"))
+                    .collect();
+                let text = if found.is_empty() { "none found".to_string() } else { found.join(", ") };
+                self.set_metric("Diagnostic ions (MS2 share)", text);
+            }
+            return true;
+        }
+        false
     }
 
     fn set_metric(&mut self, label: &str, value: String) {
@@ -322,6 +395,9 @@ impl Tracker {
             "WARN" => self.warnings.push(msg.to_string()),
             "ERROR" => self.errors.push(msg.to_string()),
             _ => {}
+        }
+        if self.quality_control(msg) {
+            return;
         }
 
         if msg.starts_with("linear peptide search (results.sage.tsv)") {
@@ -598,7 +674,7 @@ fn diagnose(failure: &str, errors: &[String], log: &[String], plan: &Plan, stage
         evidence: Vec::new(),
     };
 
-    let mut found = if has(&["ran out of memory: it needed more than"]) {
+    let mut found = if has(&["ran out of memory: it needed more than", "(max_memory_gb / --max-memory)"]) {
         d("Out of memory (RAM limit reached)",
           "sage.exe needed more memory than the Max RAM limit set under Files > Resources, so Windows stopped it.",
           &["Raise Max RAM under Files > Resources, or set it to 0 to allow all available memory.",
@@ -768,6 +844,33 @@ mod test {
         assert_eq!(t.warnings.len(), 1);
     }
 
+        /// The quality-control lines (digestion, MS1 polymers, diagnostic ions)
+    /// become metrics, in a linear search as in a crosslink search
+    #[test]
+    fn quality_control_lines_become_metrics() {
+        let mut t = Tracker::new(Plan { linear: true, ..plan(true, false) });
+        let line = |m: &str| format!("[2026-11-09T22:00:07Z INFO  sage_cli::runner::qc] {m}");
+        let log: Vec<String> = [
+            "linear peptide search (results.sage.tsv), then the crosslink search",
+            "- MS1 polymer signal in a.raw: PEG 0.40%, PPG 0.00%, polysiloxane 1.20% of the MS1 ion current (1234 spectra)",
+            "- MS1 polymer signal in b.raw: PEG 6.10%, PPG 0.00%, polysiloxane 0.20% of the MS1 ion current (1200 spectra)",
+            "- diagnostic ions in a.raw (share of 900 MS2 spectra): HexNAc 1.2%, Hex 0.0%",
+            "- diagnostic ions in b.raw (share of 800 MS2 spectra): HexNAc 0.5%, Hex 0.0%",
+            "- digestion of 812 peptides at 1% FDR: 12.3% with missed cleavages, 1.0% semi-enzymatic (N 0.5%, C 0.5%), 0.0% non-enzymatic",
+            "peak memory use: 6.21 GB",
+        ]
+        .iter()
+        .map(|m| line(m))
+        .collect();
+        t.update(&log, log.len());
+        let m = |k: &str| t.metrics.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
+        assert_eq!(m("Missed cleavages").as_deref(), Some("12.3% of peptides"));
+        assert_eq!(m("Semi-enzymatic peptides").as_deref(), Some("1.0%"));
+        assert_eq!(m("Most polymer in MS1").as_deref(), Some("PEG 6.10% of MS1 signal (b.raw)"));
+        assert_eq!(m("Diagnostic ions (MS2 share)").as_deref(), Some("HexNAc 1.2%"));
+        assert_eq!(m("Peak memory").as_deref(), Some("6.21 GB"));
+    }
+
     #[test]
     fn follows_a_linear_search_before_the_crosslinks() {
         let mut t = Tracker::new(Plan { linear: true, ..plan(true, false) });
@@ -864,6 +967,7 @@ mod test {
         let cases = [
             ("Sage search ran out of memory: it needed more than the 4.0 GB RAM limit (Files > Resources); raise the limit", "RAM limit"),
             ("memory allocation of 1073741824 bytes failed", "Out of memory"),
+            ("[2026-11-09T22:00:07Z ERROR sage_cli::memory] sage.exe uses 3.20 GB of memory, its limit is 3.00 GB (max_memory_gb / --max-memory): the search is stopped.", "RAM limit"),
             ("Error: Failed to read parameters from `x.json`\nCaused by:\n    missing field `precursor_tol`", "rejected the search settings"),
             ("Error: The system cannot find the file specified. (os error 2)", "not found"),
             ("Error: The process cannot access the file because it is being used by another process. (os error 32)", "in use"),

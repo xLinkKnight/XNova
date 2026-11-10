@@ -64,11 +64,33 @@ impl Fasta {
     }
 
     pub fn digest(&self, enzyme: &EnzymeParameters) -> Vec<Digest> {
+        self.digest_clipping(enzyme, false)
+    }
+
+    /// Digest every protein. With `clip_n_term_met`, a protein whose initiator
+    /// Met methionine aminopeptidase removes is also digested without it: the
+    /// peptides starting at residue 2 are added as protein N-terminal (the
+    /// unclipped ones stay, as clipping is often incomplete). A peptide that
+    /// starts at residue 2 already (semi-enzymatic, or cut after the Met) is
+    /// then protein N-terminal instead of internal.
+    pub fn digest_clipping(&self, enzyme: &EnzymeParameters, clip_n_term_met: bool) -> Vec<Digest> {
         self.targets
             .par_iter()
             .flat_map_iter(|(protein, sequence)| {
-                enzyme
-                    .digest(sequence, protein.clone())
+                let mut digests = enzyme.digest(sequence, protein.clone());
+                if clip_n_term_met {
+                    for clipped in enzyme.clipped_digests(sequence, protein.clone()) {
+                        match digests.iter_mut().find(|d| d.sequence == clipped.sequence) {
+                            Some(digest) => {
+                                digest.position = clipped.position;
+                                digest.semi_enzymatic = clipped.semi_enzymatic;
+                                digest.missed_cleavages = clipped.missed_cleavages;
+                            }
+                            None => digests.push(clipped),
+                        }
+                    }
+                }
+                digests
                     .into_iter()
                     .filter_map(|mut digest| {
                         if protein.contains(&self.decoy_tag) {

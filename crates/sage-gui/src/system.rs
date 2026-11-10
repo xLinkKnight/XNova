@@ -93,6 +93,36 @@ pub enum GpuSupport {
     Unknown(String),
 }
 
+/// `sage.exe <config> --estimate`: the size of the database the search would
+/// build, as sage.exe prints it (its log lines left out)
+pub fn estimate_database(sage: &Path, config: &Path) -> Result<String, String> {
+    if !sage.is_file() {
+        return Err("sage.exe not found (Files > Programs)".into());
+    }
+    let mut cmd = Command::new(sage);
+    cmd.arg(config).arg("--estimate");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().map_err(|e| format!("could not run sage.exe: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('[') && !l.trim().is_empty()).collect();
+    if out.status.success() && !lines.is_empty() {
+        Ok(lines.join("\n"))
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let last = err.lines().filter(|l| !l.trim().is_empty()).last().unwrap_or("no output").to_string();
+        Err(if lines.is_empty() && out.status.success() {
+            "this sage.exe cannot estimate (it is older than XNova's --estimate)".into()
+        } else {
+            last
+        })
+    }
+}
+
 /// Ask `sage.exe --gpu-info`
 pub fn probe_sage_gpu(sage: &Path) -> GpuSupport {
     if !sage.is_file() {
@@ -250,6 +280,33 @@ impl MemoryCap {
 
 #[cfg(test)]
 mod test {
+
+    /// `sage.exe --estimate` through the GUI: the debug or release sage.exe of
+    /// this build (skipped when neither is built)
+    #[test]
+    fn estimates_the_database_with_sage() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let target = option_env!("CARGO_TARGET_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| root.join("target"));
+        let exe = if cfg!(windows) { "sage.exe" } else { "sage" };
+        let Some(sage) = ["debug", "release"].iter().map(|p| target.join(p).join(exe)).find(|p| p.is_file()) else {
+            eprintln!("skipped: sage.exe not built");
+            return;
+        };
+        // the test configuration, with its paths made absolute
+        let tests = root.join("tests");
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tests.join("config.json")).unwrap()).unwrap();
+        json["database"]["fasta"] = serde_json::json!(tests.join("Q99536.fasta"));
+        json["mzml_paths"] = serde_json::json!([tests.join("LQSRPAAPPAPGPGQLTLR.mzML")]);
+        let config = std::env::temp_dir().join(format!("xnova_estimate_test_{}.json", std::process::id()));
+        std::fs::write(&config, json.to_string()).unwrap();
+        let result = estimate_database(&sage, &config);
+        let _ = std::fs::remove_file(&config);
+        let text = result.unwrap();
+        assert!(text.contains("peptide forms (targets and decoys): 102"), "{text}");
+        assert!(text.contains("fragments indexed: 2872"), "{text}");
+        assert!(estimate_database(std::path::Path::new("nowhere/sage.exe"), &config).is_err());
+    }
     use super::*;
 
     #[test]

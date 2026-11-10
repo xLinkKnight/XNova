@@ -22,6 +22,10 @@ tokio = { version = "1.0", features = ["fs", "io-util", "rt", "macros"] }
 tokio-util = { version = "0.7", features = ["io"] }
 quick-xml = { version = "0.31.0", features = ["async-tokio"] }
 timsrust = { version = "0.6.7"}
+# Thermo RAW reader: pure Rust, Apache-2.0 (Sage Plus fork of Sigilweaver OpenTFRaw)
+sage-plus-raw = "0.1.0"
+# analysis.tdf's TimsCalibration (already built for timsrust; same version and features)
+rusqlite = { version = "0.35", features = ["bundled"] }
 rayon = "1.5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"], default-features = false }
 regex = "1.6"

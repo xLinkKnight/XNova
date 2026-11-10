@@ -1,11 +1,15 @@
-use crate::enzyme::{group_digests, Enzyme, EnzymeParameters};
+use crate::enzyme::{group_digests, DigestGroup, Enzyme, EnzymeParameters};
 use crate::fasta::Fasta;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::Tolerance;
 use crate::modification::{
-    DetailedMod, ModEntry, ModId, ModificationError, ModificationSpecificity, Modifications,
+    DetailedMod, ModEntry, ModId, ModificationError, ModificationSpecificity, Modifications, SearchMode,
+    SiteMode,
 };
-use crate::peptide::Peptide;
+use crate::peptide::{Peptide, Site};
+use crate::scoring::Feature;
+use crate::site_rules::{SiteContext, SiteRule};
+use std::borrow::Cow;
 use dashmap::DashSet;
 use fnv::FnvBuildHasher;
 use itertools::Itertools;
@@ -168,11 +172,16 @@ pub struct Builder {
     /// Static modifications to add to matching amino acids.
     /// Each entry is either a bare mass (`57.0215`) or an object with `mass` and
     /// an optional ProForma `name` (`{"mass": 57.0215, "name": "UNIMOD:4"}`).
+    /// Keys: a residue or `^ $ [ ]` symbol, or a named site (see
+    /// [`crate::site_rules`]).
+    #[serde(default, deserialize_with = "crate::site_rules::named_static_mods")]
     pub static_mods: Option<HashMap<ModificationSpecificity, ModEntry>>,
     /// Variable modifications to add to matching amino acids.
     /// Each entry is either a bare mass (`15.9949`) or an object with `mass` and
     /// optional `max_count` and `name` fields
-    /// (`{"mass": 15.9949, "max_count": 1, "name": "UNIMOD:35"}`).
+    /// (`{"mass": 15.9949, "max_count": 1, "name": "UNIMOD:35"}`), and
+    /// optionally `position`, `motif` and `neutral_losses`.
+    #[serde(default, deserialize_with = "crate::site_rules::named_variable_mods")]
     pub variable_mods: Option<HashMap<ModificationSpecificity, Vec<ModEntry>>>,
     /// Limit number of variable modifications on a peptide
     pub max_variable_mods: Option<usize>,
@@ -192,6 +201,10 @@ pub struct Builder {
     pub prefilter: Option<bool>,
     /// Pre-filter the database with a minimal amount of memory at the cost of speed
     pub prefilter_low_memory: Option<bool>,
+    /// Also digest each protein without its initiator Met when methionine
+    /// aminopeptidase removes it (second residue G, A, S, T, C, P or V);
+    /// those peptides are protein N-terminal (default: false)
+    pub clip_n_term_met: Option<bool>,
     /// SILAC: labelled channels; every peptide is also searched in each
     pub silac: Option<crate::silac::SilacSettings>,
     /// Proteins uniformly labelled with 15N and/or 13C
@@ -199,6 +212,9 @@ pub struct Builder {
     /// Two FASTA files, searched as one for linear peptides; crosslinks only
     /// between a protein of one and a protein of the other. Replaces `fasta`.
     pub crosslink_databases: Option<CrosslinkDatabases>,
+    /// Known modification sites, for variable modifications with
+    /// `site_mode: library` (see [`crate::site_library`])
+    pub site_library: Option<crate::site_library::SiteLibrarySettings>,
 }
 
 /// Two protein databases of a crosslink search between them, e.g. two
@@ -217,10 +233,42 @@ pub const DATABASE_2: u8 = 2;
 impl Builder {
     pub fn make_parameters(self) -> Result<Parameters, ModificationError> {
         let bucket_size = self.bucket_size.unwrap_or(8192).next_power_of_two();
-        let mut modifications = ResolvedModifications::new(
-            &self.static_mods.unwrap_or_default(),
-            &self.variable_mods.unwrap_or_default(),
-        )?;
+        let mut static_mods = self.static_mods.unwrap_or_default();
+        // chemical labelling (dimethyl): the light channel's labels are static
+        if let Some(silac) = &self.silac {
+            silac.validate().map_err(ModificationError::Silac)?;
+            for (specificity, entry) in silac.light_static_mods() {
+                match static_mods.get(&specificity) {
+                    // e.g. a configuration written back by a search
+                    Some(existing) if (existing.mass() - entry.mass()).abs() < 1e-4 => {}
+                    Some(_) => {
+                        return Err(ModificationError::Silac(format!(
+                            "silac: the light label on {specificity} replaces its static modification; remove that"
+                        )))
+                    }
+                    None => {
+                        static_mods.insert(specificity, entry);
+                    }
+                }
+            }
+        }
+        let mut modifications =
+            ResolvedModifications::new(&static_mods, &self.variable_mods.unwrap_or_default())?;
+        if modifications.has_library_mods() && self.site_library.is_none() {
+            return Err(ModificationError::Rule(
+                "a modification with site_mode library needs database.site_library".into(),
+            ));
+        }
+        if modifications.has_library_mods() && !self.generate_decoys.unwrap_or(true) {
+            return Err(ModificationError::Rule(
+                "site_mode library needs generate_decoys: decoys must carry their targets' library sites".into(),
+            ));
+        }
+        if !modifications.offset_mods.is_empty() && (self.silac.is_some() || self.labelled_proteins.is_some()) {
+            return Err(ModificationError::Rule(
+                "mass offsets (search_mode mass_offset) cannot be combined with SILAC or labelled proteins".into(),
+            ));
+        }
         let mut configured: Vec<(ModificationSpecificity, ModId)> = modifications
             .static_mods
             .iter()
@@ -268,12 +316,15 @@ impl Builder {
             prefilter_chunk_size: self.prefilter_chunk_size.unwrap_or(0),
             prefilter: self.prefilter.unwrap_or(false),
             prefilter_low_memory: self.prefilter_low_memory.unwrap_or(true),
+            clip_n_term_met: self.clip_n_term_met.unwrap_or(false),
             silac: self.silac,
             labels,
             labelled_proteins: self.labelled_proteins,
             protein_labels,
             crosslink_databases: self.crosslink_databases,
             database_groups: None,
+            site_library: self.site_library,
+            library: None,
         })
     }
 
@@ -301,6 +352,8 @@ pub struct Parameters {
     pub prefilter_chunk_size: usize,
     pub prefilter: bool,
     pub prefilter_low_memory: bool,
+    /// Also search proteins without their initiator Met (see [`Builder::clip_n_term_met`])
+    pub clip_n_term_met: bool,
     /// SILAC channels (`None`: no labels)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub silac: Option<crate::silac::SilacSettings>,
@@ -320,9 +373,53 @@ pub struct Parameters {
     /// [`DATABASE_1`] and/or [`DATABASE_2`]), set by [`Parameters::merge_databases`]
     #[serde(skip)]
     pub database_groups: Option<Arc<HashMap<Arc<str>, u8>>>,
+    /// Known modification sites (`site_mode: library`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site_library: Option<crate::site_library::SiteLibrarySettings>,
+    /// The site library, resolved to the modifications by
+    /// [`Parameters::load_site_library`]
+    #[serde(skip)]
+    pub library: Option<Arc<crate::site_library::ResolvedLibrary>>,
 }
 
 impl Parameters {
+    /// Resolve the rows of a site library (`text`, see
+    /// [`crate::site_library`]) to the `site_mode: library` modifications
+    pub fn load_site_library(&mut self, text: &str) -> Result<&crate::site_library::ResolvedLibrary, String> {
+        let max_q = self.site_library.as_ref().map_or(0.01, |s| s.max_q);
+        let rows = crate::site_library::parse(text, max_q)?;
+        let mut library = crate::site_library::ResolvedLibrary { rows: rows.len(), ..Default::default() };
+        let mods = &self.modifications;
+        for row in rows {
+            let ids: Vec<ModId> = mods
+                .variable_mods
+                .iter()
+                .zip(&mods.variable_rules)
+                .filter(|((specificity, id, _), rule)| {
+                    rule.library == Some(*id)
+                        && *specificity == ModificationSpecificity::Residue(row.residue)
+                        && crate::site_library::names(mods.registry.get(*id), &row.modification)
+                })
+                .map(|((_, id, _), _)| *id)
+                .unique()
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            library.used += 1;
+            let entries = library.sites.entry(row.protein).or_default();
+            for id in ids {
+                entries.push((row.position - 1, row.residue, id));
+            }
+        }
+        for entries in library.sites.values_mut() {
+            entries.sort_unstable();
+            entries.dedup();
+        }
+        self.library = Some(Arc::new(library));
+        Ok(self.library.as_deref().expect("just set"))
+    }
+
     /// The FASTA files searched: `fasta`, or the two crosslink databases
     pub fn fasta_files(&self) -> Vec<&str> {
         match &self.crosslink_databases {
@@ -350,7 +447,7 @@ impl Parameters {
         self.prefilter_chunk_size = match self.prefilter_chunk_size {
             0 => {
                 let enzyme = self.enzyme.clone().into();
-                let total_unmodified_pep_count: usize = fasta.digest(&enzyme).len();
+                let total_unmodified_pep_count: usize = fasta.digest_clipping(&enzyme, self.clip_n_term_met).len();
                 let combination_factor = if self.max_variable_mods >= usize::BITS as usize {
                     usize::MAX
                 } else {
@@ -378,7 +475,7 @@ impl Parameters {
         let enzyme = self.enzyme.clone().into();
         // Generate all tryptic peptide sequences, including reversed (decoy)
         // and missed cleavages, if applicable.
-        let digests = fasta.digest(&enzyme);
+        let digests = fasta.digest_clipping(&enzyme, self.clip_n_term_met);
 
         log::trace!("grouping digests");
         let start_num = digests.len();
@@ -389,8 +486,6 @@ impl Parameters {
             digests.len()
         );
 
-        let mods = &self.modifications;
-
         let targets: DashSet<_, FnvBuildHasher> = DashSet::default();
         digests
             .par_iter()
@@ -400,48 +495,152 @@ impl Parameters {
             });
 
         log::trace!("modifying peptides");
+        let proteins = self.motif_proteins(fasta);
         let mut target_decoys = digests
             .into_par_iter()
-            .map(Peptide::try_from)
-            .filter_map(Result::ok)
-            .flat_map_iter(|peptide| {
-                peptide
-                    .apply(
-                        &mods.variable_mods,
-                        &mods.static_mods,
-                        &mods.registry,
-                        self.max_variable_mods,
-                        self.max_combinations,
-                    )
-                    .into_iter()
-                    // uniformly labelled proteins: their peptides labelled
-                    .flat_map(|peptide| match &self.protein_labels {
-                        Some(labels) => labels.states(peptide),
-                        None => vec![peptide],
-                    })
-                    // SILAC: each peptide light and in every labelled channel
-                    .flat_map(|peptide| match &self.labels {
-                        Some(labels) => labels.states(peptide),
-                        None => vec![peptide],
-                    })
-                    .filter(|peptide| {
-                        peptide.monoisotopic >= self.peptide_min_mass
-                            && peptide.monoisotopic <= self.peptide_max_mass
-                    })
-                    .flat_map(|peptide| {
-                        if self.generate_decoys {
-                            vec![peptide.reverse(), peptide].into_iter()
-                        } else {
-                            vec![peptide].into_iter()
-                        }
-                    })
-                    .filter(|peptide| !peptide.decoy || !targets.contains(&(peptide.sequence[..])))
-            })
+            .filter_map(|group| self.with_context(&proteins, group))
+            .flat_map_iter(|(peptide, context)| self.forms(peptide, context, &targets))
             .collect::<Vec<_>>();
 
         Self::reorder_peptides(&mut target_decoys);
 
         target_decoys
+    }
+
+    /// Protein sequences by accession when a motif or the site library
+    /// needs them (else empty)
+    fn motif_proteins<'f>(&self, fasta: &'f Fasta) -> HashMap<&'f str, &'f [u8]> {
+        match self.modifications.has_motifs() || self.library.is_some() {
+            true => fasta.targets.iter().map(|(acc, seq)| (acc.as_ref(), seq.as_bytes())).collect(),
+            false => HashMap::new(),
+        }
+    }
+
+    /// A digested peptide, and where it sits in its (first) protein when
+    /// motifs need to look past it; with a site library, the library's
+    /// sites on the peptide in each of its proteins
+    fn with_context(
+        &self,
+        proteins: &HashMap<&str, &[u8]>,
+        group: DigestGroup,
+    ) -> Option<(Peptide, Option<SiteContext>)> {
+        let sequence = group.reference.sequence.as_bytes();
+        let mut context = proteins
+            .get(group.reference.protein.as_ref())
+            .and_then(|protein| SiteContext::find(protein, sequence));
+        if let Some(library) = &self.library {
+            let mut sites: Vec<(usize, ModId)> = Vec::new();
+            for accession in &group.proteins {
+                let (Some(listed), Some(protein)) =
+                    (library.sites.get(accession.as_ref()), proteins.get(accession.as_ref()))
+                else {
+                    continue;
+                };
+                let Some(start) = protein.windows(sequence.len().max(1)).position(|w| w == sequence) else {
+                    continue;
+                };
+                for &(position, residue, id) in listed {
+                    if (start..start + sequence.len()).contains(&position) && sequence[position - start] == residue {
+                        sites.push((position - start, id));
+                    }
+                }
+            }
+            if !sites.is_empty() {
+                sites.sort_unstable();
+                sites.dedup();
+                context
+                    .get_or_insert_with(|| SiteContext { sequence: sequence.to_vec(), offset: 0, library: Vec::new() })
+                    .library = sites;
+            }
+        }
+        Peptide::try_from(group).ok().map(|peptide| (peptide, context))
+    }
+
+    /// Every form of one digested peptide the search indexes: its
+    /// modifications, labelled states and SILAC channels within the mass
+    /// range, each with its decoy (unless the decoy is a target sequence)
+    fn forms<'a>(
+        &'a self,
+        peptide: Peptide,
+        context: Option<crate::site_rules::SiteContext>,
+        targets: &'a DashSet<Vec<u8>, FnvBuildHasher>,
+    ) -> impl Iterator<Item = Peptide> + 'a {
+        let mods = &self.modifications;
+        peptide
+            .apply_with_rules(
+                &mods.variable_mods,
+                &mods.variable_rules,
+                &mods.static_mods,
+                &mods.static_rules,
+                &mods.registry,
+                self.max_variable_mods,
+                self.max_combinations,
+                context.as_ref(),
+            )
+            .into_iter()
+            // uniformly labelled proteins: their peptides labelled
+            .flat_map(move |peptide| match &self.protein_labels {
+                Some(labels) => labels.states(peptide),
+                None => vec![peptide],
+            })
+            // SILAC: each peptide light and in every labelled channel
+            .flat_map(move |peptide| match &self.labels {
+                Some(labels) => labels.states(peptide),
+                None => vec![peptide],
+            })
+            .filter(move |peptide| {
+                peptide.monoisotopic >= self.peptide_min_mass && peptide.monoisotopic <= self.peptide_max_mass
+            })
+            .flat_map(move |peptide| {
+                if self.generate_decoys {
+                    vec![peptide.reverse(), peptide].into_iter()
+                } else {
+                    vec![peptide].into_iter()
+                }
+            })
+            .filter(move |peptide| !peptide.decoy || !targets.contains(&(peptide.sequence[..])))
+    }
+
+    /// The size of the database a search would build, counted without
+    /// building it: each digested peptide's forms are generated and counted
+    /// one at a time (the same forms the search indexes), so only one
+    /// peptide's forms are held per thread. Peptides found in several
+    /// proteins are merged by the search, so the counts are an upper bound.
+    pub fn estimate(&self, fasta: &Fasta) -> DatabaseEstimate {
+        let enzyme = self.enzyme.clone().into();
+        let digests = fasta.digest_clipping(&enzyme, self.clip_n_term_met);
+        if digests.is_empty() {
+            return DatabaseEstimate { proteins: fasta.targets.len(), ..Default::default() };
+        }
+        let digests = group_digests(digests);
+        let targets: DashSet<_, FnvBuildHasher> = DashSet::default();
+        digests.par_iter().filter(|digest| !digest.reference.decoy).for_each(|digest| {
+            targets.insert(digest.reference.sequence.clone().into_bytes());
+        });
+        let per_peptide = std::mem::size_of::<Peptide>() as u64;
+        let kinds = self.ion_kinds.len();
+        let sum = |a: [u64; 4], b: [u64; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+        let proteins = self.motif_proteins(fasta);
+        let [peptides, decoys, fragments, bytes] = digests
+            .into_par_iter()
+            .filter_map(|group| self.with_context(&proteins, group))
+            .map(|(peptide, context)| {
+                self.forms(peptide, context, &targets).fold([0u64; 4], |acc, p| {
+                    let len = p.sequence.len();
+                    let fragments = (kinds * len.saturating_sub(1 + self.min_ion_index)) as u64;
+                    // the peptide, its sequence, modification masses and protein list; 8 bytes per fragment
+                    let bytes = per_peptide + 5 * len as u64 + 16 + 8 * fragments;
+                    sum(acc, [1, p.decoy as u64, fragments, bytes])
+                })
+            })
+            .reduce(|| [0; 4], sum);
+        DatabaseEstimate {
+            proteins: fasta.targets.len(),
+            peptides: peptides as usize,
+            decoys: decoys as usize,
+            fragments: fragments as usize,
+            bytes,
+        }
     }
 
     pub fn reorder_peptides(target_decoys: &mut Vec<Peptide>) {
@@ -591,8 +790,23 @@ impl Parameters {
             None => Vec::new(),
         };
 
+        // mass offsets: one per modification, with all of its sites
+        let mut mass_offsets: Vec<MassOffset> = Vec::new();
+        for (specificity, id, rule) in &self.modifications.offset_mods {
+            match mass_offsets.iter_mut().find(|o| o.id == *id) {
+                Some(offset) => offset.sites.push((*specificity, rule.clone())),
+                None => mass_offsets.push(MassOffset {
+                    id: *id,
+                    mass: self.modifications.registry.get(*id).mass,
+                    sites: vec![(*specificity, rule.clone())],
+                }),
+            }
+        }
+
         IndexedDatabase {
             database_groups,
+            mass_offsets,
+            offset_peptides: Vec::new(),
             peptides: target_decoys,
             fragments,
             min_value,
@@ -615,9 +829,80 @@ pub struct ResolvedModifications {
     pub static_mods: Vec<(ModificationSpecificity, ModId)>,
     /// `(specificity, modification, per_mod_limit)`, in a stable order
     pub variable_mods: Vec<(ModificationSpecificity, ModId, Option<usize>)>,
+    /// Where each static / variable modification may sit (same order)
+    pub static_rules: Vec<crate::site_rules::SiteRule>,
+    pub variable_rules: Vec<crate::site_rules::SiteRule>,
+    /// Variable modifications searched as mass offsets
+    /// (`search_mode: mass_offset`), not indexed
+    pub offset_mods: Vec<(ModificationSpecificity, ModId, SiteRule)>,
+}
+
+/// Check a configured modification's rule and neutral losses, and register
+/// the losses
+fn register_rule(
+    registry: &mut Modifications,
+    specificity: ModificationSpecificity,
+    id: ModId,
+    entry: &ModEntry,
+) -> Result<crate::site_rules::SiteRule, ModificationError> {
+    use ModificationSpecificity::*;
+    let rule = entry.rule();
+    let residue = match specificity {
+        Residue(r) => Some(r),
+        PeptideN(r) | PeptideC(r) | ProteinN(r) | ProteinC(r) => r,
+    };
+    if !rule.is_any() {
+        let Some(r) = residue else {
+            return Err(ModificationError::Rule(format!(
+                "modification on {specificity}: a position or motif needs a residue"
+            )));
+        };
+        if !rule.position.is_anywhere() && !matches!(specificity, Residue(_)) {
+            return Err(ModificationError::Rule(format!(
+                "modification on {specificity}: a terminal residue has no other position"
+            )));
+        }
+        if let Some(motif) = &rule.motif {
+            if !motif.site_residues().contains(&r) {
+                return Err(ModificationError::Rule(format!(
+                    "modification on {specificity}: the site of motif {} is never {}",
+                    motif.pattern(),
+                    r as char
+                )));
+            }
+        }
+    }
+    for &loss in entry.neutral_losses() {
+        if !loss.is_finite() || loss <= 0.0 {
+            return Err(ModificationError::Rule(format!(
+                "modification on {specificity}: neutral losses must be positive masses"
+            )));
+        }
+        registry.add_neutral_loss(id, residue.unwrap_or(0), loss);
+    }
+    let mut rule = rule;
+    if entry.site_mode() == SiteMode::Library {
+        if !matches!(specificity, Residue(_)) {
+            return Err(ModificationError::Rule(format!(
+                "modification on {specificity}: site_mode library is for residues, not termini"
+            )));
+        }
+        rule.library = Some(id);
+    }
+    Ok(rule)
 }
 
 impl ResolvedModifications {
+    /// Does a configured modification have a motif (which needs the protein)?
+    pub fn has_motifs(&self) -> bool {
+        self.static_rules.iter().chain(&self.variable_rules).any(|r| r.motif.is_some())
+    }
+
+    /// Is a variable modification limited to the site library?
+    pub fn has_library_mods(&self) -> bool {
+        self.variable_rules.iter().any(|r| r.library.is_some())
+    }
+
     /// Number of distinct sites (e.g. `M`, `^`) with variable modifications
     fn variable_specificities(&self) -> usize {
         // `variable_mods` is sorted by specificity
@@ -629,14 +914,38 @@ impl ResolvedModifications {
     }
 
     /// Serializable config entry for a registered modification
-    fn entry(&self, id: ModId, max_count: Option<usize>) -> ModEntry {
+    fn entry(
+        &self,
+        specificity: ModificationSpecificity,
+        id: ModId,
+        max_count: Option<usize>,
+        rule: Option<&crate::site_rules::SiteRule>,
+        search_mode: SearchMode,
+    ) -> ModEntry {
+        use ModificationSpecificity::*;
         let modification = self.registry.get(id);
+        let residue = match specificity {
+            Residue(r) => Some(r),
+            PeptideN(r) | PeptideC(r) | ProteinN(r) | ProteinC(r) => r,
+        };
+        let neutral_losses: Vec<f32> = self.registry.neutral_losses(id, residue.unwrap_or(0)).collect();
+        let rule = rule.cloned().unwrap_or_default();
         match (&modification.name, max_count) {
-            (None, None) => ModEntry::Mass(modification.mass),
+            (None, None) if rule.is_any() && neutral_losses.is_empty() && search_mode.is_indexed() => {
+                ModEntry::Mass(modification.mass)
+            }
             (name, max_count) => ModEntry::Detailed(DetailedMod {
                 mass: modification.mass,
                 max_count,
                 name: name.clone(),
+                position: rule.position,
+                site_mode: match rule.library {
+                    Some(_) => SiteMode::Library,
+                    None => SiteMode::Exhaustive,
+                },
+                motif: rule.motif,
+                neutral_losses,
+                search_mode,
             }),
         }
     }
@@ -656,13 +965,23 @@ impl ResolvedModifications {
         {
             return Err(ModificationError::StaticMaxCount(*specificity));
         }
+        for (specificity, entry) in static_mods {
+            if !entry.search_mode().is_indexed() || !entry.site_mode().is_exhaustive() {
+                return Err(ModificationError::Rule(format!(
+                    "static modification on {specificity}: search_mode and site_mode are for variable modifications"
+                )));
+            }
+        }
 
         let mut static_entries = static_mods.iter().collect::<Vec<_>>();
         static_entries.sort_unstable_by_key(|(specificity, _)| **specificity);
+        let mut static_rules = Vec::with_capacity(static_entries.len());
         let static_mods = static_entries
             .into_iter()
             .map(|(specificity, entry)| {
-                Ok((*specificity, registry.insert(entry.mass(), entry.name())?))
+                let id = registry.insert(entry.mass(), entry.name())?;
+                static_rules.push(register_rule(&mut registry, *specificity, id, entry)?);
+                Ok((*specificity, id))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -679,18 +998,54 @@ impl ResolvedModifications {
             })
             .collect::<Vec<_>>();
         variable_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let variable_mods = variable_entries
-            .into_iter()
-            .map(|(specificity, _, entry)| {
-                let id = registry.insert(entry.mass(), entry.name())?;
-                Ok((specificity, id, entry.max_count()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut variable_rules = Vec::with_capacity(variable_entries.len());
+        let mut offset_mods = Vec::new();
+        let mut variable = Vec::with_capacity(variable_entries.len());
+        for (specificity, _, entry) in variable_entries {
+            let id = registry.insert(entry.mass(), entry.name())?;
+            let rule = register_rule(&mut registry, specificity, id, entry)?;
+            match entry.search_mode() {
+                SearchMode::Indexed => {
+                    variable_rules.push(rule);
+                    variable.push((specificity, id, entry.max_count()));
+                }
+                SearchMode::MassOffset => {
+                    let why = if entry.mass() == 0.0 || !entry.mass().is_finite() {
+                        Some("needs a non-zero mass")
+                    } else if rule.motif.is_some() {
+                        Some("cannot have a motif (offsets are placed on the peptide alone)")
+                    } else if rule.library.is_some() {
+                        Some("cannot use site_mode library")
+                    } else {
+                        None
+                    };
+                    if let Some(why) = why {
+                        return Err(ModificationError::Rule(format!("mass offset on {specificity} {why}")));
+                    }
+                    offset_mods.push((specificity, id, rule));
+                }
+            }
+        }
+        let variable_mods = variable;
+        if let Some((specificity, id, _)) =
+            offset_mods.iter().find(|(_, id, _)| variable_mods.iter().any(|(_, v, _)| v == id))
+        {
+            return Err(ModificationError::Rule(format!(
+                "modification {} on {specificity} is both indexed and a mass offset; search it one way",
+                registry.get(*id)
+            )));
+        }
+        if offset_mods.iter().map(|(_, id, _)| id).unique().count() > MAX_MASS_OFFSETS {
+            return Err(ModificationError::Rule(format!("at most {MAX_MASS_OFFSETS} mass offsets")));
+        }
 
         Ok(ResolvedModifications {
             registry,
             static_mods,
             variable_mods,
+            static_rules,
+            variable_rules,
+            offset_mods,
         })
     }
 }
@@ -706,14 +1061,29 @@ impl Serialize for ResolvedModifications {
         let static_mods = self
             .static_mods
             .iter()
-            .map(|&(specificity, id)| (specificity, self.entry(id, None)))
+            .enumerate()
+            .map(|(i, &(specificity, id))| {
+                (specificity, self.entry(specificity, id, None, self.static_rules.get(i), SearchMode::Indexed))
+            })
             .collect::<BTreeMap<_, _>>();
         let mut variable_mods = BTreeMap::<_, Vec<_>>::new();
-        for &(specificity, id, max_count) in &self.variable_mods {
-            variable_mods
-                .entry(specificity)
-                .or_default()
-                .push(self.entry(id, max_count));
+        for (i, &(specificity, id, max_count)) in self.variable_mods.iter().enumerate() {
+            variable_mods.entry(specificity).or_default().push(self.entry(
+                specificity,
+                id,
+                max_count,
+                self.variable_rules.get(i),
+                SearchMode::Indexed,
+            ));
+        }
+        for (specificity, id, rule) in &self.offset_mods {
+            variable_mods.entry(*specificity).or_default().push(self.entry(
+                *specificity,
+                *id,
+                None,
+                Some(rule),
+                SearchMode::MassOffset,
+            ));
         }
 
         let mut state = serializer.serialize_struct("ResolvedModifications", 2)?;
@@ -740,6 +1110,19 @@ pub struct Theoretical {
     pub fragment_mz: f32,
 }
 
+/// The size of a search's database, from [`Parameters::estimate`]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct DatabaseEstimate {
+    pub proteins: usize,
+    /// Indexed peptide forms, targets and decoys
+    pub peptides: usize,
+    pub decoys: usize,
+    /// Theoretical fragments in the index
+    pub fragments: usize,
+    /// Memory of the peptides and the fragment index (bytes)
+    pub bytes: u64,
+}
+
 #[derive(Default)]
 pub struct IndexedDatabase {
     pub peptides: Vec<Peptide>,
@@ -760,6 +1143,39 @@ pub struct IndexedDatabase {
     /// Two crosslink databases: of each peptide (by index), [`DATABASE_1`]
     /// and/or [`DATABASE_2`]; empty with one database
     pub database_groups: Vec<u8>,
+    /// Variable modifications searched as mass offsets
+    pub mass_offsets: Vec<MassOffset>,
+    /// Peptides with a mass offset placed, given an index after the search
+    /// by [`IndexedDatabase::materialize_mass_offsets`] (indices from
+    /// `peptides.len()` on)
+    pub offset_peptides: Vec<Peptide>,
+}
+
+/// At most this many mass offsets (a candidate keeps its offset in a byte,
+/// 0 for none)
+pub const MAX_MASS_OFFSETS: usize = u8::MAX as usize - 1;
+
+/// A variable modification searched as a mass offset (`search_mode:
+/// mass_offset`, after Sage Plus, MIT). It is not expanded into the fragment
+/// index: every spectrum is also searched at its precursor mass less the
+/// offset, matching fragments both as indexed and shifted by the offset, and
+/// each candidate is then scored with the offset on every site it may take.
+/// At most one offset goes on a peptide, on a residue (or terminus) without
+/// another modification, besides the indexed variable modifications.
+#[derive(Clone, Debug)]
+pub struct MassOffset {
+    pub id: ModId,
+    pub mass: f32,
+    /// The sites it may take, with their position rules
+    pub sites: Vec<(ModificationSpecificity, SiteRule)>,
+}
+
+/// A mass offset placed on a candidate: [`IndexedDatabase::mass_offsets`]
+/// index, and site
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct OffsetPlacement {
+    pub offset: u8,
+    pub site: Site,
 }
 
 /// SILAC channel of a peptide without labelled residues
@@ -907,11 +1323,73 @@ impl IndexedDatabase {
     }
 }
 
+impl IndexedDatabase {
+    /// Sites of `peptide` where mass offset `offset` may go
+    pub fn offset_sites(&self, peptide: &Peptide, offset: usize) -> Vec<Site> {
+        let o = &self.mass_offsets[offset];
+        peptide.offset_sites(&o.sites, o.id)
+    }
+
+    /// `peptide` with a mass offset placed
+    pub fn place(&self, peptide: &Peptide, placement: OffsetPlacement) -> Peptide {
+        let o = &self.mass_offsets[placement.offset as usize];
+        peptide.with_offset(placement.site, o.id, o.mass)
+    }
+
+    /// The peptide a PSM scored, with its mass offset (before
+    /// [`IndexedDatabase::materialize_mass_offsets`])
+    pub fn resolve(&self, feature: &Feature) -> Cow<'_, Peptide> {
+        match feature.mass_offset {
+            Some(placement) => Cow::Owned(self.place(&self[feature.peptide_idx], placement)),
+            None => Cow::Borrowed(&self[feature.peptide_idx]),
+        }
+    }
+
+    /// Give every PSM with a mass offset the index of its peptide form, so
+    /// that FDR, quantification and the outputs see ordinary peptides: a form
+    /// that is also indexed keeps that index, others are added once to
+    /// `offset_peptides`. Returns the number of PSMs with an offset.
+    pub fn materialize_mass_offsets(&mut self, features: &mut [Feature]) -> usize {
+        type Key = (bool, Arc<[u8]>, Box<[Option<ModId>]>, Option<ModId>, Option<ModId>);
+        let key = |p: &Peptide| -> Key { (p.decoy, p.sequence.clone(), p.modifications.clone(), p.nterm, p.cterm) };
+        let base = self.peptides.len();
+        let mut known: HashMap<Key, PeptideIx> = self
+            .offset_peptides
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (key(p), PeptideIx((base + i) as u32)))
+            .collect();
+        let mut placed = 0;
+        for feature in features.iter_mut() {
+            let Some(placement) = feature.mass_offset.take() else { continue };
+            placed += 1;
+            let peptide = self.place(&self[feature.peptide_idx], placement);
+            let lo = self.peptides.partition_point(|p| p.monoisotopic < peptide.monoisotopic - 0.01);
+            let indexed = self.peptides[lo..]
+                .iter()
+                .take_while(|p| p.monoisotopic <= peptide.monoisotopic + 0.01)
+                .position(|p| p.same_form(&peptide));
+            feature.peptide_idx = match indexed {
+                Some(i) => PeptideIx((lo + i) as u32),
+                None => *known.entry(key(&peptide)).or_insert_with(|| {
+                    self.offset_peptides.push(peptide);
+                    PeptideIx((base + self.offset_peptides.len() - 1) as u32)
+                }),
+            };
+        }
+        placed
+    }
+}
+
 impl std::ops::Index<PeptideIx> for IndexedDatabase {
     type Output = Peptide;
 
     fn index(&self, index: PeptideIx) -> &Self::Output {
-        &self.peptides[index.0 as usize]
+        let index = index.0 as usize;
+        match self.peptides.get(index) {
+            Some(peptide) => peptide,
+            None => &self.offset_peptides[index - self.peptides.len()],
+        }
     }
 }
 
@@ -1085,6 +1563,82 @@ mod test {
         assert!(serialized["variable_mods"]["M"][0].is_number());
     }
 
+    /// With `clip_n_term_met`, a protein starting M + small residue is also
+    /// searched without its Met: the clipped peptides are protein N-terminal
+    /// (they take protein N-terminal acetylation), the unclipped ones stay,
+    /// and each has its decoy; a protein M + large residue is not clipped
+    #[test]
+    fn initiator_methionine_clipping() {
+        let digest = |clip: bool| -> (Vec<Peptide>, Vec<String>) {
+            let builder: Builder = serde_json::from_value(serde_json::json!({
+                "fasta": "none",
+                "enzyme": {"missed_cleavages": 1, "min_len": 4, "max_len": 30},
+                "variable_mods": {"[": [42.010565]},
+                "clip_n_term_met": clip
+            }))
+            .unwrap();
+            let params = builder.make_parameters().unwrap();
+            assert_eq!(params.clip_n_term_met, clip);
+            let fasta = Fasta::parse(">sp|P1|ONE
+MSDEREVAEAKLLR
+>sp|P2|TWO
+MLDEREVAEAKLLR
+".into(), "rev_", true);
+            let peptides = params.digest(&fasta);
+            let registry = params.modifications.registry.clone();
+            let mut names: Vec<String> =
+                peptides.iter().filter(|p| !p.decoy).map(|p| p.display(&registry).to_string()).collect();
+            names.sort();
+            (peptides, names)
+        };
+        let (off, off_names) = digest(false);
+        let (on, on_names) = digest(true);
+        assert!(!off_names.iter().any(|p| p == "SDER" || p.ends_with("-SDER")), "{off_names:?}");
+        for p in ["SDER", "SDEREVAEAK", "MSDER"] {
+            assert!(on_names.contains(&p.to_string()), "{p} in {on_names:?}");
+        }
+        // the clipped N-termini take protein N-terminal acetylation
+        assert!(on_names.iter().any(|p| p.starts_with('[') && p.ends_with("SDER")), "{on_names:?}");
+        assert!(on_names.iter().any(|p| p.starts_with('[') && p.ends_with("-SDEREVAEAK")), "{on_names:?}");
+        // M + L is not clipped
+        assert!(!on_names.iter().any(|p| p.trim_start_matches(|c| c != 'L').starts_with("LDER") && !p.contains('M')), "{on_names:?}");
+        let sder = on.iter().find(|p| !p.decoy && p.sequence.as_ref() == b"SDER").unwrap();
+        assert_eq!(sder.position, crate::enzyme::Position::Nterm);
+        // targets and decoys stay balanced; 2 clipped peptides, each also acetylated
+        let count = |peptides: &[Peptide], decoy: bool| peptides.iter().filter(|p| p.decoy == decoy).count();
+        assert_eq!(count(&on, false), count(&on, true));
+        assert_eq!(count(&on, false), count(&off, false) + 4);
+    }
+
+    /// The estimate counts what the search would index
+    #[test]
+    fn estimate_counts_the_database() {
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 1, "min_len": 5, "max_len": 30},
+            "static_mods": {"C": 57.021464},
+            "variable_mods": {"M": [15.994915], "[": [42.010565]},
+            "peptide_min_mass": 300.0
+        }))
+        .unwrap();
+        let params = builder.make_parameters().unwrap();
+        let fasta = Fasta::parse(
+            ">sp|P1|ONE\nMSDEREVAEAKLLRCGMKPEPTIDEK\n>sp|P2|TWO\nMLDEREVAEAKLLRQQQMMK\n".into(),
+            "rev_",
+            true,
+        );
+        let estimate = params.estimate(&fasta);
+        let built = params.clone().build(fasta.clone());
+        assert_eq!(estimate.proteins, 2);
+        // the search merges duplicate forms, so the estimate is an upper bound, and close
+        assert!(estimate.peptides >= built.peptides.len(), "{} vs {}", estimate.peptides, built.peptides.len());
+        assert!(estimate.peptides <= built.peptides.len() + 2, "{} vs {}", estimate.peptides, built.peptides.len());
+        assert!(estimate.fragments >= built.fragments.len());
+        assert!(estimate.decoys * 2 >= estimate.peptides - 2);
+        assert!(estimate.bytes > 8 * estimate.fragments as u64);
+        assert_eq!(params.estimate(&Fasta::parse(String::new(), "rev_", true)).peptides, 0);
+    }
+
     #[test]
     fn digestion() {
         let fasta = r#"
@@ -1138,12 +1692,15 @@ mod test {
             prefilter: false,
             prefilter_chunk_size: 0,
             prefilter_low_memory: true,
+            clip_n_term_met: false,
             silac: None,
             labels: None,
             labelled_proteins: None,
             protein_labels: None,
             crosslink_databases: None,
             database_groups: None,
+            site_library: None,
+            library: None,
         };
 
         let peptides = params.digest(&fasta);
@@ -1317,5 +1874,175 @@ mod test {
         assert!(!db.cross_database(ix("GLEKVSTR"), ix("GLEKVSTR")));
         assert!(db.cross_database(ix("AAWLDEK"), ix("AAWLDEK")));
         assert!(db.cross_database(ix("AAWLDEK"), ix("GLEKVSTR")));
+    }
+
+    /// Named modifications: motif and position rules decide the sites (a
+    /// motif may reach past the peptide into its protein); decoys keep their
+    /// target's sites; rules and neutral losses survive serialization
+    #[test]
+    fn named_modification_sites() {
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 1, "min_len": 5},
+            "variable_mods": {
+                "motif:N-{P}-[ST]": [{"mass": 0.984016, "name": "UNIMOD:7"}],
+                "internal_residue:K": [{"mass": 114.042927, "name": "UNIMOD:121"}],
+                "S": [{"mass": 79.966331, "name": "UNIMOD:21", "neutral_losses": [97.976896]}],
+                "first_residue:Q": [{"mass": -17.026549, "name": "UNIMOD:28"}]
+            }
+        }))
+        .unwrap();
+        let params = builder.make_parameters().unwrap();
+        let fasta = crate::fasta::Fasta::parse(
+            ">p\nMAGLLNASGKLLNPTEGKLLLLNRSAAAAAKGGKLLLAAKQLLLLGR\n".into(),
+            "rev_",
+            false,
+        );
+        let peptides = params.digest(&fasta);
+        let show = |p: &Peptide| p.display(&params.modifications.registry).to_string();
+        let targets: Vec<String> = peptides.iter().filter(|p| !p.decoy).map(show).collect();
+        let has = |name: &str| targets.iter().any(|t| t == name);
+        // the sequon N-A-S; not N-P-T
+        assert!(has("MAGLLN[UNIMOD:7]ASGK"), "{targets:?}");
+        assert!(!targets.iter().any(|t| t.contains("N[UNIMOD:7]PT")), "{targets:?}");
+        // N-R|S: the S/T is the next protein residue, past the peptide
+        assert!(has("LLLLN[UNIMOD:7]R"), "{targets:?}");
+        // GlyGly on an internal lysine only
+        assert!(has("GGK[UNIMOD:121]LLLAAK"), "{targets:?}");
+        assert!(!targets.iter().any(|t| t.ends_with("K[UNIMOD:121]")), "{targets:?}");
+        // named terminal site: pyro-glu on a peptide-initial Q
+        assert!(has("Q[UNIMOD:28]LLLLGR"), "{targets:?}");
+        // decoys are reversed targets: they keep the sites
+        assert!(peptides.iter().any(|p| p.decoy && show(p).contains("N[UNIMOD:7]")));
+
+        // phospho's loss is registered on S
+        let phospho = params.modifications.variable_mods.iter().find(|(s, _, _)| *s == ModificationSpecificity::Residue(b'S')).unwrap().1;
+        let losses: Vec<f32> = params.modifications.registry.neutral_losses(phospho, b'S').collect();
+        assert!((losses[0] - 97.976896).abs() < 1e-4);
+        assert_eq!(params.modifications.registry.neutral_losses(phospho, b'T').count(), 0);
+
+        // the configuration written back keeps rules and losses, and reads again
+        let written = serde_json::to_value(&params.modifications).unwrap();
+        assert_eq!(written["variable_mods"]["N"][0]["motif"], "N-{P}-[ST]");
+        assert_eq!(written["variable_mods"]["K"][0]["position"], "internal");
+        assert!((written["variable_mods"]["S"][0]["neutral_losses"][0].as_f64().unwrap() - 97.976896).abs() < 1e-4);
+        let again: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 1, "min_len": 5},
+            "variable_mods": written["variable_mods"].clone()
+        }))
+        .unwrap();
+        let again = again.make_parameters().unwrap();
+        assert_eq!(again.modifications.variable_rules, params.modifications.variable_rules);
+        let mut a: Vec<String> = again.digest(&fasta).iter().map(|p| p.display(&again.modifications.registry).to_string()).collect();
+        let mut b: Vec<String> = peptides.iter().map(show).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+
+        // rules that cannot apply
+        for bad in [
+            serde_json::json!({"^": [{"mass": 1.0, "position": "internal"}]}),
+            serde_json::json!({"K": [{"mass": 1.0, "motif": "N-x-[ST]"}]}),
+            serde_json::json!({"S": [{"mass": 1.0, "neutral_losses": [-3.0]}]}),
+        ] {
+            let builder: Builder =
+                serde_json::from_value(serde_json::json!({"fasta": "none", "variable_mods": bad})).unwrap();
+            assert!(builder.make_parameters().is_err(), "{bad}");
+        }
+        let unknown = serde_json::from_value::<Builder>(serde_json::json!({"fasta": "none", "variable_mods": {"elsewhere:K": [1.0]}}));
+        assert!(unknown.is_err());
+
+        // a static modification with a rule: on internal lysines only
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 1, "min_len": 5},
+            "static_mods": {"internal_residue:K": 42.010565}
+        }))
+        .unwrap();
+        let params = builder.make_parameters().unwrap();
+        let shown: Vec<String> = params.digest(&fasta).iter().filter(|p| !p.decoy).map(|p| p.display(&params.modifications.registry).to_string()).collect();
+        assert!(shown.iter().any(|t| t.starts_with("GGK[+42.01") && t.ends_with("]LLLAAK")), "{shown:?}");
+        assert!(!shown.iter().any(|t| t.ends_with(']')), "no C-terminal lysine carries it: {shown:?}");
+    }
+}
+
+#[cfg(test)]
+mod site_library_tests {
+    use super::*;
+
+    fn parameters(variable: serde_json::Value, library: bool) -> Result<Parameters, ModificationError> {
+        let mut config = serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 0, "min_len": 5},
+            "variable_mods": variable,
+        });
+        if library {
+            config["site_library"] = serde_json::json!({"path": "sites.tsv"});
+        }
+        let builder: Builder = serde_json::from_value(config).unwrap();
+        builder.make_parameters()
+    }
+
+    fn phospho() -> serde_json::Value {
+        serde_json::json!({
+            "S": [{"mass": 79.966331, "name": "UNIMOD:21", "site_mode": "library"}],
+            "T": [{"mass": 79.966331, "name": "UNIMOD:21", "site_mode": "library"}],
+            "M": [15.9949]
+        })
+    }
+
+    /// Phospho only at the library's sites, on any protein of a peptide;
+    /// decoys keep their target's site
+    #[test]
+    fn library_sites_limit_a_modification() {
+        let mut params = parameters(phospho(), true).unwrap();
+        // P1: MSSTPLGEKSASTPAAR; P2 shares SASTPAAR at 1-8
+        let library = params
+            .load_site_library(
+                "protein\tposition\tresidue\tmodification\n\
+                 P1\t3\tS\tUNIMOD:21\n\
+                 P2\t4\tT\t+79.96633\n\
+                 P1\t2\tS\tUNIMOD:35\n\
+                 P1\t5\tP\tUNIMOD:21\n",
+            )
+            .unwrap();
+        assert_eq!((library.rows, library.used), (4, 2), "an unknown modification and a P are not used");
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["variable_mods"]["S"][0]["site_mode"], "library");
+        assert_eq!(json["site_library"]["path"], "sites.tsv");
+
+        let fasta = crate::fasta::Fasta::parse(">P1\nMSSTPLGEKSASTPAAR\n>P2\nSASTPAARWEEK\n".into(), "rev_", true);
+        let db = params.clone().build(fasta);
+        let phospho = params.modifications.variable_mods.iter().find(|m| m.0 == ModificationSpecificity::Residue(b'S')).unwrap().1;
+        let sites = |sequence: &[u8], decoy: bool| -> Vec<Vec<usize>> {
+            let mut out: Vec<Vec<usize>> = db
+                .peptides
+                .iter()
+                .filter(|p| p.decoy == decoy && p.sequence.as_ref() == sequence)
+                .map(|p| (0..p.sequence.len()).filter(|&i| p.modifications[i] == Some(phospho)).collect())
+                .collect();
+            out.sort();
+            out
+        };
+        // MSSTPLGEK: only S3 (index 2), with or without oxidised M
+        assert_eq!(sites(b"MSSTPLGEK", false), vec![vec![], vec![], vec![2], vec![2]]);
+        // SASTPAAR: T4 from P2's row (index 3)
+        assert_eq!(sites(b"SASTPAAR", false), vec![vec![], vec![3]]);
+        // its decoy SAAPTSAR: the same residue, reversed (index 4)
+        assert_eq!(sites(b"SAAPTSAR", true), vec![vec![], vec![4]]);
+    }
+
+    #[test]
+    fn library_needs_a_library_and_residues() {
+        assert!(parameters(phospho(), false).is_err(), "no site_library");
+        let terminal = serde_json::json!({"^": [{"mass": 42.0106, "site_mode": "library"}]});
+        assert!(parameters(terminal, true).is_err());
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "static_mods": {"C": {"mass": 57.021465, "site_mode": "library"}},
+        }))
+        .unwrap();
+        assert!(builder.make_parameters().is_err(), "static");
     }
 }

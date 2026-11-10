@@ -41,8 +41,8 @@ A pair search thus costs one fragment-index search and a few binary searches per
 
 ### Thermo and Bruker data, with ion mobility
 
-* **Thermo:** mzML (also gzipped) and MGF files are read directly. In `sage-gui`, Thermo `.raw` files can be added as they are: they are converted to mzML with ProteoWizard msconvert or ThermoRawFileParser before the search. Isobaric reporter ions are read from MS2 or SPS-MS3 scans, optionally as signal-to-noise for Thermo files with noise data.
-* **Bruker timsTOF:** `.d` folders are read directly, each precursor's spectrum merged over all its frames. The precursor's ion mobility (1/K0) is reported for every crosslink match (`ion_mobility`), used to trace crosslinks and SILAC channels in MS1 (`mobility_pct_tolerance`), and shown in the spectrum viewer and its figures.
+* **Thermo:** `.raw` files, mzML (also gzipped) and MGF files are read directly. Thermo `.raw` files need no converter or Thermo software: `sage.exe` reads each scan's centroid peaks with a built-in pure-Rust reader ([sage-plus-raw](https://github.com/pgarrett-scripps/sage-plus-raw)), with Thermo's monoisotopic precursor m/z and the native spectrum ids msconvert writes. In `sage-gui` they can instead be converted to mzML with ProteoWizard msconvert or ThermoRawFileParser first (Files > Programs), which TMT signal-to-noise needs. Isobaric reporter ions are read from MS2 or SPS-MS3 scans, optionally as signal-to-noise for Thermo files with noise data.
+* **Bruker timsTOF:** `.d` folders are read directly, each precursor's spectrum merged over all its frames. The precursor's ion mobility (1/K0), from each frame's TimsCalibration model as Bruker's software reports it (`bruker_config.ion_mobility_scale: "linear"` for the straight line of XNova 1.2 and upstream Sage), is reported for every crosslink match (`ion_mobility`), used to trace crosslinks and SILAC channels in MS1 (`mobility_pct_tolerance`), and shown in the spectrum viewer and its figures.
 * **Mobiligrams:** for timsTOF runs, `sage-gui` draws every searched precursor by m/z and 1/K0, shaped by charge and coloured by identification (inter-protein, intra-protein, loop-link, multivalent, linear, unidentified). A search run from `sage-gui` writes them per run and combined, as SVG and PDF.
 
 ### CPU, reflect and GPU backends
@@ -67,6 +67,19 @@ Sage's quantification works on crosslinks too, and the linear search quantifies 
 * **Label-free (MS1):** `crosslinks.lfq.tsv` gives each crosslinked species (peptide pair or loop-linked peptide) its intensity in every run. Species are traced in MS1 at every charge state over their first three isotopes, using the isotope envelope of both peptides plus the linker (and ion mobility on timsTOF data). Runs are aligned on shared crosslinks, peaks are integrated as in Sage's linear LFQ, decoy traces give each MS1 peak a q-value, and species identified in one run are quantified in the others (match-between-runs).
 * **Isobaric (TMT):** reporter ions are read from each crosslink match's MS2 spectrum, or from the SPS-MS3 scan that names it as precursor, and added to `crosslinks.sage.tsv`. Labelling usually follows crosslinking, so a linked lysine carries no label: set TMT on lysine as a variable modification, and XNova links only the unlabelled form (it warns when a static modification blocks the reactive residues).
 * **SILAC:** see [Isotope-incorporation searches](#isotope-incorporation-searches).
+
+### Peptide searches: quality control, FDR, modifications and localization
+
+The linear search (on its own, or the first stage of every crosslink search) adds to Sage's:
+
+* **Quality control on every search:** `digestion.tsv` (missed-cleavage, semi- and non-enzymatic rates at 1% FDR, decoy-corrected), a check of the MS1 signal for polymer contamination (PEG, PPG, polysiloxane), and optional diagnostic ions (glycan oxonium, acetyl-lysine and phosphotyrosine immonium ions) in `diagnostic_ions.tsv`. With entrapment proteins in the FASTA (`entrapment: {"tag": "ENTRAP_"}`), `entrapment.tsv` estimates how many false discoveries the reported FDR really lets through, for PSMs, peptides, proteins and crosslinks (Wen et al. 2025).
+* **Picked FDR** at the peptide, protein and protein-group levels: each target competes with its own decoy, and only the winner of each pair is ranked.
+* **Named modifications:** a modification may be limited to a position on the peptide (`not_c_term`, e.g. GlyGly or acetyl on a lysine that blocks trypsin) or to a PROSITE-style motif matched against the protein (`N-{P}-[ST]`), and may carry neutral losses that its fragments are also matched with (phospho on S/T: 97.977 Da). Keys may name the site (`first_residue:Q`, `protein_last:K`, `motif:[ST]-P`), next to Sage's symbols. A variable modification may be searched as a **mass offset** (`"search_mode": "mass_offset"`): tried on every candidate at search time instead of being indexed, for large or rare modifications such as a crosslinker's monolinks; or only at the sites of a **site library** (`"site_mode": "library"` with `database.site_library`), such as the `sites.tsv` of an earlier search. Initiator methionine clipping (`clip_n_term_met`) searches proteins whose initiator Met was removed.
+* **Site localization** (`localization: {}`): each variable modification is moved over every residue that could carry it, and over decoy residues that cannot, and every arrangement is rescored. `results.sage.tsv` gets `localized_peptide` in ProForma 2.0 with localization scores (`S[UNIMOD:21#g1(0.90)]T[#g1(0.10)]`), a localization probability and a false-localization-rate q-value from the decoy residues; `sites.tsv` lists the sites on proteins with a site-level q-value.
+* **Retention-time alignment** across runs is nonlinear by default (a robust affine fit, then a monotone warp), for LFQ, SILAC and crosslink quantification; **`lfq_long.tsv`** gives each peptide's intensity per run with whether that run identified it by MS2, its apex, bounds and FWHM, and a row-level extraction q-value. **Dimethyl labelling** (light, medium, heavy on K and N-termini) works like SILAC.
+* **Memory:** `sage.exe --estimate` reports the database size and memory a search will need before running it, `max_memory_gb` (`--max-memory`) stops a search that would use more, and the database prefilter streams spectrum files when they do not fit in memory at once.
+
+These are adapted from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) (MIT); see [CHANGELOG.md](CHANGELOG.md) for details.
 
 ### Database vs. database searches
 
@@ -105,6 +118,60 @@ With `"multivalent": 2` to `4`, XNova also searches species held together by mor
 
 See [CROSSLINKING.md](CROSSLINKING.md) for every option and output, and its [Limitations](CROSSLINKING.md#limitations) section for what has been validated so far.
 
+## Head-to-head with Sage and Sage Plus
+
+XNova was run on the three peptide-search tests of Sage Plus's head-to-head benchmark ([HEADTOHEAD-2026-10](https://github.com/pgarrett-scripps/sage-plus/blob/main/benchmarks/HEADTOHEAD-2026-10.md)), with the same search settings and the same ID definitions: PSMs are target PSMs at 1% spectrum FDR, peptides distinct peptides at 1% peptide FDR, protein groups distinct groups of those PSMs at 1% group FDR. The rows for upstream Sage v0.15.0-beta.2 and Sage Plus (main 9483f1c) are the benchmark's published numbers, measured on a loaded Linux i7-10700K (8 cores, 16 threads) from mzML. XNova's were measured in November 2026 on a Windows Ryzen 7 3700X (8 cores, 16 threads), reading the Thermo `.raw` files directly. Identifications compare directly; wall time and memory, from different machines, only roughly.
+
+**DDA, human/yeast/E. coli mixture** (PXD028735, 4 Orbitrap files, LFQ on, 3 repeats each; identical IDs in every repeat)
+
+| Engine | PSMs | Peptides | Protein groups | Wall time (median) | Peak memory |
+|---|---|---|---|---|---|
+| Sage v0.15.0-beta.2 | 247,102 | 57,009 | 6,916 | 107.6 s | 7.57 GiB |
+| Sage Plus | 250,060 | 57,700 | 7,028 | 113.7 s | 6.19 GiB |
+| XNova | 247,021 | 57,067 | 6,913 | 191.3 s | 5.79 GiB |
+
+LFQ ratios, log2 A/B of the precursors at 1% quantified in all 4 files, as n / median / IQR (expected: human 0, yeast +1, E. coli -2):
+
+| Engine | Human | Yeast | E. coli |
+|---|---|---|---|
+| Sage v0.15.0-beta.2 | 26,077 / +0.009 / 0.367 | 7,427 / +1.117 / 0.448 | 1,370 / -2.219 / 0.866 |
+| Sage Plus | 26,676 / +0.017 / 0.351 | 7,585 / +1.114 / 0.413 | 1,400 / -2.215 / 0.849 |
+| XNova | 25,922 / +0.017 / 0.350 | 7,380 / +1.111 / 0.409 | 1,351 / -2.213 / 0.836 |
+
+Of XNova's 191 s, reading the 14.4 GB of `.raw` files took 56 s and the search 80 s.
+
+**ETD, dual HCD/ETD acquisition** (PXD018176, 3 repeats each)
+
+| Engine, ion types | PSMs | from ETD scans | Peptides | Protein groups | Wall time (median) | Peak memory |
+|---|---|---|---|---|---|---|
+| Sage v0.15.0-beta.2, `b,y,c,z` | 14,395 | 4,515 | 7,495 | 711 | 7.50 s | 1.27 GiB |
+| Sage Plus, `b,y,c,z` | 14,686 | 4,674 | 7,588 | 719 | 6.15 s | 0.81 GiB |
+| Sage Plus, `b,y,c,z_dot` | 16,818 | 6,799 | 7,631 | 725 | 6.31 s | 0.82 GiB |
+| XNova, `b,y,c,z` | 14,374 | 4,509 | 7,491 | 709 | 7.70 s | 1.05 GiB |
+| XNova, `b,y,c,z_radical` | 16,437 | 6,594 | 7,503 | 708 | 7.83 s | 1.04 GiB |
+
+XNova's `z_radical` is Sage Plus's `z_dot` (the z+1 radical ion).
+
+**Phospho** (PXD007058, 2 files, phospho on S/T/Y and Met oxidation, `max_variable_mods` 1, one run each)
+
+| Engine | PSMs | Peptides | Protein groups | Phospho PSMs | Phospho peptides | Wall time | Peak memory |
+|---|---|---|---|---|---|---|---|
+| Sage v0.15.0-beta.2 | 14,825 | 6,583 | 2,467 | 10,044 | 4,845 | 26.6 s | 8.06 GiB |
+| Sage Plus | 14,838 | 6,226 | 2,491 | 10,044 | 4,484 | 44.3 s | 4.75 GiB |
+| Sage Plus, phospho as a mass offset | 15,227 | 6,405 | 2,506 | 10,433 | 4,664 | 29.0 s | 1.83 GiB |
+| XNova | 14,832 | 6,596 | 2,451 | 10,051 | 4,854 | 32.3 s | 5.62 GiB |
+| XNova, phospho as a mass offset | 15,124 | 6,565 | 2,485 | 10,373 | 4,831 | 26.4 s | 2.01 GiB |
+
+Site localization (upstream Sage has none):
+
+| | Sage Plus | XNova |
+|---|---|---|
+| Localized PSMs | 10,346 | 10,354 |
+| Phospho PSMs at 1% false localization rate | 6,014 | 6,972 |
+| Phospho protein sites at 1% site FDR | 2,930 | 3,212 |
+
+The two engines estimate localization error rates differently, so these rows compare their outputs rather than one statistic. The benchmark's FASTA files are not published; XNova's were rebuilt from UniProt release 2026_04 (reviewed human, yeast and E. coli K-12, within 0.2% of the benchmark's protein counts). The benchmark does not list isotope errors for the phospho test; -1 to 3, as in its other two tests, reproduces upstream Sage's index (11.78 million peptides) and identifications.
+
 ## Citation
 
 If you use Sage in a scientific publication, please cite the following paper:
@@ -140,6 +207,10 @@ xiVIEW in `sage-gui` ("Open in xiVIEW") is the work of the [Rappsilber Laborator
 - [Rappsilber-Laboratory/xiview-server](https://github.com/Rappsilber-Laboratory/xiview-server) (Apache-2.0): the page shells, styles, GO terms and help pages.
 - [PRIDE-Archive/crosslinking-api](https://github.com/PRIDE-Archive/crosslinking-api) and its [Rappsilber-Laboratory fork](https://github.com/Rappsilber-Laboratory/crosslinking-api) (Apache-2.0), by the PRIDE team at EMBL-EBI and the Rappsilber Laboratory: the data API of the [PRIDE Crosslinking Resource](https://www.ebi.ac.uk/pride/markdownpage/crosslinking), which XNova's local server answers in the same form; its data model comes from [mzidentml-reader](https://github.com/PRIDE-Archive/mzidentml-reader) ([Rappsilber-Laboratory/mzidentml-reader](https://github.com/Rappsilber-Laboratory/mzidentml-reader)).
 - [xiAnnotator](https://github.com/Rappsilber-Laboratory/xiAnnotator) and [xi2annotator](https://github.com/Rappsilber-Laboratory/xi2annotator) (Rappsilber Laboratory): the annotation format xiSPEC reads, which XNova writes from Annotator's engine.
+
+Quality control, timsTOF calibration, nonlinear retention-time alignment, picked FDR, the long-form LFQ table, named modifications, mass offsets, site localization, site libraries and the streamed prefilter are adapted from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) by pgarrett-scripps (MIT; `licenses/sage-plus/`).
+
+Thermo `.raw` files are read with [sage-plus-raw](https://github.com/pgarrett-scripps/sage-plus-raw), a pure-Rust reader of the Thermo RAW format from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) (pgarrett-scripps), forked from [OpenTFRaw](https://github.com/Sigilweaver/OpenTFRaw) by Nathan Riley and contributors (Sigilweaver Holdings LLC), under the Apache-2.0 license; its license and notice are in [licenses/sage-plus-raw](licenses/sage-plus-raw). XNova's reader module (`crates/sage-cloudpath/src/thermoraw.rs`) is adapted from Sage Plus's (MIT). Thermo Fisher Scientific is not affiliated with either project.
 
 Modification names, masses and sites in `sage-gui` come from [Unimod](https://www.unimod.org), the protein modification database for mass spectrometry started by David Creasy and John Cottrell at Matrix Science. Unimod is a public domain database, distributed under a copyleft licence, the [Design Science License](crates/sage-gui/assets/unimod/LICENSE-unimod.txt): "Copyright (C) 2002-2006 Unimod; this information may be copied, distributed and/or modified under certain conditions, but it comes WITHOUT ANY WARRANTY; see the accompanying Design Science License for more details." XNova bundles Unimod's XML export unchanged, with that notice and license ([crates/sage-gui/assets/unimod](crates/sage-gui/assets/unimod), and the `unimod` folder of each release download), and compiles it into `sage-gui`. Looking up a modification therefore needs no internet connection and sends no traffic to unimod.org. The Design Science License covers the Unimod data only; it does not extend to XNova's own code. `mzcore`, Annotator's engine, also carries its own compiled copy of Unimod.
 

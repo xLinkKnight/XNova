@@ -248,23 +248,23 @@ pub fn find_msconvert() -> Option<PathBuf> {
 }
 
 /// The command that converts one Thermo .raw file to mzML in `out_dir`.
-/// Supports ProteoWizard msconvert and ThermoRawFileParser.
-pub fn conversion_step(converter: &Path, raw: &Path, out_dir: &Path) -> Step {
+/// Supports ProteoWizard msconvert and ThermoRawFileParser; `noise` asks
+/// ThermoRawFileParser for its noise data (TMT signal-to-noise).
+pub fn conversion_step(converter: &Path, raw: &Path, out_dir: &Path, noise: bool) -> Step {
     let output = converted_path(raw, out_dir);
-    let exe = converter
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_ascii_lowercase();
-    let args: Vec<OsString> = if exe.contains("thermorawfileparser") {
-        vec![
+    let args: Vec<OsString> = if is_thermorawfileparser(converter) {
+        let mut args: Vec<OsString> = vec![
             "-i".into(),
             raw.into(),
             "-o".into(),
             out_dir.into(),
             "-f".into(),
             "2".into(),
-        ]
+        ];
+        if noise {
+            args.push("-N".into());
+        }
+        args
     } else {
         vec![
             raw.into(),
@@ -285,7 +285,41 @@ pub fn conversion_step(converter: &Path, raw: &Path, out_dir: &Path) -> Step {
     }
 }
 
+/// Is this converter ThermoRawFileParser (else msconvert)?
+pub fn is_thermorawfileparser(converter: &Path) -> bool {
+    converter
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("thermorawfileparser")
+}
+
 pub fn converted_path(raw: &Path, out_dir: &Path) -> PathBuf {
     let stem = raw.file_stem().unwrap_or_default().to_string_lossy();
     out_dir.join(format!("{stem}.mzML"))
+}
+
+#[cfg(test)]
+mod raw_conversion_test {
+    use super::*;
+
+    /// ThermoRawFileParser writes noise data (-N) only when asked, for TMT
+    /// signal-to-noise; msconvert is run as before
+    #[test]
+    fn converter_arguments() {
+        let raw = Path::new("C:/data/run1.raw");
+        let out = Path::new("C:/out/converted_mzML");
+        let trfp = Path::new("C:/Tools/ThermoRawFileParser/ThermoRawFileParser.exe");
+        let args = |step: Step| step.args.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert!(is_thermorawfileparser(trfp));
+        assert!(!is_thermorawfileparser(Path::new("C:/ProteoWizard/msconvert.exe")));
+        let plain = args(conversion_step(trfp, raw, out, false));
+        assert_eq!(plain.iter().filter(|a| *a == "-f").count(), 1);
+        assert!(!plain.contains(&"-N".to_string()));
+        assert!(args(conversion_step(trfp, raw, out, true)).ends_with(&["-N".to_string()]));
+        let msconvert = args(conversion_step(Path::new("C:/ProteoWizard/msconvert.exe"), raw, out, true));
+        assert!(msconvert.contains(&"--mzML".to_string()) && !msconvert.contains(&"-N".to_string()));
+        assert_eq!(conversion_step(trfp, raw, out, false).skip_if_exists, Some(out.join("run1.mzML")));
+    }
 }

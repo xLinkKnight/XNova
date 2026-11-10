@@ -28,6 +28,9 @@ pub enum SpectrumKind {
     MzML,
     /// Read by xiVIEW only, which finds spectra by position (`index=N`)
     Mgf,
+    /// Thermo .raw read directly: neither viewer reads it, but its spectrum
+    /// ids are the native ids of an mzML msconvert would write
+    ThermoRaw,
     /// Bruker .d and anything else: neither viewer reads it
     Other,
 }
@@ -54,6 +57,8 @@ impl SpectrumFile {
             SpectrumKind::MzML
         } else if lower.ends_with(".mgf") {
             SpectrumKind::Mgf
+        } else if lower.ends_with(".raw") {
+            SpectrumKind::ThermoRaw
         } else {
             SpectrumKind::Other
         };
@@ -84,7 +89,7 @@ impl SpectrumFile {
         match self.kind {
             SpectrumKind::Mgf => true,
             SpectrumKind::MzML => ids.any(|id| id_scan_number(id).is_none()),
-            SpectrumKind::Other => false,
+            SpectrumKind::ThermoRaw | SpectrumKind::Other => false,
         }
     }
 }
@@ -845,6 +850,7 @@ pub(super) mod test {
         let f = SpectrumFile::from_name("Run_01.mzML.gz");
         assert_eq!((f.name.as_str(), f.kind), ("Run_01.mzML", SpectrumKind::MzML));
         assert_eq!(SpectrumFile::from_name("a.MGF").kind, SpectrumKind::Mgf);
+        assert_eq!(SpectrumFile::from_name("Run_02.RAW").kind, SpectrumKind::ThermoRaw);
         assert_eq!(SpectrumFile::from_name("sample.d").kind, SpectrumKind::Other);
         // positions are read only where the ids do not give the scan number
         let mzml = SpectrumFile::from_name("a.mzML");

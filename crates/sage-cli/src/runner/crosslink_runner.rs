@@ -240,6 +240,21 @@ impl Runner {
             }
         }
 
+        // polymer check and diagnostic ions (the linear search, if any, did them already)
+        if self.parameters.qc.is_none() {
+            self.finish_qc(None, &filenames)?;
+        }
+        // entrapment of the crosslinks, next to the linear search's
+        let crosslink_entrapment = self.entrapment_crosslinks(&matches);
+        if !crosslink_entrapment.is_empty() {
+            let mut all = self.parameters.qc.as_ref().map(|q| q.entrapment.clone()).unwrap_or_default();
+            all.extend(crosslink_entrapment);
+            self.write_entrapment(&all)?;
+            if let Some(qc) = self.parameters.qc.as_mut() {
+                qc.entrapment = all;
+            }
+        }
+
         let path = self.make_path("results.json");
         println!("{}", serde_json::to_string_pretty(&self.parameters)?);
         let bytes = serde_json::to_vec_pretty(&self.parameters)?;

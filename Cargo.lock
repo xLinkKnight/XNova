@@ -5348,7 +5348,9 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "rusqlite",
  "sage-core",
+ "sage-plus-raw",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -5399,6 +5401,16 @@ dependencies = [
  "webbrowser",
  "windows 0.58.0",
  "winresource",
+]
+
+[[package]]
+name = "sage-plus-raw"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af00c7a3d2fee2670f2a3afe8d63391ced195d392af2413d2b941d14b8f01cf2"
+dependencies = [
+ "roxmltree 0.21.2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

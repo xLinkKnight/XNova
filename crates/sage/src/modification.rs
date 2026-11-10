@@ -10,9 +10,13 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 
+use crate::site_rules::{Motif, SitePosition, SiteRule};
+
 /// A modification with an optional ProForma label and, for variable
-/// modifications, an optional per-peptide occurrence limit.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+/// modifications, an optional per-peptide occurrence limit; optionally where
+/// it may sit and the neutral losses of its fragments (see
+/// [`crate::site_rules`]).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DetailedMod {
     pub mass: f32,
@@ -22,6 +26,62 @@ pub struct DetailedMod {
     /// ProForma label reported instead of the mass, e.g. `UNIMOD:35`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<ModName>,
+    /// Where on the peptide the residue may be: `not_n_term`, `not_c_term`,
+    /// `internal` (default anywhere)
+    #[serde(default, skip_serializing_if = "SitePosition::is_anywhere")]
+    pub position: SitePosition,
+    /// PROSITE-style motif around the site, matched against the protein
+    /// (`N-{P}-[ST]`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motif: Option<Motif>,
+    /// Masses (Da) lost by fragments that contain the modified residue
+    /// (phospho on S/T: 97.976896); those fragments are also matched less
+    /// the loss
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neutral_losses: Vec<f32>,
+    /// `mass_offset`: a variable modification tried on every candidate at
+    /// search time instead of being expanded into the fragment index (at
+    /// most one per peptide; see [`crate::database::MassOffset`])
+    #[serde(default, skip_serializing_if = "SearchMode::is_indexed")]
+    pub search_mode: SearchMode,
+    /// `library`: a variable modification only at the protein sites a site
+    /// library lists (`database.site_library`, see [`crate::site_library`])
+    #[serde(default, skip_serializing_if = "SiteMode::is_exhaustive")]
+    pub site_mode: SiteMode,
+}
+
+/// How a variable modification is searched
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    /// Every modified form is a peptide of the fragment index
+    #[default]
+    Indexed,
+    /// Tried on each candidate peptide at search time (a mass offset)
+    MassOffset,
+}
+
+impl SearchMode {
+    pub fn is_indexed(&self) -> bool {
+        *self == SearchMode::Indexed
+    }
+}
+
+/// Where a variable modification may sit on a protein
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteMode {
+    /// Every residue its key (and position or motif) allows
+    #[default]
+    Exhaustive,
+    /// Only the sites a site library lists for it
+    Library,
+}
+
+impl SiteMode {
+    pub fn is_exhaustive(&self) -> bool {
+        *self == SiteMode::Exhaustive
+    }
 }
 
 /// A modification entry may use the existing bare-mass syntax or the
@@ -121,6 +181,60 @@ impl ModEntry {
             ModEntry::Mass(_) => None,
             ModEntry::Detailed(modification) => modification.name.as_ref(),
         }
+    }
+
+    /// Where the modification may sit
+    pub fn rule(&self) -> SiteRule {
+        match self {
+            ModEntry::Mass(_) => SiteRule::default(),
+            ModEntry::Detailed(m) => SiteRule { position: m.position, motif: m.motif.clone(), library: None },
+        }
+    }
+
+    pub fn neutral_losses(&self) -> &[f32] {
+        match self {
+            ModEntry::Mass(_) => &[],
+            ModEntry::Detailed(m) => &m.neutral_losses,
+        }
+    }
+
+    pub fn search_mode(&self) -> SearchMode {
+        match self {
+            ModEntry::Mass(_) => SearchMode::Indexed,
+            ModEntry::Detailed(m) => m.search_mode,
+        }
+    }
+
+    pub fn site_mode(&self) -> SiteMode {
+        match self {
+            ModEntry::Mass(_) => SiteMode::Exhaustive,
+            ModEntry::Detailed(m) => m.site_mode,
+        }
+    }
+
+    /// This entry with the rule of its key (`internal_residue:K`); an error
+    /// if the entry gives a different one
+    pub fn with_rule(self, rule: &SiteRule) -> Result<ModEntry, String> {
+        if rule.is_any() {
+            return Ok(self);
+        }
+        let mut m = match self {
+            ModEntry::Mass(mass) => DetailedMod { mass, ..Default::default() },
+            ModEntry::Detailed(m) => m,
+        };
+        if !rule.position.is_anywhere() {
+            if !m.position.is_anywhere() && m.position != rule.position {
+                return Err(format!("modification {}: its key and its position disagree", m.mass));
+            }
+            m.position = rule.position;
+        }
+        if let Some(motif) = &rule.motif {
+            if m.motif.as_ref().is_some_and(|x| x != motif) {
+                return Err(format!("modification {}: its key and its motif disagree", m.mass));
+            }
+            m.motif = Some(motif.clone());
+        }
+        Ok(ModEntry::Detailed(m))
     }
 }
 
@@ -247,6 +361,8 @@ pub enum ModificationError {
     TooMany,
     /// Invalid `silac` settings
     Silac(String),
+    /// A position, motif or neutral loss that cannot apply
+    Rule(String),
     /// `max_count` only applies to variable modifications
     StaticMaxCount(ModificationSpecificity),
 }
@@ -260,6 +376,7 @@ impl Display for ModificationError {
                 u8::MAX
             ),
             ModificationError::Silac(message) => write!(f, "{message}"),
+            ModificationError::Rule(message) => write!(f, "{message}"),
             ModificationError::StaticMaxCount(specificity) => write!(
                 f,
                 "static modification {} cannot have a max_count",
@@ -275,6 +392,9 @@ impl std::error::Error for ModificationError {}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Modifications {
     entries: Vec<Modification>,
+    /// Neutral losses: (modification, residue it sits on, or 0 on a
+    /// terminus, loss)
+    losses: Vec<(ModId, u8, f32)>,
 }
 
 impl Modifications {
@@ -325,6 +445,22 @@ impl Modifications {
 
     pub fn iter(&self) -> impl Iterator<Item = &Modification> {
         self.entries.iter()
+    }
+
+    /// Fragments containing `id` on `residue` (0: a terminus) also lose `loss`
+    pub fn add_neutral_loss(&mut self, id: ModId, residue: u8, loss: f32) {
+        if !self.losses.iter().any(|&(i, r, l)| i == id && r == residue && (l - loss).abs() < 1e-5) {
+            self.losses.push((id, residue, loss));
+        }
+    }
+
+    /// Neutral losses of `id` on `residue` (0: a terminus)
+    pub fn neutral_losses(&self, id: ModId, residue: u8) -> impl Iterator<Item = f32> + '_ {
+        self.losses.iter().filter(move |&&(i, r, _)| i == id && r == residue).map(|&(_, _, l)| l)
+    }
+
+    pub fn has_neutral_losses(&self) -> bool {
+        !self.losses.is_empty()
     }
 }
 
@@ -383,6 +519,8 @@ pub enum InvalidModification {
     Empty,
     InvalidResidue(char),
     TooLong(String),
+    /// A named site that does not exist (`elsewhere:K`)
+    UnknownSite(String),
 }
 
 impl Display for InvalidModification {
@@ -397,6 +535,11 @@ impl Display for InvalidModification {
             InvalidModification::TooLong(s) => {
                 write!(f, "invalid modification string: {} is too long", s)
             }
+            InvalidModification::UnknownSite(s) => write!(
+                f,
+                "invalid modification string: {s} is not a site (a residue, ^ $ [ ], or e.g. first_residue:K, \
+                 protein_last:K, peptide_n_term, internal_residue:K, motif:N-{{P}}-[ST])"
+            ),
         }
     }
 }
@@ -407,6 +550,28 @@ impl FromStr for ModificationSpecificity {
     type Err = InvalidModification;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // named sites (see `crate::site_rules`)
+        match s {
+            "peptide_n_term" => return Ok(ModificationSpecificity::PeptideN(None)),
+            "peptide_c_term" => return Ok(ModificationSpecificity::PeptideC(None)),
+            "protein_n_term" => return Ok(ModificationSpecificity::ProteinN(None)),
+            "protein_c_term" => return Ok(ModificationSpecificity::ProteinC(None)),
+            _ => {}
+        }
+        if let Some((name, residue)) = s.split_once(':') {
+            let prefix = match name {
+                "residue" | "any_residue" => "",
+                "first_residue" | "peptide_first" => "^",
+                "last_residue" | "peptide_last" => "$",
+                "protein_first" | "protein_first_residue" => "[",
+                "protein_last" | "protein_last_residue" => "]",
+                _ => return Err(InvalidModification::UnknownSite(s.into())),
+            };
+            if residue.chars().count() != 1 {
+                return Err(InvalidModification::TooLong(s.into()));
+            }
+            return format!("{prefix}{residue}").parse();
+        }
         let mut chars = s.chars();
         let first = chars.next().ok_or(InvalidModification::Empty)?;
         let rest = chars.as_str();
@@ -504,6 +669,7 @@ mod test {
             mass: 15.9949,
             max_count: Some(1),
             name: None,
+            ..Default::default()
         });
         assert_eq!(entry.mass(), 15.9949);
         assert_eq!(entry.max_count(), Some(1));

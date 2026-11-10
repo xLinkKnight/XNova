@@ -9,6 +9,8 @@ pub enum FileFormat {
     MzML,
     MGF,
     TDF,
+    /// Thermo Fisher `.raw`, read directly (see [`crate::thermoraw`])
+    ThermoRaw,
     Unidentified,
 }
 
@@ -23,6 +25,8 @@ impl FileFormat {
             FileFormat::MzML => false,
             FileFormat::MGF => false,
             FileFormat::TDF => true,
+            // its scans are decoded in parallel
+            FileFormat::ThermoRaw => true,
             FileFormat::Unidentified => false,
         }
     }
@@ -33,6 +37,9 @@ impl From<&str> for FileFormat {
         let path_lower = s.to_lowercase();
         if path_lower.ends_with(".mgf.gz") || path_lower.ends_with(".mgf") {
             FileFormat::MGF
+        } else if is_thermo_raw(&path_lower) {
+            // before the Bruker check, which also takes paths ending in "raw"
+            FileFormat::ThermoRaw
         } else if is_bruker(&path_lower) {
             FileFormat::TDF
         } else if path_lower.ends_with(".mzml.gz") || path_lower.ends_with(".mzml") {
@@ -44,6 +51,11 @@ impl From<&str> for FileFormat {
 }
 
 const BRUKER_EXTENSIONS: [&str; 5] = [".d", ".tdf", ".tdf_bin", "ms2", "raw"];
+
+/// A Thermo `.raw` file (lower case): a file, never a directory
+fn is_thermo_raw(path: &str) -> bool {
+    path.ends_with(".raw")
+}
 
 fn is_bruker(path: &str) -> bool {
     BRUKER_EXTENSIONS.iter().any(|ext| {
@@ -68,14 +80,15 @@ pub fn read_spectra(
         FileFormat::MzML => read_mzml(url, file_id, sn),
         FileFormat::MGF => read_mgf(url, file_id),
         FileFormat::TDF => read_tdf(url, file_id, bruker_processor, requires_ms1),
+        FileFormat::ThermoRaw => read_thermo_raw(url, file_id, requires_ms1),
         FileFormat::Unidentified => panic!("Unable to get type for '{}'", url), // read_mzml(path, file_id, sn),
     }
 }
 
 /// Only the spectra of one file with these ids (Sage's spectrum ids), as
-/// [`read_spectra`] reads them. Bruker data is read spectrum by spectrum,
-/// without decoding the rest of the run; other formats are read whole and
-/// filtered.
+/// [`read_spectra`] reads them. Bruker and Thermo RAW data are read spectrum
+/// by spectrum, without decoding the rest of the run; other formats are read
+/// whole and filtered.
 pub fn read_spectra_with_ids(
     url: &Url,
     file_id: usize,
@@ -83,6 +96,10 @@ pub fn read_spectra_with_ids(
     bruker_processor: BrukerProcessingConfig,
     ids: &std::collections::HashSet<String>,
 ) -> Result<Vec<RawSpectrum>, Error> {
+    if FileFormat::from(url.as_ref()) == FileFormat::ThermoRaw {
+        let path = local_path(url)?;
+        return Ok(crate::thermoraw::ThermoRaw::open(&path, file_id)?.read_ids(ids)?);
+    }
     if FileFormat::from(url.as_ref()) == FileFormat::TDF {
         let numbers: Vec<usize> = ids.iter().filter_map(|id| id.parse().ok()).collect();
         if numbers.len() == ids.len() {
@@ -112,6 +129,21 @@ pub fn read_mzml(
             .parse(bf)
             .await?)
     })
+}
+
+/// The local path of a file a reader needs to seek in
+fn local_path(url: &Url) -> Result<std::path::PathBuf, Error> {
+    if url.scheme() != "file" {
+        log::error!("this file must be local: {}", url);
+        return Err(Error::InvalidUri);
+    }
+    url.to_file_path().map_err(|_| Error::InvalidUri)
+}
+
+/// A Thermo `.raw` file, read directly (MS1 scans only when `requires_ms1`)
+pub fn read_thermo_raw(url: &Url, file_id: usize, requires_ms1: bool) -> Result<Vec<RawSpectrum>, Error> {
+    let path = local_path(url)?;
+    Ok(crate::thermoraw::read(&path, file_id, requires_ms1)?)
 }
 
 pub fn read_tdf(
@@ -221,6 +253,17 @@ where
     })
 }
 
+/// The text of a file (local or remote, gzipped or not)
+pub fn read_text(url: &Url) -> Result<String, Error> {
+    read_and_execute(url, |mut bf| async move {
+        let mut contents = String::new();
+        bf.read_to_string(&mut contents)
+            .await
+            .map_err(crate::Error::IO)?;
+        Ok(contents)
+    })
+}
+
 pub fn read_json<S, T>(path: S) -> Result<T, Error>
 where
     S: AsRef<str>,
@@ -271,6 +314,18 @@ mod test {
         let p = read_spectrum_positions(&crate::to_url(plain.to_str().unwrap()).unwrap()).unwrap();
         assert_eq!((p["first"], p["second spectrum"]), (0, 1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Thermo .raw files, whatever the case, before the Bruker check (which
+    /// also takes paths ending in "raw")
+    #[test]
+    fn thermo_raw_paths() {
+        assert_eq!(FileFormat::from("run1.raw"), FileFormat::ThermoRaw);
+        assert_eq!(FileFormat::from("C:/data/RUN1.RAW"), FileFormat::ThermoRaw);
+        assert_eq!(FileFormat::from("file:///C:/data/run1.Raw"), FileFormat::ThermoRaw);
+        assert!(FileFormat::ThermoRaw.within_file_parallel());
+        assert_eq!(FileFormat::from("foo_raw"), FileFormat::TDF);
+        assert_eq!(FileFormat::from("run1.raw.mzML"), FileFormat::MzML);
     }
 
     #[test]
