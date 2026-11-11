@@ -4,7 +4,7 @@
 
 [![Rust](https://github.com/lazear/sage/actions/workflows/rust.yml/badge.svg)](https://github.com/lazear/sage/actions/workflows/rust.yml)
 
-XNova is a search engine for crosslinking mass spectrometry (XL-MS), built on [Sage](https://github.com/lazear/sage) by Michael Lazear. It keeps everything Sage does for ordinary (linear) peptides and adds crosslink searches for non-cleavable, MS-cleavable and zero-length reagents, from purified complexes to whole proteomes. It runs as the `sage` command-line program and as `sage-gui`, a desktop app for setting up searches, following them and exploring the results.
+XNova is a search engine for crosslinking mass spectrometry (XL-MS), built on [Sage](https://github.com/lazear/sage) by Michael Lazear. It keeps everything Sage does for ordinary (linear) peptides and adds crosslink searches for non-cleavable, MS-cleavable and zero-length reagents, from purified complexes to whole proteomes. It runs as the `sage` command-line program and as `sage-gui`, a desktop app for setting up searches, following them and exploring the results. From the linear and crosslink results it also builds [spectral libraries](#spectral-libraries-for-dia-dia-nn-spectronaut-peaks) for DIA searches in DIA-NN, Spectronaut and PEAKS.
 
 Documentation: [CROSSLINKING.md](CROSSLINKING.md) (crosslink searches, backends, outputs and viewers), [SILAC.md](SILAC.md) (SILAC and isotope-labelled proteins), the [changelog](CHANGELOG.md), and [Sage's online documentation](https://sage-docs.vercel.app/docs) for the core search engine and its configuration file.
 
@@ -68,7 +68,7 @@ Sage's quantification works on crosslinks too, and the linear search quantifies 
 * **Isobaric (TMT):** reporter ions are read from each crosslink match's MS2 spectrum, or from the SPS-MS3 scan that names it as precursor, and added to `crosslinks.sage.tsv`. Labelling usually follows crosslinking, so a linked lysine carries no label: set TMT on lysine as a variable modification, and XNova links only the unlabelled form (it warns when a static modification blocks the reactive residues).
 * **SILAC:** see [Isotope-incorporation searches](#isotope-incorporation-searches).
 
-### Peptide searches: quality control, FDR, modifications, localization and spectral libraries
+### Peptide searches: quality control, FDR, modifications and localization
 
 The linear search (on its own, or the first stage of every crosslink search) adds to Sage's:
 
@@ -81,7 +81,27 @@ The linear search (on its own, or the first stage of every crosslink search) add
 
 These are adapted from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) (MIT); see [CHANGELOG.md](CHANGELOG.md) for details.
 
-**Spectral libraries** (`spectral_library: {}`) for DIA searches of the same samples in DIA-NN, Spectronaut or PEAKS, made from the confident PSMs as [EasyPQP](https://github.com/grosenberger/easypqp) makes one (each precursor's best PSM per run, retention times on one scale across the runs or in iRT, ion mobility from timsTOF runs, the runs' median spectrum), without Python: `library.tsv` (OpenSWATH layout: DIA-NN, PEAKS, OpenSWATH) and `library.spectronaut.xls` (Spectronaut layout: Spectronaut, DIA-NN, PEAKS). A crosslink search adds **`xlibrary.tsv`** and **`xlibrary.spectronaut.xls`** with the crosslinks, written as the Rappsilber Laboratory's [xiDIA-library](https://github.com/Rappsilber-Laboratory/xiDIA-library) writes them for Spectronaut, with decoys for DIA-NN (see [CROSSLINKING.md](CROSSLINKING.md#spectral-libraries-for-dia)).
+### Spectral libraries for DIA (DIA-NN, Spectronaut, PEAKS)
+
+A DDA search can feed the DIA analysis of the same samples. With `"spectral_library": {}` (in `sage-gui`: Scoring & output > Spectral libraries), XNova writes its confident results as spectral libraries for DIA-NN, Spectronaut and PEAKS, from linear and crosslink searches alike. They are built in `sage.exe` itself, without Python or a separate tool, following the method of [EasyPQP](https://github.com/grosenberger/easypqp), the library generator of OpenSWATH and FragPipe:
+
+1. **Confident PSMs.** Target PSMs at 1% PSM, peptide and protein FDR, from proteotypic peptides (those of a single protein). A database of a few proteins, such as a purified complex, cannot reach 1% protein FDR; the library is then filtered at PSM and peptide level only.
+2. **The best spectrum of each run.** For each precursor (modified peptide and charge), the best PSM of every run, with its matched fragment ions scaled to an intensity of 10,000.
+3. **One scale across runs.** Retention times from XNova's alignment of the runs, on a 0-100 scale, or in iRT (`"irt": true`), calibrated with the Biognosys iRT kit peptides the search finds (at least 4 of the 11). From timsTOF `.d` runs, the precursor's ion mobility (1/K0, V·s/cm²), calibrated across runs onto the run with the most precursors.
+4. **Consensus.** Each precursor's median retention time, ion mobility and fragment intensities over its runs, with its 20 most intense fragments; a precursor with fewer than 3 matched fragments is left out.
+
+| File | Layout | Use it in |
+|---|---|---|
+| `library.tsv` | OpenSWATH: EasyPQP's columns with its DIA-NN fragment columns, modifications as `(UniMod:N)` | DIA-NN; PEAKS Studio (Library Viewer, as an OpenMS library); OpenSWATH |
+| `library.spectronaut.xls` | Spectronaut's library export columns, modifications by Spectronaut's names (`[Oxidation (M)]`) | Spectronaut; DIA-NN and PEAKS Studio read it too |
+| `xlibrary.tsv` | OpenSWATH: the crosslinks, with one decoy each | DIA-NN |
+| `xlibrary.spectronaut.xls` | Spectronaut: the crosslinks | Spectronaut; PEAKS Studio |
+
+* **Crosslink libraries.** A crosslink search adds the `xlibrary` files. No DIA tool knows crosslinks, so each crosslink at 1% FDR (pairs and loop-links) is written as one precursor, the way the Rappsilber Laboratory's [xiDIA-library](https://github.com/Rappsilber-Laboratory/xiDIA-library) writes crosslinks for Spectronaut: the two peptides in alphabetical order joined by `_`, the crosslinker on each linked residue (`FVK[DSSO]VR_MILTHVDLIEK[DSSO]FLR`), and the crosslink's own precursor and fragment m/z, which the DIA tool then searches by. The fragments are the ions the crosslink search matched: both peptides' backbone ions, those containing the link site with the partner peptide and the linker or, for MS-cleavable linkers, a stub. `FragmentPepId` says which peptide each comes from and `CLContainingFragment` whether it carries the linker. Multivalent species are not included. See [CROSSLINKING.md](CROSSLINKING.md#spectral-libraries-for-dia).
+* **Decoys.** The linear libraries have none: DIA-NN, Spectronaut and PEAKS make their own. DIA-NN would make meaningless decoys for a crosslinked pair, and it uses a library's own decoys when there are some, so `xlibrary.tsv` has one decoy per crosslink, both peptides reversed. As in the search itself, no decoy peptide has the sequence of a target peptide (I and L alike), so that no true hit is taken for a decoy.
+* **Options** (`spectral_library`, all optional): `formats` (`["openswath", "spectronaut"]`), `psm_fdr`, `peptide_fdr`, `protein_fdr` and `crosslink_fdr` (0.01 each), `proteotypic` (true), `consensus` (true; false takes the single best PSM of all runs), `min_fragments` (3), `max_fragments` (20), `irt` (false) and `crosslink_decoys` (true). For example, `"spectral_library": {"irt": true, "max_fragments": 12}`.
+
+On four Orbitrap runs of a human/yeast/E. coli mixture, XNova builds a library of 62,312 precursors from 217,043 PSMs, with iRT calibrated from 10 kit peptides (r² 0.999). On two timsTOF runs of a DSSO-crosslinked Pol II complex, it builds 718 linear precursors, all with ion mobility, and 92 crosslink precursors (42 of them loop-links). The layouts follow the Spectronaut 20 and PEAKS Studio 12 manuals and DIA-NN's documentation; please report any problem importing them.
 
 ### Database vs. database searches
 
