@@ -1,11 +1,14 @@
 //! Crosslinkers and modifications saved under a name for later searches: the
 //! "Saved crosslinkers" panel of the Crosslinking tab and the "Saved
-//! modifications" panel of the Modifications tab. They are kept on this
-//! computer in `%APPDATA%\sage-gui\library.json`, apart from the search
-//! settings, and written as soon as one is saved, edited or deleted.
+//! modifications" panel of the Modifications tab. Also the crosslink plot's
+//! templates (styles saved under a name, [`Template`]), saved in the
+//! "Crosslink plot (Circos)" window. They are kept on this computer in
+//! `%APPDATA%\sage-gui\library.json`, apart from the search settings, and
+//! written as soon as one is saved, edited or deleted.
 
 use crate::settings::{self, Crosslink, ModKind, Modification, Reagent, Site};
 use crate::theme;
+use crate::viewer::circos::{CircosStyle, Template};
 use eframe::egui::{self, Color32, ComboBox, RichText, TextEdit, Ui};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -397,11 +400,18 @@ pub fn library_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("sage-gui").join("library.json"))
 }
 
-/// The saved crosslinkers and modifications
+/// The saved crosslinkers, modifications and crosslink plot templates
 #[derive(Default)]
 pub struct Library {
     pub crosslinkers: Vec<SavedLinker>,
     pub modifications: Vec<SavedMod>,
+    /// Crosslink plot (Circos) styles saved under a name
+    pub circos_templates: Vec<Template>,
+    /// The template new crosslink plots start from, by name
+    pub circos_default: Option<String>,
+    /// Templates this version cannot read (saved by a newer XNova, say),
+    /// written back as they were
+    unread_templates: Vec<Value>,
     /// The file it is kept in; `None` keeps it in memory only
     path: Option<PathBuf>,
     /// The file could not be read: it is backed up before it is replaced
@@ -428,6 +438,13 @@ impl Library {
                 let all = |key: &str| v.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
                 lib.crosslinkers = all("crosslinkers").iter().filter_map(SavedLinker::from_json).collect();
                 lib.modifications = all("modifications").iter().filter_map(SavedMod::from_json).collect();
+                for t in all("circos_templates") {
+                    match serde_json::from_value::<Template>(t.clone()) {
+                        Ok(template) if !template.name.trim().is_empty() => lib.circos_templates.push(template),
+                        _ => lib.unread_templates.push(t),
+                    }
+                }
+                lib.circos_default = v.get("circos_default").and_then(Value::as_str).map(str::to_string);
             }
             Ok(_) => lib.unreadable(path, "it is not a library"),
             Err(e) => lib.unreadable(path, &e),
@@ -438,7 +455,7 @@ impl Library {
     fn unreadable(&mut self, path: &Path, why: &str) {
         self.unreadable = true;
         self.error = Some(format!(
-            "The saved crosslinkers and modifications could not be read from {} ({why}). \
+            "The saved crosslinkers, modifications and plot templates could not be read from {} ({why}). \
              It is kept as {} when something is saved.",
             path.display(),
             backup_path(path).display()
@@ -450,6 +467,13 @@ impl Library {
             "version": 1,
             "crosslinkers": self.crosslinkers.iter().map(SavedLinker::to_json).collect::<Vec<_>>(),
             "modifications": self.modifications.iter().map(SavedMod::to_json).collect::<Vec<_>>(),
+            "circos_templates": self
+                .circos_templates
+                .iter()
+                .filter_map(|t| serde_json::to_value(t).ok())
+                .chain(self.unread_templates.iter().cloned())
+                .collect::<Vec<_>>(),
+            "circos_default": self.circos_default,
         })
     }
 
@@ -477,21 +501,22 @@ impl Library {
         std::fs::rename(&tmp, path).map_err(failed)
     }
 
-    /// A name for a new entry, or a renamed one (`except` = its own index)
-    fn check_name<'a>(names: impl Iterator<Item = &'a str>, name: &str, except: Option<usize>, what: &str) -> Result<(), String> {
+    /// A name for a new entry, or a renamed one (`except` = its own index);
+    /// `edit` is the button that changes a saved one
+    fn check_name<'a>(names: impl Iterator<Item = &'a str>, name: &str, except: Option<usize>, what: &str, edit: &str) -> Result<(), String> {
         let name = name.trim();
         if name.is_empty() {
             return Err(format!("Give the {what} a name."));
         }
         match names.enumerate().find(|(i, n)| Some(*i) != except && n.eq_ignore_ascii_case(name)) {
-            Some(_) => Err(format!("A saved {what} is already called \"{name}\": choose another name, or use Edit to change it.")),
+            Some(_) => Err(format!("A saved {what} is already called \"{name}\": choose another name, or use {edit} to change it.")),
             None => Ok(()),
         }
     }
 
     /// Save a new crosslinker (`index` None) or replace a saved one
     pub fn put_linker(&mut self, linker: SavedLinker, index: Option<usize>) -> Result<(), String> {
-        Self::check_name(self.crosslinkers.iter().map(|l| l.name.as_str()), &linker.name, index, "crosslinker")?;
+        Self::check_name(self.crosslinkers.iter().map(|l| l.name.as_str()), &linker.name, index, "crosslinker", "Edit")?;
         match index {
             Some(i) if i < self.crosslinkers.len() => self.crosslinkers[i] = linker,
             _ => self.crosslinkers.push(linker),
@@ -513,7 +538,7 @@ impl Library {
 
     /// Save a new modification (`index` None) or replace a saved one
     pub fn put_mod(&mut self, m: SavedMod, index: Option<usize>) -> Result<(), String> {
-        Self::check_name(self.modifications.iter().map(|m| m.name.as_str()), &m.name, index, "modification")?;
+        Self::check_name(self.modifications.iter().map(|m| m.name.as_str()), &m.name, index, "modification", "Edit")?;
         settings::check_target(&m.target)?;
         if !m.mass.is_finite() {
             return Err("The mass shift is not a number.".into());
@@ -533,6 +558,62 @@ impl Library {
             self.modifications.remove(index);
         }
         self.save()
+    }
+
+    /// Save a new plot template (`index` None) or replace a saved one, which
+    /// stays the default if it was
+    pub fn put_template(&mut self, mut template: Template, index: Option<usize>) -> Result<(), String> {
+        Self::check_name(self.circos_templates.iter().map(|t| t.name.as_str()), &template.name, index, "template", "Update or Rename")?;
+        template.name = template.name.trim().to_string();
+        match index {
+            Some(i) if i < self.circos_templates.len() => {
+                if self.is_default_template(i) {
+                    self.circos_default = Some(template.name.clone());
+                }
+                self.circos_templates[i] = template;
+            }
+            _ => self.circos_templates.push(template),
+        }
+        self.save()
+    }
+
+    pub fn delete_template(&mut self, index: usize) -> Result<(), String> {
+        if index < self.circos_templates.len() {
+            if self.is_default_template(index) {
+                self.circos_default = None;
+            }
+            self.circos_templates.remove(index);
+        }
+        self.save()
+    }
+
+    /// The saved template called `name` (any case)
+    pub fn template(&self, name: &str) -> Option<(usize, &Template)> {
+        self.circos_templates.iter().enumerate().find(|(_, t)| t.name.eq_ignore_ascii_case(name.trim()))
+    }
+
+    pub fn is_default_template(&self, index: usize) -> bool {
+        match (&self.circos_default, self.circos_templates.get(index)) {
+            (Some(name), Some(t)) => t.name.eq_ignore_ascii_case(name),
+            _ => false,
+        }
+    }
+
+    /// Make a saved template the one new crosslink plots start from, or none
+    pub fn set_default_template(&mut self, index: Option<usize>) -> Result<(), String> {
+        self.circos_default = index.and_then(|i| self.circos_templates.get(i)).map(|t| t.name.clone());
+        self.save()
+    }
+
+    /// The template new crosslink plots start from, if one is set
+    pub fn default_template(&self) -> Option<&Template> {
+        self.template(self.circos_default.as_deref()?).map(|(_, t)| t)
+    }
+
+    /// The style new crosslink plots start from: the default template's,
+    /// else the built-in one
+    pub fn circos_style(&self) -> CircosStyle {
+        self.default_template().map(|t| t.apply(&CircosStyle::default())).unwrap_or_default()
     }
 }
 
@@ -1144,6 +1225,49 @@ mod test {
         bad.target = "KK".into();
         assert!(lib.put_mod(bad, None).is_err());
         assert!(lib.modifications.is_empty());
+    }
+
+    #[test]
+    fn plot_templates_are_kept_with_the_library() {
+        use crate::viewer::circos::{CircosData, ColorBy};
+        let path = temp_file("templates");
+        let mut lib = Library::load_from(&path);
+        lib.put_linker(SavedLinker::from_crosslink("DSS", &with(Reagent::Dss)), None).unwrap();
+        let paper = CircosStyle { size: 7.0, color_by: ColorBy::Score, title: "Pol II".into(), ..CircosStyle::default() };
+        lib.put_template(Template::new("Paper", &paper, false, &CircosData::default()), None).unwrap();
+        lib.put_template(Template::new("Poster", &CircosStyle { size: 20.0, ..CircosStyle::default() }, false, &CircosData::default()), None).unwrap();
+        assert!(lib.put_template(Template::new("paper ", &paper, false, &CircosData::default()), None).unwrap_err().contains("already called"));
+        assert!(lib.put_template(Template::new(" ", &paper, false, &CircosData::default()), None).unwrap_err().contains("name"));
+        // no default: the built-in style
+        assert_eq!(lib.circos_style(), CircosStyle::default());
+        lib.set_default_template(Some(0)).unwrap();
+
+        // a template written by a newer XNova is kept as it is
+        let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        file["circos_templates"].as_array_mut().unwrap().push(json!({"name": "Future", "style": {"palette": "neon"}}));
+        std::fs::write(&path, file.to_string()).unwrap();
+
+        let mut back = Library::load_from(&path);
+        assert_eq!(back.circos_templates, lib.circos_templates);
+        assert_eq!(back.crosslinkers.len(), 1);
+        assert_eq!(back.default_template().unwrap().name, "Paper");
+        let style = back.circos_style();
+        assert_eq!((style.size, style.color_by, style.title.as_str()), (7.0, ColorBy::Score, ""));
+        assert_eq!(back.template("POSTER").unwrap().0, 1);
+
+        // renamed, the default stays the default; deleted, there is none
+        let mut renamed = back.circos_templates[0].clone();
+        renamed.name = "Paper 2026".into();
+        back.put_template(renamed, Some(0)).unwrap();
+        assert_eq!(back.circos_default.as_deref(), Some("Paper 2026"));
+        back.delete_template(0).unwrap();
+        assert!(back.default_template().is_none());
+        let back = Library::load_from(&path);
+        assert_eq!(back.circos_templates.len(), 1);
+        assert!(back.circos_default.is_none());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"Future\"") && text.contains("neon"), "{text}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cli"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5335,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cloudpath"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "async-compression",
  "base64 0.13.1",
@@ -5362,7 +5362,7 @@ dependencies = [
 
 [[package]]
 name = "sage-core"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "dashmap",
  "fnv",
@@ -5380,7 +5380,7 @@ dependencies = [
 
 [[package]]
 name = "sage-gui"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "eframe",
  "egui_kittest",
@@ -5394,6 +5394,7 @@ dependencies = [
  "roxmltree 0.20.0",
  "sage-cloudpath",
  "sage-core",
+ "serde",
  "serde_json",
  "svg2pdf",
  "tiny_http",

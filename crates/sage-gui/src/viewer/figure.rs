@@ -553,6 +553,22 @@ fn system_fonts() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
         .clone()
 }
 
+/// The font families installed, as the figures find them, sorted
+pub(super) fn font_families() -> Vec<String> {
+    use resvg::usvg::fontdb::Language;
+    let fonts = system_fonts();
+    let mut names: Vec<String> = fonts
+        .faces()
+        .filter_map(|face| {
+            let english = face.families.iter().find(|(_, language)| *language == Language::English_UnitedStates);
+            english.or(face.families.first()).map(|(name, _)| name.clone())
+        })
+        .collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    names.dedup();
+    names
+}
+
 /// The SVG parsed for rendering, with the system fonts
 fn parse(svg: &str) -> Result<(resvg::usvg::Tree, f32), String> {
     let mut options = resvg::usvg::Options::default();

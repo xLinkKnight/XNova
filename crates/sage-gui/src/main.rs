@@ -40,7 +40,52 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     // `sage-gui --view <results folder>` opens the annotated spectra of a search,
-    // `sage-gui --xiview <results folder>` its crosslinks in xiVIEW (web browser)
+    // `sage-gui --xiview <results folder>` its crosslinks in xiVIEW (web browser),
+    // `sage-gui --circos <results folder> [style.json | template]` writes its
+    // crosslink plot (no window), in the style of the file or saved template
+    // given, else of the default template
+    if std::env::args().nth(1).as_deref() == Some("--circos") {
+        let folder = std::env::args().nth(2).unwrap_or_else(|| ".".into());
+        let library = library::Library::load();
+        if let Some(e) = &library.error {
+            eprintln!("{e}");
+        }
+        let style = match std::env::args().nth(3) {
+            Some(path) if Path::new(&path).is_file() => {
+                match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| viewer::circos::CircosStyle::from_json(&t)) {
+                    Ok(style) => style,
+                    Err(e) => {
+                        eprintln!("{path}: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some(name) => match library.template(&name) {
+                Some((_, t)) => t.apply(&viewer::circos::CircosStyle::default()),
+                None => {
+                    let names: Vec<&str> = library.circos_templates.iter().map(|t| t.name.as_str()).collect();
+                    eprintln!(
+                        "{name}: neither a style file nor a saved template{}",
+                        if names.is_empty() { " (none saved yet)".to_string() } else { format!(" ({})", names.join(", ")) }
+                    );
+                    std::process::exit(1);
+                }
+            },
+            None => library.circos_style(),
+        };
+        match viewer::circos::write_figures(Path::new(&folder), &style) {
+            Ok(files) => {
+                for f in files {
+                    println!("{}", f.display());
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let mut args = std::env::args().skip(1);
     let (view, xiview) = match args.next().as_deref() {
         Some("--view") => (args.next(), None),
@@ -112,7 +157,7 @@ struct SageGui {
     /// Steps, metrics and errors of the current or last search
     tracker: Option<progress::Tracker>,
     /// The mobiligrams of the last search, being written in the background
-    figures: Option<std::sync::mpsc::Receiver<Result<Vec<PathBuf>, String>>>,
+    figures: Option<std::sync::mpsc::Receiver<(Vec<PathBuf>, Vec<String>)>>,
     /// CPU / RAM / GPU / vRAM utilisation, shown on the Progress tab
     usage: usage::Monitor,
     dark: bool,
@@ -533,15 +578,12 @@ impl SageGui {
         // the mobiligrams written in the background: listed with the search's outputs
         if let (Some(rx), Some(tracker)) = (&self.figures, &mut self.tracker) {
             match rx.try_recv() {
-                Ok(Ok(written)) => {
+                Ok((written, warnings)) => {
                     for path in written {
                         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         tracker.outputs.push((path, size));
                     }
-                    self.figures = None;
-                }
-                Ok(Err(e)) => {
-                    tracker.warnings.push(format!("mobiligram not written: {e}"));
+                    tracker.warnings.extend(warnings);
                     self.figures = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -555,13 +597,25 @@ impl SageGui {
             Status::Running(_) => {}
             Status::Finished if tracker.state != progress::State::Finished => {
                 tracker.finish(progress::State::Finished, None, &log);
-                // timsTOF data: the mobiligrams next to the results, written in
-                // the background so the window stays responsive
+                // timsTOF data: the mobiligrams next to the results; crosslink
+                // searches: the crosslink plot. Written in the background so
+                // the window stays responsive
                 let out = tracker.plan.output_dir.clone();
+                // the crosslink plot in the default template's style
+                let style = self.library.circos_style();
                 let (tx, rx) = std::sync::mpsc::channel();
                 let ctx = ctx.clone();
-                let _ = std::thread::Builder::new().name("mobiligrams".into()).spawn(move || {
-                    let _ = tx.send(viewer::mobiligram::write_figures(&out));
+                let _ = std::thread::Builder::new().name("figures".into()).spawn(move || {
+                    let (mut written, mut warnings) = (Vec::new(), Vec::new());
+                    match viewer::mobiligram::write_figures(&out) {
+                        Ok(paths) => written.extend(paths),
+                        Err(e) => warnings.push(format!("mobiligram not written: {e}")),
+                    }
+                    match viewer::circos::write_figures(&out, &style) {
+                        Ok(paths) => written.extend(paths),
+                        Err(e) => warnings.push(format!("crosslink plot not written: {e}")),
+                    }
+                    let _ = tx.send((written, warnings));
                     ctx.request_repaint();
                 });
                 self.figures = Some(rx);
@@ -863,7 +917,7 @@ impl SageGui {
                             self.xiview_controls(ui, Path::new(&folder));
                             ui.add_space(4.0);
                         }
-                        self.viewer.ui(ui, &self.s.output_directory)
+                        self.viewer.ui(ui, &self.s.output_directory, &mut self.library)
                     }
                 });
             });
@@ -1440,8 +1494,9 @@ impl SageGui {
                     ui.spinner();
                     ui.label(
                         RichText::new(format!(
-                            "writing the mobiligrams to {}\\ (precursor m/z against ion mobility)…",
-                            viewer::mobiligram::FOLDER
+                            "writing the figures: mobiligrams to {}\\ (timsTOF), the crosslink plot to {}\\ (crosslink searches)…",
+                            viewer::mobiligram::FOLDER,
+                            viewer::circos::FOLDER
                         ))
                         .color(muted),
                     );

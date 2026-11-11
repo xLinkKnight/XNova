@@ -757,6 +757,119 @@ and the expected fragments annotate (about twice the peaks of the neighbouring
 spectrum); synthetic DSS, loop-link and EDC spectra from Sage's fragment model
 annotate 98 to 100%.
 
+## Crosslink plots (Circos)
+
+`sage-gui` draws a search's crosslinks as a circular plot in the style of
+[Circos](https://circos.ca) (Martin Krzywinski, Canada's Michael Smith Genome
+Sciences Centre) with its own renderer: no Circos, Perl or internet connection
+is needed, and the figure is the same in the window, in the exported files and
+in the plots written after a search. Open it with **Crosslink plot...** on the
+Annotated spectra tab.
+
+* **Which crosslinks:** target CSMs of rank 1 in `crosslinks.sage.tsv` whose
+  spectrum q-value and crosslink q-value are both at most the threshold (0.01
+  by default). The CSMs of the same two residues make one link; **CSMs ≥**
+  leaves out links seen fewer times. Links between proteins, within a protein
+  (two peptides of one protein), loop-links and the links of multivalent
+  species can each be shown or left out. A peptide found in several proteins
+  (or in several places of one) is placed in the first protein Sage lists for
+  it, or in each with **peptides of several proteins: in each**.
+* **Proteins** are the arcs of the circle, scaled to their length, the protein
+  with the most links first, clockwise from the start angle. Reorder them
+  (⏶ ⏷), label them (the gene name by default), colour them, or leave them out.
+* **Tracks**, inside the ring: the crosslinked residues (CSMs per site), the
+  sequence coverage of the linear search (its target peptides at the same
+  q-value), the linker's reactive residues (e.g. every K for DSSO; taken from
+  the search's crosslinker unless given), and your own regions from a
+  tab-separated annotation file:
+
+  ```
+  protein                 start   end    label        colour (optional)
+  RPB1                    1       345    clamp core   #4e79a7
+  sp|P08518|RPB2_YEAST    700     1000   lobe
+  ```
+
+  The protein may be named by accession, entry name, gene or label. A header
+  line and lines starting with `#` are skipped; proteins not in the plot are
+  listed under the annotation file's name.
+* **Links** are coloured by kind (in the mobiligram's colours), by protein, by
+  score, crosslink q-value or number of CSMs (a gradient between two colours of
+  your choice), or in one colour; wider for more CSMs or not, with their
+  opacity and curvature.
+* **Highlights:** crosslinks picked out in a colour of their own, drawn wider
+  (**width ×**) and on top of the others: one crosslink (picked from a list of
+  every crosslink, most CSMs first, searched by protein or residue, e.g.
+  `RPB2 K813`), every crosslink of a protein, those between two proteins (or
+  within one), a kind of crosslink (between proteins, within a protein,
+  loop-links, multivalent), or those with an end in a stretch of a protein.
+  A crosslink takes the colour of the first highlight that picks it; reorder
+  them with ⏶ ⏷, untick one to keep it without drawing it. **Dim the others**
+  draws the crosslinks no highlight picks in grey (or a colour of your
+  choice), fainter. Each highlight is a row of the legend, with the number of
+  crosslinks it colours, under its own text or what it picks. The Circos
+  files colour them the same (`hl1`, `hl2`, ... in `circos.conf`), wider and
+  on top (`z`).
+* **Legend:** in the corner of your choice. The circle keeps clear of it:
+  it moves away from the legend and, only if that is not enough, is drawn
+  smaller, so that labels, tick numbers and legend never overlap.
+* **Text:** the font, picked from those installed on the computer (or typed
+  as a list of fonts in order of preference, as in CSS), and for each kind of
+  text (title, protein labels, tick numbers, legend, annotation labels) its
+  size in points, bold and italic; **smaller** and **larger** change every
+  size at once. PDF and PNG carry the font; an SVG names it, so whoever opens
+  the SVG needs it installed, or gets the next font of the list. Italic and
+  bold need the font's italic and bold faces. The Circos input files take the
+  same sizes, bold and italic, in Circos' own fonts.
+* **Export:** **Save figure...** as SVG or PDF (vector), or PNG or TIFF at 72
+  to 1200 dpi. **Circos files...** writes the plot as input for Circos itself.
+  **Table...** writes the number of crosslinks between each pair of proteins
+  for Circos' [table viewer](https://mk.bcgsc.ca/tableviewer/). **All to
+  results folder** writes all of them to `circos/`.
+
+After every crosslink search, `sage-gui` writes these to the `circos` folder
+of the results, in the default template's style (below) or the built-in one:
+
+| File | Content |
+|---|---|
+| `crosslinks_circos.svg`, `.pdf`, `.png` | The plot (the PNG at 300 dpi) |
+| `circos_style.json` | The style it was drawn in, to load again or share |
+| `crosslink_table.txt` | Crosslinks between each pair of proteins, for the table viewer |
+| `circos_input/` | `karyotype.txt`, `links.txt`, the track files and `circos.conf`: run `circos -conf circos.conf` in this folder |
+
+`sage-gui --circos <results folder> [style.json | template name]` writes the
+same without opening a window. The Circos input files follow Circos's
+documented formats but have not yet been run through Circos itself; please
+report any problem.
+
+### Templates
+
+A plot's style can be saved under a name, **Templates > Save as** in the
+**Crosslink plot** window, and applied to other results (**Apply**) to give
+their plot the same look, so that a series of figures, or a paper's, match. A
+template holds everything about the plot but its proteins: the crosslinks
+drawn (thresholds and kinds), the ring, labels, ticks and tracks, link colours
+and widths, the canvas size, background and legend, the font and each text's
+size, bold and italic. Tick
+**with these proteins** to also keep which proteins are shown, their order,
+labels and colours (palette colours as they are when saved), the annotation
+file and the title. They are matched by accession in other results: for the
+same complex across experiments. A template without proteins leaves each
+plot's own. Highlights follow the same rule: those of a kind of crosslink
+belong to the style, those of proteins, residues or stretches to the
+proteins.
+
+* **Update** replaces a template with the plot's style now, and **Rename** and
+  **Delete** change or remove it; each asks first.
+* **default**: new plots start from this template (marked ★ in the menu): the
+  window when it opens, the plot written after each search, and
+  `sage-gui --circos` without a style.
+* Templates are kept on this computer with the saved crosslinkers and
+  modifications, in `%APPDATA%\sage-gui\library.json`, written as soon as one
+  changes. To share one, **Save style...** writes the style as JSON;
+  **Load style...** and then **Save as** make it a template on another
+  computer. `sage-gui --circos <folder> <name>` uses a template by its name
+  (in any case).
+
 ## Quantification
 
 The usual `quant` block works for crosslink searches:

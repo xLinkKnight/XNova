@@ -1,6 +1,8 @@
 //! "Annotated spectra" tab: the matches of a results folder and, for the one
 //! picked, its spectrum annotated by Annotator's engine (see [`model`]).
 
+pub mod circos;
+mod circos_view;
 pub mod figure;
 pub mod loader;
 pub mod mobiligram;
@@ -50,6 +52,8 @@ pub struct Viewer {
     labels: Vec<model::PeptideLabel>,
     annotated: Option<(usize, Model)>,
     mobiligram: MobiligramView,
+    /// The crosslink plot (Circos) window
+    circos: circos_view::CircosView,
     /// Width of the match list; the divider next to it is dragged to change it
     list_width: f32,
 }
@@ -91,6 +95,7 @@ impl Default for Viewer {
             labels: Vec::new(),
             annotated: None,
             mobiligram: MobiligramView::default(),
+            circos: circos_view::CircosView::default(),
             list_width: LIST_WIDTH,
         }
     }
@@ -277,7 +282,8 @@ impl Viewer {
         self.shown = shown;
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, output_directory: &str) {
+    /// The tab's contents; `lib` holds the crosslink plot's saved templates
+    pub fn ui(&mut self, ui: &mut Ui, output_directory: &str, lib: &mut crate::library::Library) {
         self.poll(ui.ctx());
         ui.heading("Annotated spectra");
         ui.label(
@@ -375,6 +381,19 @@ impl Viewer {
             {
                 self.mobiligram.open = true;
             }
+            let has_crosslinks = results.matches.iter().any(|m| m.kind != Kind::Linear);
+            if ui
+                .add_enabled(has_crosslinks, egui::Button::new("Crosslink plot…"))
+                .on_hover_text(
+                    "The crosslinks as a circular (Circos-style) plot: proteins around the circle, a curve per \
+                     crosslink, tracks for crosslinked residues, coverage and your annotations. Every colour, \
+                     label and size can be changed; export as SVG, PDF, PNG or TIFF, or as Circos input files.",
+                )
+                .on_disabled_hover_text("Needs a crosslink search (crosslinks.sage.tsv).")
+                .clicked()
+            {
+                self.circos.open = true;
+            }
         });
         ui.add_space(4.0);
 
@@ -396,6 +415,17 @@ impl Viewer {
                 .default_size([920.0, 680.0])
                 .resizable(true)
                 .show(ui.ctx(), |ui| view.ui(ui, &points));
+            view.open = open;
+        }
+        if self.circos.open {
+            let mut open = true;
+            let folder = self.folder.clone();
+            let view = &mut self.circos;
+            egui::Window::new("Crosslink plot (Circos)")
+                .open(&mut open)
+                .default_size([1180.0, 800.0])
+                .resizable(true)
+                .show(ui.ctx(), |ui| view.ui(ui, &results, &folder, lib));
             view.open = open;
         }
     }
@@ -1699,7 +1729,7 @@ mod test {
                     installed = true;
                     return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, ""));
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, "", &mut crate::library::Library::default()));
             },
             viewer,
         );
@@ -1811,7 +1841,7 @@ mod test {
                     installed = true;
                     return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, ""));
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, "", &mut crate::library::Library::default()));
             },
             viewer,
         );
@@ -1905,7 +1935,7 @@ mod test {
                     installed = true;
                     return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, ""));
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, "", &mut crate::library::Library::default()));
             },
             viewer,
         );
@@ -1990,7 +2020,7 @@ mod test {
                     installed = true;
                     return;
                 }
-                v.ui(ui, "");
+                v.ui(ui, "", &mut crate::library::Library::default());
             },
             viewer,
         );

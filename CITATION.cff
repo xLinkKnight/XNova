@@ -176,6 +176,33 @@ references:
     doi: 10.1074/mcp.TIR118.001276
     notes: "Crosslink spectral libraries for Spectronaut (xiDIA-library, https://github.com/Rappsilber-Laboratory/xiDIA-library, Apache-2.0); XNova's xlibrary files are written in their form."
   - type: article
+    title: "Circos: An information aesthetic for comparative genomics"
+    authors:
+      - family-names: Krzywinski
+        given-names: Martin
+      - family-names: Schein
+        given-names: Jacqueline
+      - family-names: Birol
+        given-names: Inanc
+      - family-names: Connors
+        given-names: Joseph
+      - family-names: Gascoyne
+        given-names: Randy
+      - family-names: Horsman
+        given-names: Doug
+      - family-names: Jones
+        given-names: Steven J.
+      - family-names: Marra
+        given-names: Marco A.
+    journal: Genome Research
+    volume: 19
+    issue: 9
+    start: 1639
+    end: 1645
+    year: 2009
+    doi: 10.1101/gr.092759.109
+    notes: "Circos (https://circos.ca); sage-gui's crosslink plots are drawn in its style with XNova's own code (no Circos code is included), and can be exported as Circos input files."
+  - type: article
     title: "Unimod: Protein modifications for mass spectrometry"
     authors:
       - family-names: Creasy
