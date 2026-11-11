@@ -717,6 +717,7 @@ pub(super) mod test {
             spectrum_q: 0.001,
             crosslink_q: q,
             species: None,
+            fragments: None,
         }
     }
 

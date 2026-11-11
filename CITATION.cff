@@ -146,6 +146,35 @@ references:
     year: 2025
     doi: 10.1093/nar/gkae1011
     notes: "PRIDE; XNova's local xiVIEW server answers the data API of the PRIDE Crosslinking Resource (https://github.com/PRIDE-Archive/crosslinking-api)."
+  - type: software
+    title: "EasyPQP: Simple library generation for OpenSWATH"
+    authors:
+      - family-names: Rosenberger
+        given-names: George
+    repository-code: "https://github.com/grosenberger/easypqp"
+    license: BSD-3-Clause
+    notes: "XNova's spectral libraries (spectral_library) follow EasyPQP's method and library columns, reimplemented in Rust (no EasyPQP code is included)."
+  - type: article
+    title: "Data-independent Acquisition Improves Quantitative Cross-linking Mass Spectrometry"
+    authors:
+      - family-names: Müller
+        given-names: Fränze
+      - family-names: Kolbowski
+        given-names: Lars
+      - family-names: Bernhardt
+        given-names: Oliver M.
+      - family-names: Reiter
+        given-names: Lukas
+      - family-names: Rappsilber
+        given-names: Juri
+    journal: Molecular & Cellular Proteomics
+    volume: 18
+    issue: 4
+    start: 786
+    end: 795
+    year: 2019
+    doi: 10.1074/mcp.TIR118.001276
+    notes: "Crosslink spectral libraries for Spectronaut (xiDIA-library, https://github.com/Rappsilber-Laboratory/xiDIA-library, Apache-2.0); XNova's xlibrary files are written in their form."
   - type: article
     title: "Unimod: Protein modifications for mass spectrometry"
     authors:

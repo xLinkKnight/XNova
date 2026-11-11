@@ -773,6 +773,30 @@ pub struct CrosslinkMatch {
     /// Multivalent species (`kind == Multi`): every peptide and link. `alpha`
     /// / `beta` and their sites are then the species' first link.
     pub species: Option<Box<Species>>,
+    /// Matched fragment ions of pairs and loop-links, when the search keeps
+    /// them (spectral libraries; see [`CrosslinkScorer::annotate`])
+    #[serde(skip)]
+    pub fragments: Option<Box<Vec<LinkedFragment>>>,
+}
+
+/// A matched fragment ion of a crosslink-spectrum match
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LinkedFragment {
+    /// 0: alpha, 1: beta
+    pub peptide: u8,
+    pub kind: Kind,
+    /// Series number: residues the ion contains
+    pub number: u16,
+    pub charge: u8,
+    /// Calculated m/z
+    pub mz: f32,
+    /// Intensity of the matched peak
+    pub intensity: f32,
+    /// Carries the linker: with the partner peptide, or one of an MS-cleavable
+    /// linker's stubs
+    pub linked: bool,
+    /// Neutral mass added to the plain backbone ion
+    pub shift: f32,
 }
 
 static CSM_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -1558,7 +1582,105 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             found[idx].delta_next = found[idx].hyperscore - next;
             found[idx].pairs_scored = pairs_scored;
         }
+        if self.scorer.annotate_matches {
+            for m in found.iter_mut().filter(|m| m.kind != LinkKind::Multi) {
+                m.fragments = Some(Box::new(self.annotate(query, m)));
+            }
+        }
         found
+    }
+
+    /// The matched fragment ions of a pair or loop-link (for spectral
+    /// libraries): every backbone ion of both peptides, at each charge the
+    /// search matches, at its most intense peak within the fragment tolerance.
+    /// Ions containing a link site carry the partner peptide and the linker
+    /// or, for MS-cleavable linkers, one of the linker's stubs; of these
+    /// forms the one with the most intense peak is kept. Loop-links: ions
+    /// containing both sites carry the linker (cleavable: or both arms'
+    /// stubs), ions containing one site exist only for cleavable linkers (with
+    /// a stub).
+    pub fn annotate(&self, query: &ProcessedSpectrum, m: &CrosslinkMatch) -> Vec<LinkedFragment> {
+        let db = self.scorer.db;
+        let mods = &db.modifications;
+        let max_fc = frag_charge_bound(self.scorer.max_fragment_charge, m.charge);
+        let tol = self.scorer.fragment_tol;
+        let linker = self.settings.linker_mass();
+        let stubs: Vec<f32> = self
+            .settings
+            .stubs()
+            .map(|s| s.arms().iter().flat_map(|arm| arm.all()).collect())
+            .unwrap_or_default();
+        // cleavable loop-links: stubs on both residues, one arm's short stub
+        let mut loop_both: Vec<f32> = Vec::new();
+        if let Some(cleavable) = self.settings.stubs() {
+            let arms = cleavable.arms();
+            for x in &arms {
+                for y in &arms {
+                    for long in std::iter::once(y.long).chain(y.alt.iter().copied()) {
+                        let sum = x.short + long;
+                        if loop_both.iter().all(|b| (b - sum).abs() > 1e-3) {
+                            loop_both.push(sum);
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        let mut chain = |which: u8, peptide: &Peptide, sites: &[usize], partner: f32| {
+            let len = peptide.sequence.len();
+            for &kind in &db.ion_kinds {
+                let n_terminal = matches!(kind, Kind::A | Kind::B | Kind::C);
+                for (idx, ion) in IonSeries::new(peptide, kind, mods).enumerate() {
+                    let inside = sites
+                        .iter()
+                        .filter(|&&site| if n_terminal { idx >= site } else { idx < site })
+                        .count();
+                    let shifts: Vec<f32> = match (sites.len(), inside) {
+                        (_, 0) => vec![0.0],
+                        (1, _) => std::iter::once(partner + linker).chain(stubs.iter().copied()).collect(),
+                        (_, 1) => stubs.clone(),
+                        _ => std::iter::once(linker).chain(loop_both.iter().copied()).collect(),
+                    };
+                    let number = if n_terminal { idx + 1 } else { len.saturating_sub(1 + idx) };
+                    for charge in 1..max_fc {
+                        let mut best: Option<(usize, f32)> = None;
+                        for &shift in &shifts {
+                            let mz = (ion.monoisotopic_mass + shift) / charge as f32;
+                            if let Some(peak) =
+                                select_most_intense_peak(&query.masses, &query.intensities, mz, tol, None)
+                            {
+                                if best.map_or(true, |(b, _)| query.intensities[peak] > query.intensities[b]) {
+                                    best = Some((peak, shift));
+                                }
+                            }
+                        }
+                        if let Some((peak, shift)) = best {
+                            let fragment_charge = query.charges[peak].max(charge);
+                            out.push(LinkedFragment {
+                                peptide: which,
+                                kind,
+                                number: number as u16,
+                                charge: fragment_charge,
+                                mz: (ion.monoisotopic_mass + shift) / fragment_charge as f32 + crate::mass::PROTON,
+                                intensity: query.intensities[peak],
+                                linked: shift != 0.0,
+                                shift,
+                            });
+                        }
+                    }
+                }
+            }
+        };
+        let alpha = &db[m.alpha];
+        match m.beta {
+            Some(beta) => {
+                let beta = &db[beta];
+                chain(0, alpha, &[m.alpha_site as usize], beta.monoisotopic);
+                chain(1, beta, &[m.beta_site as usize], alpha.monoisotopic);
+            }
+            None => chain(0, alpha, &[m.alpha_site as usize, m.beta_site as usize], 0.0),
+        }
+        out
     }
 
     /// Matched ions carrying the linker on each chain of a non-cleavable match
@@ -2952,6 +3074,69 @@ mod test {
         ];
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    /// With `annotate_matches`, a pair's matched ions are kept for spectral
+    /// libraries: both chains, both charges, the linked ones with the partner
+    /// peptide and linker (non-cleavable) or a stub (MS-cleavable)
+    #[test]
+    fn annotates_matched_fragments() {
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let (site_a, site_b) = (3usize, 9usize);
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let mut sc = scorer(&db);
+
+        // non-cleavable: only searched when asked for
+        let cfg = CrosslinkSettings::default();
+        let query = linked_spectrum(&db, &a, &b, site_a, site_b, DSS);
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&query);
+        assert!(hits[0].fragments.is_none());
+        sc.annotate_matches = true;
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&query);
+        let hit = &hits[0];
+        let fragments = hit.fragments.as_ref().expect("annotated");
+        let alpha_is_a = db[hit.alpha].sequence == a.sequence;
+        let (alpha, beta) = if alpha_is_a { (&a, &b) } else { (&b, &a) };
+        let alpha_site = if alpha_is_a { site_a } else { site_b };
+        let n = (alpha.sequence.len() - 1 + beta.sequence.len() - 1) * 2 * 2;
+        assert!(fragments.len() >= n * 9 / 10, "{} of {n}", fragments.len());
+        for f in fragments.iter() {
+            let (p, partner) = if f.peptide == 0 { (alpha, beta) } else { (beta, alpha) };
+            assert_eq!(f.linked, f.shift != 0.0);
+            if f.linked {
+                assert!((f.shift - (partner.monoisotopic + DSS)).abs() < 1e-3);
+            }
+            let n_terminal = matches!(f.kind, Kind::B);
+            let site = if f.peptide == 0 { alpha_site } else if alpha_is_a { site_b } else { site_a };
+            let contains = if n_terminal { f.number as usize > site } else { p.sequence.len() - (f.number as usize) <= site };
+            assert_eq!(f.linked, contains, "{f:?}");
+            assert!(f.charge == 1 || f.charge == 2);
+        }
+        assert!(fragments.iter().any(|f| f.peptide == 1 && f.linked));
+        // the m/z of an ion: (mass + shift) / z + proton
+        let y3 = fragments.iter().find(|f| f.peptide == 0 && f.kind == Kind::Y && f.number == 3 && f.charge == 2).unwrap();
+        let mass = IonSeries::new(alpha, Kind::Y, &db.modifications).nth(alpha.sequence.len() - 4).unwrap().monoisotopic_mass;
+        assert!((y3.mz - ((mass + y3.shift) / 2.0 + PROTON)).abs() < 1e-3);
+
+        // MS-cleavable: linked ions carry one of the stubs
+        let cfg = dsso();
+        let stubs = cfg.stubs().unwrap();
+        let mut ions = stubbed_ions(&a, &db.modifications, site_a, &stubs);
+        ions.extend(stubbed_ions(&b, &db.modifications, site_b, &stubs));
+        for p in [&a, &b] {
+            ions.push((Kind::B, p.monoisotopic + stubs.short));
+            ions.push((Kind::B, p.monoisotopic + stubs.long));
+        }
+        let query = spectrum(a.monoisotopic + b.monoisotopic + cfg.linker_mass(), 4, &ions);
+        let hits = CrosslinkScorer::new(&sc, &cfg).score(&query);
+        let fragments = hits[0].fragments.as_ref().expect("annotated");
+        let linked: Vec<_> = fragments.iter().filter(|f| f.linked).collect();
+        assert!(!linked.is_empty());
+        assert!(linked.iter().all(|f| (f.shift - stubs.short).abs() < 1e-3 || (f.shift - stubs.long).abs() < 1e-3), "{linked:?}");
     }
 
     /// Stub-bearing ions of a chain on one arm of an asymmetric linker

@@ -110,7 +110,8 @@ impl Runner {
             chimera: false,
             report_psms: self.parameters.report_psms,
             wide_window: false,
-            annotate_matches: false,
+            // a spectral library needs the matched fragments
+            annotate_matches: self.parameters.spectral_library.is_some(),
             score_type: self.parameters.score_type,
         };
         let kernel = sage_core::crosslink::make_kernel(&settings, &self.database)
@@ -176,6 +177,9 @@ impl Runner {
             csms
         );
         info!("discovered {} unique target crosslinks at 1% FDR", links);
+        if let Some(library) = self.parameters.spectral_library.clone() {
+            self.write_crosslink_library(&matches, &settings, &library)?;
+        }
 
         let filenames = self
             .parameters

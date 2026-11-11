@@ -2641,6 +2641,33 @@ fn scoring_tab(ui: &mut Ui, s: &mut Settings) {
             |ui| ui.checkbox(&mut s.write_annotator, "write .annotator.csv files"));
     });
 
+    heading(ui, "Spectral libraries");
+    note(ui, "For DIA searches of the same samples in DIA-NN, Spectronaut or PEAKS: the confident PSMs \
+        (1% PSM, peptide and protein FDR) become a spectral library, as EasyPQP makes one: for each precursor \
+        the best PSM of every run, retention times on one scale across the aligned runs (0-100, or iRT) and, \
+        from timsTOF runs, ion mobility (1/K0) calibrated across runs, then the median of the runs and each \
+        fragment's median intensity. Written in two layouts: library.tsv (OpenSWATH columns: DIA-NN, PEAKS \
+        Library Viewer, OpenSWATH) and library.spectronaut.xls (Spectronaut, also DIA-NN and PEAKS). A \
+        crosslink search also writes xlibrary.tsv and xlibrary.spectronaut.xls: each crosslink at 1% FDR \
+        (pairs and loop-links) as one precursor, its two peptides joined by _ and the crosslinker on the \
+        linked residues, as Rappsilber Laboratory's xiDIA-library writes them for Spectronaut; xlibrary.tsv \
+        has a decoy for each, which DIA-NN then uses instead of making its own.");
+    grid(ui, "library", |ui| {
+        row(ui, "Spectral libraries", "Write library.tsv and library.spectronaut.xls (and, with crosslinks, \
+            xlibrary.tsv and xlibrary.spectronaut.xls) next to the results. The search keeps the matched \
+            fragments of every PSM for them.",
+            |ui| ui.checkbox(&mut s.spectral_library, "write spectral libraries"));
+        row(ui, "Retention time", "iRT: calibrate the library's retention times to Biognosys' iRT kit peptides \
+            found by the search (4 of the 11 needed; spike the kit into the runs). Otherwise, and when too few \
+            are found, the aligned runs' times on a 0-100 scale, which DIA-NN, Spectronaut and PEAKS recalibrate \
+            to their runs.",
+            |ui| ui.add_enabled(s.spectral_library, egui::Checkbox::new(&mut s.library_irt, "iRT from the iRT kit peptides")));
+        row(ui, "Shared peptides", "By default only peptides of a single protein (proteotypic) go into the \
+            library, as EasyPQP does. Tick to also include peptides shared by several proteins (marked as not \
+            proteotypic).",
+            |ui| ui.add_enabled(s.spectral_library, egui::Checkbox::new(&mut s.library_shared, "include shared peptides")));
+    });
+
     heading(ui, "Quality control");
     note(ui, "Every search writes digestion.tsv: the missed-cleavage, semi- and non-enzymatic rates of the \
         peptides at 1% FDR (decoy-corrected), and checks MS1 spectra for polymer contamination (PEG, PPG and \

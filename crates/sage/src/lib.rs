@@ -25,6 +25,7 @@ pub mod protein_grouping;
 pub mod scoring;
 pub mod silac;
 pub mod site_library;
+pub mod spectral_library;
 pub mod site_rules;
 pub mod spectrum;
 pub mod tmt;

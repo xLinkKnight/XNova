@@ -33,6 +33,7 @@ mod crosslink_runner;
 mod entrapment;
 mod lfq_long;
 mod qc;
+mod library;
 mod sites;
 pub use qc::QcReport;
 mod silac_tables;
@@ -46,6 +47,8 @@ pub struct Runner {
     spectra_searched: AtomicUsize,
     /// Quality control gathered while the spectra are read
     qc: std::sync::Mutex<qc::QcCollector>,
+    /// The linear spectral library's scales, for the crosslink library
+    library: Option<library::LibraryContext>,
 }
 
 #[derive(Default)]
@@ -155,6 +158,7 @@ impl Runner {
                         start,
                         spectra_searched: AtomicUsize::new(0),
                         qc: Default::default(),
+                        library: None,
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
                     parameters.database.clone().build_from_peptides(peptides)
@@ -174,6 +178,7 @@ impl Runner {
             start,
             spectra_searched: AtomicUsize::new(0),
             qc: Default::default(),
+            library: None,
         })
     }
 
@@ -679,7 +684,8 @@ impl Runner {
             chimera: self.parameters.chimera,
             report_psms: self.parameters.report_psms,
             wide_window: self.parameters.wide_window,
-            annotate_matches: self.parameters.annotate_matches,
+            // a spectral library needs the matched fragments
+            annotate_matches: self.parameters.annotate_matches || self.parameters.spectral_library.is_some(),
             score_type: self.parameters.score_type,
         };
 
@@ -745,6 +751,19 @@ impl Runner {
         // are reported with protein group FDR = 1.0
         let q_protein_group =
             sage_core::fdr::picked_protein_group(&self.database, &mut outputs.features);
+
+        if let Some(library) = self.parameters.spectral_library.clone() {
+            // the library's retention times are the aligned ones
+            let aligned = match &alignments {
+                Some(alignments) => alignments.clone(),
+                None => sage_core::ml::retention_alignment::global_alignment_with_method(
+                    &mut outputs.features,
+                    self.parameters.mzml_paths.len(),
+                    self.parameters.quant.lfq_settings.alignment,
+                ),
+            };
+            self.write_linear_library(&outputs.features, &library, aligned)?;
+        }
 
         let filenames = self
             .parameters

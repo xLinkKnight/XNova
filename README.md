@@ -68,7 +68,7 @@ Sage's quantification works on crosslinks too, and the linear search quantifies 
 * **Isobaric (TMT):** reporter ions are read from each crosslink match's MS2 spectrum, or from the SPS-MS3 scan that names it as precursor, and added to `crosslinks.sage.tsv`. Labelling usually follows crosslinking, so a linked lysine carries no label: set TMT on lysine as a variable modification, and XNova links only the unlabelled form (it warns when a static modification blocks the reactive residues).
 * **SILAC:** see [Isotope-incorporation searches](#isotope-incorporation-searches).
 
-### Peptide searches: quality control, FDR, modifications and localization
+### Peptide searches: quality control, FDR, modifications, localization and spectral libraries
 
 The linear search (on its own, or the first stage of every crosslink search) adds to Sage's:
 
@@ -80,6 +80,8 @@ The linear search (on its own, or the first stage of every crosslink search) add
 * **Memory:** `sage.exe --estimate` reports the database size and memory a search will need before running it, `max_memory_gb` (`--max-memory`) stops a search that would use more, and the database prefilter streams spectrum files when they do not fit in memory at once.
 
 These are adapted from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) (MIT); see [CHANGELOG.md](CHANGELOG.md) for details.
+
+**Spectral libraries** (`spectral_library: {}`) for DIA searches of the same samples in DIA-NN, Spectronaut or PEAKS, made from the confident PSMs as [EasyPQP](https://github.com/grosenberger/easypqp) makes one (each precursor's best PSM per run, retention times on one scale across the runs or in iRT, ion mobility from timsTOF runs, the runs' median spectrum), without Python: `library.tsv` (OpenSWATH layout: DIA-NN, PEAKS, OpenSWATH) and `library.spectronaut.xls` (Spectronaut layout: Spectronaut, DIA-NN, PEAKS). A crosslink search adds **`xlibrary.tsv`** and **`xlibrary.spectronaut.xls`** with the crosslinks, written as the Rappsilber Laboratory's [xiDIA-library](https://github.com/Rappsilber-Laboratory/xiDIA-library) writes them for Spectronaut, with decoys for DIA-NN (see [CROSSLINKING.md](CROSSLINKING.md#spectral-libraries-for-dia)).
 
 ### Database vs. database searches
 
@@ -138,7 +140,7 @@ LFQ ratios, log2 A/B of the precursors at 1% quantified in all 4 files, as n / m
 | Sage Plus | 26,676 / +0.017 / 0.351 | 7,585 / +1.114 / 0.413 | 1,400 / -2.215 / 0.849 |
 | XNova | 25,922 / +0.017 / 0.350 | 7,380 / +1.111 / 0.409 | 1,351 / -2.213 / 0.836 |
 
-Of XNova's 191 s, reading the 14.4 GB of `.raw` files took 56 s and the search 80 s.
+Of XNova's 191 s, reading the 14.4 GB of `.raw` files took 56 s and the search 80 s. The XNova rows were measured with v1.5.0. Since v1.6.0, decoys with a target's sequence (I and L alike) are no longer searched, which recovers true hits that such decoys took: on these runs XNova then finds 248,003 PSMs, 57,440 peptides and 6,891 protein groups.
 
 **ETD, dual HCD/ETD acquisition** (PXD018176, 3 repeats each)
 
@@ -194,6 +196,10 @@ XNova serves xiVIEW the data model of the PRIDE Crosslinking Resource's API; for
 
 Perez-Riverol, Y.; Bandla, C.; Kundu, D. J.; Kamatchinathan, S.; Bai, J.; Hewapathirana, S.; John, N. S.; Prakash, A.; Walzer, M.; Wang, S.; Vizcaíno, J. A. [The PRIDE database at 20 years: 2025 update](https://doi.org/10.1093/nar/gkae1011). *Nucleic Acids Res.* **2025**, 53 (D1), D543–D553. doi:10.1093/nar/gkae1011
 
+If you use the spectral libraries, please credit [EasyPQP](https://github.com/grosenberger/easypqp), whose method they follow, and for crosslink libraries the paper that introduced their form:
+
+Müller, F.; Kolbowski, L.; Bernhardt, O. M.; Reiter, L.; Rappsilber, J. [Data-independent Acquisition Improves Quantitative Cross-linking Mass Spectrometry](https://doi.org/10.1074/mcp.TIR118.001276). *Mol. Cell. Proteomics* **2019**, 18 (4), 786–795. doi:10.1074/mcp.TIR118.001276
+
 If you add modifications from [Unimod](https://www.unimod.org) (`sage-gui`, Modifications tab, "Unimod accession #"), please cite Unimod:
 
 Creasy, D. M.; Cottrell, J. S. [Unimod: Protein modifications for mass spectrometry](https://doi.org/10.1002/pmic.200300744). *Proteomics* **2004**, 4 (6), 1534–1536. doi:10.1002/pmic.200300744
@@ -211,6 +217,8 @@ xiVIEW in `sage-gui` ("Open in xiVIEW") is the work of the [Rappsilber Laborator
 Quality control, timsTOF calibration, nonlinear retention-time alignment, picked FDR, the long-form LFQ table, named modifications, mass offsets, site localization, site libraries and the streamed prefilter are adapted from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) by pgarrett-scripps (MIT; `licenses/sage-plus/`).
 
 Thermo `.raw` files are read with [sage-plus-raw](https://github.com/pgarrett-scripps/sage-plus-raw), a pure-Rust reader of the Thermo RAW format from [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) (pgarrett-scripps), forked from [OpenTFRaw](https://github.com/Sigilweaver/OpenTFRaw) by Nathan Riley and contributors (Sigilweaver Holdings LLC), under the Apache-2.0 license; its license and notice are in [licenses/sage-plus-raw](licenses/sage-plus-raw). XNova's reader module (`crates/sage-cloudpath/src/thermoraw.rs`) is adapted from Sage Plus's (MIT). Thermo Fisher Scientific is not affiliated with either project.
+
+Spectral libraries (`spectral_library`) follow the method of [EasyPQP](https://github.com/grosenberger/easypqp) by George Rosenberger and contributors (BSD-3-Clause), the library generator of OpenSWATH and FragPipe: its filters (PSM, peptide and protein FDR, proteotypic peptides), the best PSM of each precursor in every run, retention times scaled 0-100 and ion mobilities calibrated to a reference run, the consensus of the runs with fragment intensities scaled to 10,000, its OpenSWATH library columns with their DIA-NN fragment columns, and its reading of Sage results (accessions and entry names from `db|ACC|ENTRY`, modifications as UniMod accessions). XNova reimplements these in Rust; no EasyPQP code is included. Crosslink libraries are written in the form of the Rappsilber Laboratory's [xiDIA-library](https://github.com/Rappsilber-Laboratory/xiDIA-library) (Apache-2.0) for Spectronaut, described in Muller et al. 2019 (see Citation); again no code of it is included.
 
 Modification names, masses and sites in `sage-gui` come from [Unimod](https://www.unimod.org), the protein modification database for mass spectrometry started by David Creasy and John Cottrell at Matrix Science. Unimod is a public domain database, distributed under a copyleft licence, the [Design Science License](crates/sage-gui/assets/unimod/LICENSE-unimod.txt): "Copyright (C) 2002-2006 Unimod; this information may be copied, distributed and/or modified under certain conditions, but it comes WITHOUT ANY WARRANTY; see the accompanying Design Science License for more details." XNova bundles Unimod's XML export unchanged, with that notice and license ([crates/sage-gui/assets/unimod](crates/sage-gui/assets/unimod), and the `unimod` folder of each release download), and compiles it into `sage-gui`. Looking up a modification therefore needs no internet connection and sends no traffic to unimod.org. The Design Science License covers the Unimod data only; it does not extend to XNova's own code. `mzcore`, Annotator's engine, also carries its own compiled copy of Unimod.
 

@@ -491,7 +491,7 @@ impl Parameters {
             .par_iter()
             .filter(|digest| !digest.reference.decoy)
             .for_each(|digest| {
-                targets.insert(digest.reference.sequence.clone().into_bytes());
+                targets.insert(isobaric_key(digest.reference.sequence.as_bytes()));
             });
 
         log::trace!("modifying peptides");
@@ -598,7 +598,9 @@ impl Parameters {
                     vec![peptide].into_iter()
                 }
             })
-            .filter(move |peptide| !peptide.decoy || !targets.contains(&(peptide.sequence[..])))
+            // a decoy with a target's sequence (I and L alike) would score
+            // true hits as decoys
+            .filter(move |peptide| !peptide.decoy || !targets.contains(&isobaric_key(&peptide.sequence)))
     }
 
     /// The size of the database a search would build, counted without
@@ -615,7 +617,7 @@ impl Parameters {
         let digests = group_digests(digests);
         let targets: DashSet<_, FnvBuildHasher> = DashSet::default();
         digests.par_iter().filter(|digest| !digest.reference.decoy).for_each(|digest| {
-            targets.insert(digest.reference.sequence.clone().into_bytes());
+            targets.insert(isobaric_key(digest.reference.sequence.as_bytes()));
         });
         let per_peptide = std::mem::size_of::<Peptide>() as u64;
         let kinds = self.ion_kinds.len();
@@ -644,6 +646,7 @@ impl Parameters {
     }
 
     pub fn reorder_peptides(target_decoys: &mut Vec<Peptide>) {
+        // (see the end of this function for decoys matching targets)
         log::trace!("sorting and deduplicating peptides");
 
         let init_size = target_decoys.len();
@@ -669,6 +672,21 @@ impl Parameters {
                 false
             }
         });
+
+        // A decoy whose sequence is a target's, with I and L alike (they are
+        // isobaric: same precursor and fragment masses), would take true hits
+        // as decoys: dropped. Digests already leave these out; peptides merged
+        // from separately digested parts (the prefilter's chunks) may not.
+        let targets: std::collections::HashSet<Vec<u8>, FnvBuildHasher> = target_decoys
+            .par_iter()
+            .filter(|p| !p.decoy)
+            .map(|p| isobaric_key(&p.sequence))
+            .collect();
+        let before = target_decoys.len();
+        target_decoys.retain(|p| !p.decoy || !targets.contains(&isobaric_key(&p.sequence)));
+        if before > target_decoys.len() {
+            log::trace!("dropped {} decoys with a target's sequence", before - target_decoys.len());
+        }
 
         target_decoys
             .par_iter_mut()
@@ -1487,6 +1505,14 @@ where
     (left_idx, right_idx)
 }
 
+
+/// A peptide sequence with I read as L. The two are isobaric, so sequences
+/// with the same key have the same precursor and fragment masses: a decoy
+/// with a target's key would score that target's spectra.
+pub fn isobaric_key(sequence: &[u8]) -> Vec<u8> {
+    sequence.iter().map(|&r| if r == b'I' { b'L' } else { r }).collect()
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -1608,6 +1634,45 @@ MLDEREVAEAKLLR
         let count = |peptides: &[Peptide], decoy: bool| peptides.iter().filter(|p| p.decoy == decoy).count();
         assert_eq!(count(&on, false), count(&on, true));
         assert_eq!(count(&on, false), count(&off, false) + 4);
+    }
+
+    /// A decoy (reversed, first and last residue kept) with the sequence of a
+    /// target, I and L alike, is not searched: it would take true hits
+    #[test]
+    fn decoys_matching_targets_are_dropped() {
+        let builder: Builder = serde_json::from_value(serde_json::json!({
+            "fasta": "none",
+            "enzyme": {"missed_cleavages": 0, "min_len": 5, "cleave_at": "KR", "restrict": "P"},
+        }))
+        .unwrap();
+        let params = builder.make_parameters().unwrap();
+        // PEPTIDEK reversed is PEDITPEK, which P2 holds with an L; P3 holds it as such
+        let fasta = Fasta::parse(">P1\nPEPTIDEKAAGLMNAR\n>P2\nPEDLTPEK\n>P3\nSPEDITPEKR\n".into(), "rev_", true);
+        let peptides = params.digest(&fasta);
+        let sequences = |decoy: bool| -> Vec<String> {
+            peptides
+                .iter()
+                .filter(|p| p.decoy == decoy)
+                .map(|p| String::from_utf8(p.sequence.to_vec()).unwrap())
+                .collect()
+        };
+        let (targets, decoys) = (sequences(false), sequences(true));
+        assert!(targets.contains(&"PEPTIDEK".to_string()) && targets.contains(&"PEDLTPEK".to_string()));
+        // PEPTIDEK's decoy is PEDLTPEK with an I, and PEDLTPEK's decoy is
+        // PEPTIDEK with an L: neither is searched
+        assert!(!decoys.contains(&"PEDITPEK".to_string()), "{decoys:?}");
+        assert!(!decoys.contains(&"PEPTLDEK".to_string()), "{decoys:?}");
+        // a decoy of another target stays
+        assert!(decoys.contains(&"AANMLGAR".to_string()), "{decoys:?}");
+        // and in merged peptide lists too
+        let mut merged: Vec<Peptide> = peptides.clone();
+        let mut sneaky = peptides.iter().find(|p| !p.decoy && p.sequence.as_ref() == b"PEDLTPEK").unwrap().clone();
+        sneaky.decoy = true;
+        sneaky.sequence = std::sync::Arc::from(b"PEDITPEK".to_vec().into_boxed_slice());
+        merged.push(sneaky);
+        Parameters::reorder_peptides(&mut merged);
+        assert!(!merged.iter().any(|p| p.decoy && p.sequence.as_ref() == b"PEDITPEK"));
+        assert_eq!(isobaric_key(b"LIKIER"), b"LLKLER".to_vec());
     }
 
     /// The estimate counts what the search would index

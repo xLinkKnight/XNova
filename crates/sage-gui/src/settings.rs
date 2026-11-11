@@ -965,6 +965,15 @@ pub struct Settings {
     pub localization: bool,
     /// Residues used as decoy sites for the false localization rate
     pub localization_decoys: String,
+    /// Write spectral libraries (library.tsv, library.spectronaut.xls; with
+    /// crosslinks also xlibrary.*)
+    pub spectral_library: bool,
+    /// Library retention times in iRT (Biognosys iRT kit peptides)
+    pub library_irt: bool,
+    /// Also peptides of several proteins (`proteotypic: false`)
+    pub library_shared: bool,
+    /// Other `spectral_library` keys of a loaded file, written back unchanged
+    library_extra: Map<String, Value>,
 
     /// Keys from a loaded file the GUI does not edit, written back unchanged
     extra: Map<String, Value>,
@@ -1049,6 +1058,10 @@ impl Default for Settings {
             entrapment_tag: String::new(),
             localization: false,
             localization_decoys: "A".into(),
+            spectral_library: false,
+            library_irt: false,
+            library_shared: false,
+            library_extra: Map::new(),
             extra: Map::new(),
             extra_database: Map::new(),
             extra_enzyme: Map::new(),
@@ -1063,7 +1076,7 @@ const TOP_KEYS: &[&str] = &[
     "isotope_errors", "deisotope", "chimera", "wide_window", "min_peaks", "max_peaks",
     "max_fragment_charge", "min_matched_peaks", "report_psms", "score_type", "predict_rt",
     "protein_grouping", "protein_grouping_peptide_fdr", "write_pin", "write_report",
-    "write_annotator", "annotate_matches", "diagnostic_ions", "retention_time_alignment", "entrapment", "localization", "quant", "crosslink", "mzml_paths", "output_directory",
+    "write_annotator", "annotate_matches", "diagnostic_ions", "retention_time_alignment", "entrapment", "localization", "spectral_library", "quant", "crosslink", "mzml_paths", "output_directory",
 ];
 const DATABASE_KEYS: &[&str] = &[
     "fasta", "enzyme", "peptide_min_mass", "peptide_max_mass", "ion_kinds", "min_ion_index",
@@ -1492,6 +1505,16 @@ impl Settings {
         if !self.entrapment_tag.trim().is_empty() {
             top.insert("entrapment".into(), json!({"tag": self.entrapment_tag.trim()}));
         }
+        if self.spectral_library {
+            let mut library = self.library_extra.clone();
+            if self.library_irt {
+                library.insert("irt".into(), json!(true));
+            }
+            if self.library_shared {
+                library.insert("proteotypic".into(), json!(false));
+            }
+            top.insert("spectral_library".into(), Value::Object(library));
+        }
         // only when not the default (nonlinear)
         if self.linear_alignment {
             top.insert("retention_time_alignment".into(), json!("linear"));
@@ -1675,6 +1698,27 @@ impl Settings {
                 .unwrap_or_default(),
             linear_alignment: top.get("retention_time_alignment").and_then(Value::as_str) == Some("linear"),
             localization: top.get("localization").is_some_and(|l| l.is_object()),
+            spectral_library: top.get("spectral_library").is_some_and(|l| l.is_object()),
+            library_irt: top
+                .get("spectral_library")
+                .and_then(|l| l.get("irt"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            library_shared: top
+                .get("spectral_library")
+                .and_then(|l| l.get("proteotypic"))
+                .and_then(Value::as_bool)
+                .is_some_and(|proteotypic| !proteotypic),
+            library_extra: top
+                .get("spectral_library")
+                .and_then(Value::as_object)
+                .map(|l| {
+                    l.iter()
+                        .filter(|(k, _)| *k != "irt" && *k != "proteotypic")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             localization_decoys: top
                 .get("localization")
                 .and_then(|l| l.get("decoy_residues"))
@@ -2123,6 +2167,24 @@ mod test {
         let core: sage_core::localization::LocalizationSettings =
             serde_json::from_value(localized.to_json(&[])["localization"].clone()).unwrap();
         assert_eq!(core.decoy_residues, "AL");
+
+        // spectral libraries: off by default, {} with the defaults, the options
+        // the GUI edits, and other keys of a loaded file kept
+        let mut library = Settings::default();
+        assert!(library.to_json(&[]).get("spectral_library").is_none());
+        library.spectral_library = true;
+        assert_eq!(library.to_json(&[])["spectral_library"], json!({}));
+        library.library_irt = true;
+        library.library_shared = true;
+        assert_eq!(library.to_json(&[])["spectral_library"], json!({"irt": true, "proteotypic": false}));
+        let mut loaded = library.to_json(&[]);
+        loaded["spectral_library"]["max_fragments"] = json!(12);
+        let reread = Settings::from_json(&loaded).unwrap();
+        assert!(reread.spectral_library && reread.library_irt && reread.library_shared);
+        let written = reread.to_json(&[])["spectral_library"].clone();
+        assert_eq!(written, json!({"irt": true, "proteotypic": false, "max_fragments": 12}));
+        let core: sage_core::spectral_library::LibrarySettings = serde_json::from_value(written).unwrap();
+        assert!(core.irt && !core.proteotypic && core.max_fragments == 12);
 
         let mut entrapment = Settings::default();
         entrapment.entrapment_tag = "ENTRAP_".into();

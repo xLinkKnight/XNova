@@ -76,6 +76,10 @@ pub struct Search {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub localization: Option<sage_core::localization::LocalizationSettings>,
 
+    /// Spectral libraries of the results, for DIA-NN, Spectronaut and PEAKS
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectral_library: Option<sage_core::spectral_library::LibrarySettings>,
+
     /// Quality control: digestion summary, polymer check, diagnostic ions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qc: Option<crate::runner::QcReport>,
@@ -123,6 +127,9 @@ pub struct Input {
     pub entrapment: Option<sage_core::entrapment::EntrapmentConfig>,
     /// Modification site localization: `{}` (or `{"decoy_residues": "A"}`)
     pub localization: Option<sage_core::localization::LocalizationSettings>,
+    /// Spectral libraries (`library.tsv`, `library.spectronaut.xls`, and for
+    /// crosslink searches `xlibrary.*`): `{}` for the defaults
+    pub spectral_library: Option<sage_core::spectral_library::LibrarySettings>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -601,6 +608,13 @@ impl Input {
             max_memory_gb: self.max_memory_gb.filter(|gb| *gb > 0.0),
             entrapment: self.entrapment.filter(|e| !e.tag.is_empty()),
             localization: self.localization,
+            spectral_library: match self.spectral_library {
+                Some(library) => {
+                    library.validate().map_err(anyhow::Error::msg)?;
+                    Some(library)
+                }
+                None => None,
+            },
             qc: None,
         })
     }

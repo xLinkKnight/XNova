@@ -814,6 +814,53 @@ every run:
 
 `predict_rt` is not used: it needs linear PSMs.
 
+## Spectral libraries for DIA
+
+With `"spectral_library": {}` (sage-gui: Scoring & output > Spectral libraries)
+a crosslink search writes, next to the linear search's `library.tsv` and
+`library.spectronaut.xls`, two crosslink libraries for DIA searches of the same
+samples:
+
+* **`xlibrary.spectronaut.xls`** for Spectronaut, in the form of the Rappsilber
+  Laboratory's [xiDIA-library](https://github.com/Rappsilber-Laboratory/xiDIA-library)
+  (Müller et al., Mol Cell Proteomics 2019, "Data-independent acquisition
+  improves quantitative cross-linking mass spectrometry"). Spectronaut has no
+  crosslinks: each crosslink is a precursor of its own, `ModifiedPeptide`
+  holding both peptides in alphabetical order joined by `_`, with the
+  crosslinker on each linked residue (`FVK[DSSO]VR_MILTHVDLIEK[DSSO]FLR`; a
+  loop-link is one peptide with two). `PrecursorMz` and `FragmentMz` are the
+  crosslink's own, so Spectronaut searches it by those masses; it asks once
+  how to map an unknown modification tag such as `[DSSO]`. Targets only:
+  Spectronaut makes its decoys.
+* **`xlibrary.tsv`** in the OpenSWATH layout, for DIA-NN: the same precursors and
+  one decoy per crosslink (`Decoy` 1), both peptides reversed as the search's
+  decoys are, with the fragment masses of the reversed peptides. A decoy
+  peptide never has the sequence of a target peptide of the search (I and L
+  alike), which would take that peptide's true hits: it is rotated instead,
+  and a crosslink whose peptides cannot be made into such decoys gets none. DIA-NN uses
+  the decoys of a library that has some instead of making its own, which for a
+  pair would not be meaningful.
+
+Each crosslink at 1% CSM and unique-crosslink FDR (`crosslink_fdr`) is in them,
+pairs and loop-links; multivalent species are not. The fragments are the ones
+the search matched: both peptides' backbone ions, those containing the link site
+carrying the partner peptide and the linker or, for MS-cleavable linkers, a stub
+(whichever form's peak is most intense), with two extra columns:
+`FragmentPepId` (0 for the first peptide, 1 for the second) and
+`CLContainingFragment`. The stub-peptide doublet peaks themselves are not
+fragments of the peptide backbone, which DIA-NN requires, and are left out. As in
+the linear library each crosslink's best CSM per run is taken, retention times
+are on the linear library's scale (0-100 across the aligned runs, or iRT) and,
+from timsTOF runs, ion mobility is calibrated across runs; a crosslink's
+consensus is the median of its runs.
+
+The library form is the one of xiDIA-library (Müller et al., Mol Cell
+Proteomics 2019, doi:10.1074/mcp.TIR118.001276), and the way runs are combined
+follows [EasyPQP](https://github.com/grosenberger/easypqp); XNova reimplements
+both. These libraries carry what the crosslink search found; how well a DIA search
+then controls the FDR of crosslinks depends on that tool, which treats each
+crosslink as one peptide.
+
 ## Limitations
 
 * `reflect`/`gpu`: results are close to, but not bit-identical with, the `cpu`
