@@ -43,7 +43,44 @@ fn main() -> eframe::Result {
     // `sage-gui --xiview <results folder>` its crosslinks in xiVIEW (web browser),
     // `sage-gui --circos <results folder> [style.json | template]` writes its
     // crosslink plot (no window), in the style of the file or saved template
-    // given, else of the default template
+    // given, else of the default template;
+    // `sage-gui --network <results folder> [style.json] [--look-up]` its
+    // protein network, with what was looked up about its proteins (looked up
+    // in UniProt and STRING first with --look-up)
+    if std::env::args().nth(1).as_deref() == Some("--network") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let look_up = args.iter().any(|a| a == "--look-up");
+        let mut rest = args.iter().filter(|a| *a != "--look-up");
+        let folder = rest.next().cloned().unwrap_or_else(|| ".".into());
+        let style = match rest.next() {
+            Some(path) => match std::fs::read_to_string(path).map_err(|e| e.to_string()).and_then(|t| viewer::network::NetworkStyle::from_json(&t)) {
+                Ok(style) => style,
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None => viewer::network::NetworkStyle::default(),
+        };
+        match viewer::network::write_figures(Path::new(&folder), &style, look_up) {
+            Ok((files, problems)) => {
+                for p in problems {
+                    eprintln!("{p}");
+                }
+                if files.is_empty() {
+                    eprintln!("{folder}: no crosslinked proteins");
+                }
+                for f in files {
+                    println!("{}", f.display());
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if std::env::args().nth(1).as_deref() == Some("--circos") {
         let folder = std::env::args().nth(2).unwrap_or_else(|| ".".into());
         let library = library::Library::load();

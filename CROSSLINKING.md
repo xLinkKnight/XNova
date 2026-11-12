@@ -898,6 +898,155 @@ proteins.
   computer. `sage-gui --circos <folder> <name>` uses a template by its name
   (in any case).
 
+## Protein networks
+
+**Protein network...** on the Annotated spectra tab draws the crosslinked
+proteins as an interaction network, drawn by `sage-gui` itself: a node per
+protein, an edge per pair of proteins crosslinked to each other. With what
+UniProt and STRING know about the proteins, nodes are grouped and coloured by
+complex, pathway, GO term or location, and edges by whether the interaction is
+known. The figure is the same in the window and in the files written.
+
+* **Which crosslinks:** as the crosslink plot: target CSMs of rank 1 whose
+  spectrum and crosslink q-values are both at most the threshold (0.01 by
+  default), and residue pairs seen in at least **CSMs** CSMs. Each residue
+  pair between two proteins adds to their edge; each link of a multivalent
+  species counts as one. Crosslinks within a protein (homomeric or not) and
+  loop-links are a loop on its node. A protein crosslinked only within itself
+  is a node without edges (or left out). A peptide found in several proteins
+  counts in the first Sage listed, unless **shared peptides in every protein**
+  is ticked.
+* **Nodes:** sized by crosslinks (residue pairs, within it too), CSMs or
+  partners, or all the same; labelled by gene (UniProt's, else the FASTA
+  header's `GN=`), entry name or accession, or a label of your own; beside,
+  below or on the node. Untick a protein to leave it out with its edges.
+* **Edges:** wider the more crosslinks (or CSMs) join the two proteins, from
+  the thinnest to the widest width set, on a log scale; **the number of
+  crosslinks on each edge** writes it on the edge.
+
+### Looking proteins up
+
+**Look up in UniProt and STRING** sends the proteins' accessions, and nothing
+else, to two public services, and keeps what comes back in the results
+folder, in `network/protein_info.json`, with the UniProt release, the STRING
+version and the date. The network is then drawn from that file, offline and
+the same each time; proteins new to the network (other settings or results)
+are looked up when the button is pressed again, and **again** looks every
+protein up anew.
+
+* **UniProt** (`rest.uniprot.org`, 100 accessions per request): name, gene,
+  organism, the "Function" text, subcellular locations, GO terms (biological
+  process, molecular function, cellular component), complexes (Complex
+  Portal), pathways (Reactome, UniProt's lowest-level ones) and keywords (but
+  for technical ones such as `3D-structure`).
+* **STRING** (`string-db.org`): each protein's STRING id, then every
+  interaction STRING has between the proteins (its scores from 0.15 up, for
+  each species with two proteins or more, at most 2000 proteins), with the
+  combined score and those of experiments, curated databases, text mining and
+  co-expression.
+* Accessions are UniProt's: `sp|P04050|RPB1_YEAST` and `tr|…|…` headers, or
+  bare accessions (`P04050`; an isoform `P04050-2` as its entry). Proteins
+  with other accessions are not looked up; group them with a file of your own.
+* Hover over a protein in the preview for what was found: name, organism,
+  crosslinks, group, location, complexes, pathways, GO terms and function.
+
+### Groups
+
+**group by** colours the nodes by complex (Complex Portal), pathway
+(Reactome), GO biological process, molecular function or cellular component,
+subcellular location, UniProt keyword, the network's modules, your own groups,
+or nothing. A protein can have many terms of a kind, but is drawn in one
+colour, so the groups are chosen one at a time: the term shared by the most
+proteins takes them, then the term most of the rest share, and so on (on a
+tie, the more specific term, shared by fewer proteins in all), while a group
+has at least **proteins** members and up to **groups** groups. The rest are
+"other", in the colour for no group.
+
+* **leave out** a group (e.g. `Nucleus`, or a GO term that is too general)
+  for its proteins to join their next term. **Other terms** lists the terms
+  not taken, with their proteins; **prefer** one to take it first: for
+  instance, the Reactome pathway to name the Pol II subunits by, of the
+  fifteen they all share.
+* Each group's colour (from the palette, or your own) and label can be
+  changed; **group names in the figure** writes each beside its proteins.
+* **network module (Louvain):** communities of the network itself, found by
+  the Louvain method (Blondel et al. 2008), weighing each edge by its
+  crosslinks; their modularity (from -0.5 to 1) is in the window and in the
+  legend.
+* **your own groups (file):** a tab- or comma-separated file of a protein
+  (accession, UniProt accession, gene or entry name, or label) and its group
+  per line, optionally a `#rrggbb` colour; `#` lines and a `protein` header
+  are skipped. Proteins need no lookup for these.
+
+### Known and new interactions
+
+**colour** colours the edges:
+
+* **known (STRING) or new:** known where STRING's score of the chosen
+  evidence is at least the threshold (0.4, STRING's medium confidence; 0.7
+  high, 0.9 highest): **experiments** (physical interaction data, e.g. from
+  BioGRID and IntAct), **curated databases** (complexes and pathways),
+  **experiments or databases** (the default), or **any** (STRING's combined
+  score, text mining and co-expression included). STRING's interactions are
+  functional associations, not only direct contacts. Edges of proteins not
+  looked up are "not looked up in STRING".
+* **shared complex / shared pathway:** an edge between two proteins of the
+  same complex (or pathway) takes its colour: the group's when grouping by
+  the same, else colours of their own (after the groups'), the term most
+  edges share first.
+* **within a group:** the colour of the group both proteins are in; edges
+  between groups grey.
+* **one colour.**
+
+The legend's numbers (with **with the numbers**) count the proteins, the
+crosslinked pairs, those known to STRING, the crosslinks and CSMs.
+
+### Layout
+
+* **force-directed** (after Fruchterman and Reingold, 1991): edges pull, all
+  proteins push apart, and a slight pull to the middle keeps unconnected
+  proteins near; **groups gather** draws the proteins of a group together.
+  **clusters by group** starts each group in its own place and keeps groups
+  apart; **circle** puts the proteins on a circle, group by group. **spacing**
+  widens or narrows it all, and **Another layout** starts it from elsewhere.
+  The same settings give the same layout.
+* The network fills the room the title, legend and labels leave, in its own
+  proportions. **Drag a protein** in the preview to move it; only it moves,
+  and it is kept in the style (by accession; **Put moved proteins back**
+  undoes it).
+* **Canvas:** width and height (inches), background, title, legend (right,
+  left, or below in blocks side by side) and its numbers; **Text:** the font
+  and each text's size, bold and italic, as in the crosslink plot.
+
+### Files
+
+* **Save figure...**: SVG, PDF, PNG or TIFF (72 to 1200 dpi).
+* **Cytoscape...**: `crosslink_network.cyjs` (Cytoscape.js JSON; Cytoscape:
+  File > Import > Network from File), with the layout as drawn and, for each
+  protein, its label, gene, name, UniProt accession, entry, organism, group
+  and colour, crosslinks, CSMs, partners, loops, locations, complexes,
+  pathways, GO terms, keywords, function and STRING id; for each pair, its
+  crosslinks, CSMs, best q-value and score, multivalent links, residue pairs
+  (`123-456; …`, residue in the source protein first), whether known, the
+  STRING scores, the complexes and pathways shared, colour and width.
+* **GraphML...**: the same as `crosslink_network.graphml` (Cytoscape, Gephi,
+  yEd, igraph, NetworkX), with the places as `x` and `y`.
+* **Tables...**: `network_proteins.tsv` and `network_pairs.tsv`, the same
+  columns.
+* **All to results folder**: all of these, with the style
+  (`network_style.json`), into `network` in the results folder.
+* **Style files:** **Save style...** and **Load style...** a style as JSON (with
+  proteins moved by hand); **Style of the results folder** loads the one
+  written there.
+* `sage-gui --network <results folder> [style.json] [--look-up]` writes the
+  figures, files and style without a window, from what was looked up before
+  (`--look-up`: looking new proteins up first).
+
+The network is not drawn after each search, unlike the crosslink plot: its
+lookups use the internet, and only when asked. The `.cyjs` follows the
+Cytoscape.js JSON format and the GraphML is read back in XNova's tests, but
+neither has yet been opened in Cytoscape itself; please report any problem.
+
 ## Quantification
 
 The usual `quant` block works for crosslink searches:

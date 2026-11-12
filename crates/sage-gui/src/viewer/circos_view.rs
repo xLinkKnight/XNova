@@ -269,7 +269,7 @@ fn outcome(result: Result<(), String>, done: String) -> Option<(bool, String)> {
     })
 }
 
-fn show_message(ui: &mut Ui, message: &Option<(bool, String)>) {
+pub(super) fn show_message(ui: &mut Ui, message: &Option<(bool, String)>) {
     if let Some((error, text)) = message {
         if *error {
             ui.label(RichText::new(format!("✖ {text}")).color(Color32::from_rgb(210, 60, 60)));
@@ -314,7 +314,7 @@ impl Default for CircosView {
 }
 
 /// `#rrggbb` ↔ the colour picker
-fn color_edit(ui: &mut Ui, hex: &mut String) -> bool {
+pub(super) fn color_edit(ui: &mut Ui, hex: &mut String) -> bool {
     let (r, g, b) = circos::rgb(hex);
     let mut color = Color32::from_rgb(r, g, b);
     let changed = ui.color_edit_button_srgba(&mut color).changed();
@@ -324,14 +324,53 @@ fn color_edit(ui: &mut Ui, hex: &mut String) -> bool {
     changed
 }
 
-fn section(ui: &mut Ui, title: &str, open: bool, body: impl FnOnce(&mut Ui)) {
+pub(super) fn section(ui: &mut Ui, title: &str, open: bool, body: impl FnOnce(&mut Ui)) {
     egui::CollapsingHeader::new(RichText::new(title).strong()).default_open(open).show(ui, body);
 }
 
-fn number(ui: &mut Ui, label: &str, value: &mut f64, range: std::ops::RangeInclusive<f64>, speed: f64, tip: &str) {
+pub(super) fn number(ui: &mut Ui, label: &str, value: &mut f64, range: std::ops::RangeInclusive<f64>, speed: f64, tip: &str) {
     ui.horizontal(|ui| {
         ui.label(label).on_hover_text(tip);
         ui.add(egui::DragValue::new(value).range(range).speed(speed).max_decimals(3));
+    });
+}
+
+/// The font menu (the installed fonts, found by typing) and the font list
+/// it sets; `fonts` keeps the installed fonts once read
+pub(super) fn font_menu(ui: &mut Ui, id: &str, font: &mut String, fonts: &mut Option<Vec<String>>, filter: &mut String) {
+    ui.horizontal(|ui| {
+        ui.label("font");
+        let current = circos::first_font(font);
+        egui::ComboBox::from_id_salt(id)
+            .width(230.0)
+            .height(380.0)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .selected_text(current.clone())
+            .show_ui(ui, |ui| {
+                ui.add(TextEdit::singleline(filter).hint_text("search the installed fonts").desired_width(210.0));
+                let installed = fonts.get_or_insert_with(figure::font_families);
+                let needle = filter.trim().to_lowercase();
+                let mut picked = None;
+                for name in circos::GENERIC_FONTS.iter().map(|g| g.to_string()).chain(installed.iter().cloned()) {
+                    if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                        continue;
+                    }
+                    if ui.selectable_label(name.eq_ignore_ascii_case(&current), name.as_str()).clicked() {
+                        picked = Some(name);
+                    }
+                }
+                if let Some(name) = picked {
+                    *font = circos::font_list(&name);
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("font list");
+        ui.add(TextEdit::singleline(font).desired_width(220.0)).on_hover_text(
+            "Fonts in order of preference, as in CSS: the first one installed is used. The SVG names \
+             them, so whoever opens it needs the font (or gets the next one); PDF and PNG carry it.",
+        );
     });
 }
 
@@ -577,41 +616,7 @@ impl CircosView {
         });
 
         section(ui, "Text", false, |ui| {
-            let (fonts, filter) = (&mut self.fonts, &mut self.font_filter);
-            ui.horizontal(|ui| {
-                ui.label("font");
-                let current = circos::first_font(&s.font);
-                egui::ComboBox::from_id_salt("circos_font")
-                    .width(230.0)
-                    .height(380.0)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .selected_text(current.clone())
-                    .show_ui(ui, |ui| {
-                        ui.add(TextEdit::singleline(filter).hint_text("search the installed fonts").desired_width(210.0));
-                        let installed = fonts.get_or_insert_with(figure::font_families);
-                        let needle = filter.trim().to_lowercase();
-                        let mut picked = None;
-                        for name in circos::GENERIC_FONTS.iter().map(|g| g.to_string()).chain(installed.iter().cloned()) {
-                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-                                continue;
-                            }
-                            if ui.selectable_label(name.eq_ignore_ascii_case(&current), name.as_str()).clicked() {
-                                picked = Some(name);
-                            }
-                        }
-                        if let Some(name) = picked {
-                            s.font = circos::font_list(&name);
-                            ui.memory_mut(|m| m.close_popup());
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                ui.label("font list");
-                ui.add(TextEdit::singleline(&mut s.font).desired_width(220.0)).on_hover_text(
-                    "Fonts in order of preference, as in CSS: the first one installed is used. The SVG names \
-                     them, so whoever opens it needs the font (or gets the next one); PDF and PNG carry it.",
-                );
-            });
+            font_menu(ui, "circos_font", &mut s.font, &mut self.fonts, &mut self.font_filter);
             egui::Grid::new("circos_text").num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
                 ui.label("");
                 ui.label(RichText::new("size (pt)").weak());

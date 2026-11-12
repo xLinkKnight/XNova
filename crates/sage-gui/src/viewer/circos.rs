@@ -346,7 +346,7 @@ impl TypeStyle {
     }
 
     /// Its SVG attributes, in `font` (escaped)
-    fn attrs(&self, font: &str) -> String {
+    pub(super) fn attrs(&self, font: &str) -> String {
         format!(
             r#"font-family="{font}" font-size="{:.1}"{}{}"#,
             self.units(),

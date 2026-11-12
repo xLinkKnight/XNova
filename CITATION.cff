@@ -203,6 +203,178 @@ references:
     doi: 10.1101/gr.092759.109
     notes: "Circos (https://circos.ca); sage-gui's crosslink plots are drawn in its style with XNova's own code (no Circos code is included), and can be exported as Circos input files."
   - type: article
+    title: "UniProt: the Universal Protein Knowledgebase in 2025"
+    authors:
+      - name: "The UniProt Consortium"
+    journal: Nucleic Acids Research
+    volume: 53
+    issue: D1
+    start: D609
+    end: D617
+    year: 2025
+    doi: 10.1093/nar/gkae1010
+    notes: "UniProt (https://www.uniprot.org), in which sage-gui's protein networks look their proteins up when asked (name, gene, function, location, GO terms, complexes, pathways, keywords)."
+  - type: article
+    title: "The STRING database in 2025: protein networks with directionality of regulation"
+    authors:
+      - family-names: Szklarczyk
+        given-names: Damian
+      - family-names: Nastou
+        given-names: Katerina
+      - family-names: Koutrouli
+        given-names: Mikaela
+      - family-names: Kirsch
+        given-names: Rebecca
+      - family-names: Mehryary
+        given-names: Farrokh
+      - family-names: Hachilif
+        given-names: Radja
+      - family-names: Hu
+        given-names: Dewei
+      - family-names: Peluso
+        given-names: Matteo E.
+      - family-names: Huang
+        given-names: Qingyao
+      - family-names: Fang
+        given-names: Tao
+      - family-names: Doncheva
+        given-names: Nadezhda T.
+      - family-names: Pyysalo
+        given-names: Sampo
+      - family-names: Bork
+        given-names: Peer
+      - family-names: Jensen
+        given-names: Lars J.
+      - family-names: von Mering
+        given-names: Christian
+    journal: Nucleic Acids Research
+    volume: 53
+    issue: D1
+    start: D730
+    end: D737
+    year: 2025
+    doi: 10.1093/nar/gkae1113
+    notes: "STRING (https://string-db.org), in which sage-gui's protein networks look up the known interactions between their proteins when asked."
+  - type: article
+    title: "Complex Portal 2022: new curation frontiers"
+    authors:
+      - family-names: Meldal
+        given-names: Birgit H. M.
+      - family-names: Perfetto
+        given-names: Livia
+      - family-names: Combe
+        given-names: Colin
+      - family-names: Lubiana
+        given-names: Tiago
+      - family-names: Ferreira Cavalcante
+        given-names: João Vitor
+      - family-names: Bye-A-Jee
+        given-names: Hema
+      - family-names: Waagmeester
+        given-names: Andra
+      - family-names: del-Toro
+        given-names: Noemi
+      - family-names: Shrivastava
+        given-names: Anjali
+      - family-names: Barrera
+        given-names: Elisabeth
+      - family-names: Wong
+        given-names: Edith
+      - family-names: Mlecnik
+        given-names: Bernhard
+      - family-names: Bindea
+        given-names: Gabriela
+      - family-names: Panneerselvam
+        given-names: Kalpana
+      - family-names: Willighagen
+        given-names: Egon
+      - family-names: Rappsilber
+        given-names: Juri
+      - family-names: Porras
+        given-names: Pablo
+      - family-names: Hermjakob
+        given-names: Henning
+      - family-names: Orchard
+        given-names: Sandra
+    journal: Nucleic Acids Research
+    volume: 50
+    issue: D1
+    start: D578
+    end: D586
+    year: 2022
+    doi: 10.1093/nar/gkab991
+    notes: "Complex Portal (https://www.ebi.ac.uk/complexportal), whose complexes (through UniProt) group the proteins of sage-gui's protein networks."
+  - type: article
+    title: "The Reactome Pathway Knowledgebase 2024"
+    authors:
+      - family-names: Milacic
+        given-names: Marija
+      - family-names: Beavers
+        given-names: Deidre
+      - family-names: Conley
+        given-names: Patrick
+      - family-names: Gong
+        given-names: Chuqiao
+      - family-names: Gillespie
+        given-names: Marc
+      - family-names: Griss
+        given-names: Johannes
+      - family-names: Haw
+        given-names: Robin
+      - family-names: Jassal
+        given-names: Bijay
+      - family-names: Matthews
+        given-names: Lisa
+      - family-names: May
+        given-names: Bruce
+      - family-names: Petryszak
+        given-names: Robert
+      - family-names: Ragueneau
+        given-names: Eliot
+      - family-names: Rothfels
+        given-names: Karen
+      - family-names: Sevilla
+        given-names: Cristoffer
+      - family-names: Shamovsky
+        given-names: Veronica
+      - family-names: Stephan
+        given-names: Ralf
+      - family-names: Tiwari
+        given-names: Krishna
+      - family-names: Varusai
+        given-names: Thawfeek
+      - family-names: Weiser
+        given-names: Joel
+      - family-names: Wright
+        given-names: Adam
+      - family-names: Wu
+        given-names: Guanming
+      - family-names: Stein
+        given-names: Lincoln
+      - family-names: Hermjakob
+        given-names: Henning
+      - family-names: "D'Eustachio"
+        given-names: Peter
+    journal: Nucleic Acids Research
+    volume: 52
+    issue: D1
+    start: D672
+    end: D678
+    year: 2024
+    doi: 10.1093/nar/gkad1025
+    notes: "Reactome (https://reactome.org), whose pathways (through UniProt) group the proteins of sage-gui's protein networks."
+  - type: article
+    title: "The Gene Ontology knowledgebase in 2023"
+    authors:
+      - name: "The Gene Ontology Consortium"
+    journal: Genetics
+    volume: 224
+    issue: 1
+    start: iyad031
+    year: 2023
+    doi: 10.1093/genetics/iyad031
+    notes: "The Gene Ontology (https://geneontology.org), whose terms (through UniProt) group the proteins of sage-gui's protein networks."
+  - type: article
     title: "Unimod: Protein modifications for mass spectrometry"
     authors:
       - family-names: Creasy

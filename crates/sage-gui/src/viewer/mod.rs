@@ -7,6 +7,9 @@ pub mod figure;
 pub mod loader;
 pub mod mobiligram;
 pub mod model;
+pub mod network;
+mod network_view;
+pub mod protein_info;
 pub mod species;
 
 use eframe::egui::{self, Color32, RichText, Ui};
@@ -54,6 +57,8 @@ pub struct Viewer {
     mobiligram: MobiligramView,
     /// The crosslink plot (Circos) window
     circos: circos_view::CircosView,
+    /// The protein network window
+    network: network_view::NetworkView,
     /// Width of the match list; the divider next to it is dragged to change it
     list_width: f32,
 }
@@ -96,6 +101,7 @@ impl Default for Viewer {
             annotated: None,
             mobiligram: MobiligramView::default(),
             circos: circos_view::CircosView::default(),
+            network: network_view::NetworkView::default(),
             list_width: LIST_WIDTH,
         }
     }
@@ -394,6 +400,16 @@ impl Viewer {
             {
                 self.circos.open = true;
             }
+            if ui
+                .add_enabled(has_crosslinks, egui::Button::new("Protein network…"))
+                .on_hover_text(
+                    "The crosslinked proteins as an interaction network: a node per protein, an edge per pair                      crosslinked. Look the proteins up in UniProt and STRING to colour them by complex, pathway,                      GO term or location, and the edges by known or new interaction; export as SVG, PDF, PNG or                      TIFF, for Cytoscape (.cyjs), as GraphML or as tables.",
+                )
+                .on_disabled_hover_text("Needs a crosslink search (crosslinks.sage.tsv).")
+                .clicked()
+            {
+                self.network.open = true;
+            }
         });
         ui.add_space(4.0);
 
@@ -426,6 +442,17 @@ impl Viewer {
                 .default_size([1180.0, 800.0])
                 .resizable(true)
                 .show(ui.ctx(), |ui| view.ui(ui, &results, &folder, lib));
+            view.open = open;
+        }
+        if self.network.open {
+            let mut open = true;
+            let folder = self.folder.clone();
+            let view = &mut self.network;
+            egui::Window::new("Protein network")
+                .open(&mut open)
+                .default_size([1220.0, 820.0])
+                .resizable(true)
+                .show(ui.ctx(), |ui| view.ui(ui, &results, &folder));
             view.open = open;
         }
     }

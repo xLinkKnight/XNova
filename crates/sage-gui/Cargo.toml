@@ -17,6 +17,8 @@ serde_json = "1.0"
 # Circos plot styles, saved as JSON
 serde = { version = "1.0", features = ["derive"] }
 ureq = "2.12"
+# UniProt's answers can come gzipped twice (ureq undoes one layer)
+flate2 = "1"
 egui_plot = "0.31"
 # Spectrum viewer: spectra are read exactly as Sage read them...
 sage-core = { path = "../sage" }
