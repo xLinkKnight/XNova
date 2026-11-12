@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Crosslinked proteins as FASTA files: every crosslink search writes `xlinkProtein_1pctFDR.fasta`, `xlinkProtein_5pctFDR.fasta` and `xlinkProtein_10pctFDR.fasta`, the proteins of its crosslinks at 1%, 5% and 10% FDR, each copied from the search's FASTA file(s) as it was (header line and sequence lines), in the file's order. A match counts at a level when it is target-target and its CSM q-value (`spectrum_q`) or crosslink q-value (`crosslink_q`) is within it, so that no protein is missing whichever FDR the results are used at (`crosslinks_FDRfiltered.sage.tsv`, or sage-gui's FDR setting for xiVIEW and the crosslink plot). Both peptides of a pair, loop-links and every peptide of a multivalent species count, with every protein a peptide is found in. A level without crosslinks writes no file.
+
 ## [v1.7.0] - 2026-11-11
 
 ### Added

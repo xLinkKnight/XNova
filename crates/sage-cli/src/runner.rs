@@ -38,6 +38,7 @@ mod sites;
 pub use qc::QcReport;
 mod silac_tables;
 mod summary_tables;
+mod xlink_proteins;
 
 pub struct Runner {
     pub database: IndexedDatabase,

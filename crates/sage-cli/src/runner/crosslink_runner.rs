@@ -204,6 +204,9 @@ impl Runner {
         let path = self.write_crosslinks(FDR_FILTERED, &accepted, &filenames, reporters_out)?;
         info!("wrote {} ({} target crosslink-spectrum matches at 1% FDR)", FDR_FILTERED, accepted.len());
         self.parameters.output_paths.push(path);
+        // the crosslinked proteins at 1%, 5% and 10% FDR, as FASTA files
+        let fastas = self.write_xlink_proteins(&matches)?;
+        self.parameters.output_paths.extend(fastas);
         // xiVIEW, ProXL and mzIdentML describe pairs and loop-links only
         let pairs: Vec<CrosslinkMatch> = matches.iter().filter(|m| m.kind != LinkKind::Multi).cloned().collect();
         let multi = matches.len() - pairs.len();

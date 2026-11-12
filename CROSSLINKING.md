@@ -437,6 +437,34 @@ target-target, -1 otherwise; `class` is `TT`/`TD`/`DD` (loop-links: `TT`/`DD`).
 only, see `min_linked_peaks`). With two crosslink databases, `database_a` /
 `database_b` say which one each peptide is from (`1`, `2` or `1+2`).
 
+## Crosslinked proteins as FASTA files
+
+Every crosslink search also writes the proteins of its crosslinks as FASTA
+files, at three FDR levels:
+
+| File | Proteins of the crosslinks at |
+|---|---|
+| `xlinkProtein_1pctFDR.fasta` | 1% FDR |
+| `xlinkProtein_5pctFDR.fasta` | 5% FDR |
+| `xlinkProtein_10pctFDR.fasta` | 10% FDR |
+
+A smaller database of only the proteins found crosslinked, e.g. for a second
+search or for structural modelling. Each protein is copied from the search's
+FASTA file (or both crosslink databases) as it was there, header line and
+all, in the file's order. Each level holds the proteins of the levels below
+it.
+
+* A crosslink-spectrum match counts at a level when it is target-target and
+  its CSM q-value (`spectrum_q`, as `crosslinks_FDRfiltered.sage.tsv` at 1%)
+  **or** its crosslink q-value (`crosslink_q`, as sage-gui's FDR setting for
+  xiVIEW and the crosslink plot) is at or below it. Whichever of the two
+  q-values the results are used at, no protein of them is missing from the
+  file of that level.
+* Both peptides of a pair, the peptide of a loop-link and every peptide of a
+  multivalent species count, each with every protein it is found in (a
+  peptide shared by several proteins brings all of them).
+* A level without crosslinks writes no file.
+
 ## Files for xiVIEW, ProXL and PRIDE
 
 Every crosslink search also writes three files for viewers and repositories, next
