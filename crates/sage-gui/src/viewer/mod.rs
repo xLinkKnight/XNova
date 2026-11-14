@@ -38,8 +38,14 @@ pub struct Viewer {
     reading: Option<String>,
     /// timsTOF runs of the shown matches opened (in the background), of all
     runs: (usize, usize),
+    /// Which kinds of match are listed: linear, crosslinks (pairs),
+    /// loop-links, multivalent species
     show_linear: bool,
-    show_crosslinks: bool,
+    show_pairs: bool,
+    show_loops: bool,
+    show_multi: bool,
+    /// The kinds of match in the results (in [`Kind`] order)
+    present: [bool; 4],
     targets_only: bool,
     max_q: f32,
     search: String,
@@ -47,6 +53,10 @@ pub struct Viewer {
     shown: Vec<usize>,
     filter_key: String,
     selected: Option<usize>,
+    /// Row of the list (in `shown`) to scroll into view: the arrow keys moved there
+    scroll_to: Option<usize>,
+    /// The list's scroll offset and the part of it in view, last frame
+    list_scroll: (f32, egui::Rect),
     model: Model,
     label_all: bool,
     export: ExportSettings,
@@ -86,13 +96,18 @@ impl Default for Viewer {
             reading: None,
             runs: (0, 0),
             show_linear: true,
-            show_crosslinks: true,
+            show_pairs: true,
+            show_loops: true,
+            show_multi: true,
+            present: [false; 4],
             targets_only: true,
             max_q: 0.01,
             search: String::new(),
             shown: Vec::new(),
             filter_key: String::new(),
             selected: None,
+            scroll_to: None,
+            list_scroll: (0.0, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(LIST_WIDTH, LIST_HEIGHT))),
             model: Model::CidHcd,
             label_all: false,
             export: ExportSettings::default(),
@@ -141,6 +156,21 @@ fn stub_color(stub: usize) -> Color32 {
 
 const UNMATCHED: Color32 = Color32::from_rgb(175, 175, 175);
 
+/// The scroll offset that shows row `row` whole, in a list of rows `pitch`
+/// apart and `height` tall scrolled to `offset` with `view` of it in view;
+/// `None` when it is in view already
+fn scroll_into_view(row: usize, pitch: f32, height: f32, (offset, view): (f32, f32)) -> Option<f32> {
+    let top = row as f32 * pitch;
+    let bottom = top + height;
+    if top < offset {
+        Some(top)
+    } else if bottom > offset + view {
+        Some((bottom - view).max(0.0))
+    } else {
+        None
+    }
+}
+
 impl Viewer {
     /// Read the results in `folder` (in the background); spectra are read
     /// as matches are picked
@@ -155,6 +185,7 @@ impl Viewer {
         self.reading = None;
         self.runs = (0, 0);
         self.selected = None;
+        self.scroll_to = None;
         self.annotation = None;
         self.annotated = None;
         self.filter_key.clear();
@@ -180,6 +211,10 @@ impl Viewer {
             _ => (l, x + 1),
         });
         self.message = Some((false, format!("{linear} linear and {crosslinks} crosslink matches")));
+        self.present = [false; 4];
+        for m in &results.matches {
+            self.present[m.kind as usize] = true;
+        }
         // Annotator's CID model includes MS-cleavable linker (DSSO / DSBU) stub ions
         self.model = Model::CidHcd;
         let results = Arc::new(results);
@@ -249,11 +284,49 @@ impl Viewer {
         }
     }
 
+    /// Whether matches of `kind` are listed (its check box)
+    fn shows(&mut self, kind: Kind) -> &mut bool {
+        match kind {
+            Kind::Linear => &mut self.show_linear,
+            Kind::Crosslink => &mut self.show_pairs,
+            Kind::Loop => &mut self.show_loops,
+            Kind::Multi => &mut self.show_multi,
+        }
+    }
+
+    /// The Up and Down arrow keys pick the match above or below the one
+    /// picked, and scroll it into view; not while a text box or another
+    /// widget has the keyboard (egui then moves its focus with them)
+    fn arrow_keys(&mut self, ctx: &egui::Context) {
+        if self.shown.is_empty() || ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let (up, down) = ctx.input_mut(|i| {
+            (
+                i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            )
+        });
+        let step = down as isize - up as isize;
+        if up + down == 0 {
+            return;
+        }
+        let last = self.shown.len() - 1;
+        let row = match self.selected.and_then(|s| self.shown.iter().position(|&i| i == s)) {
+            Some(row) => (row as isize + step).clamp(0, last as isize) as usize,
+            // the match picked is filtered out (or none is): start at an end
+            None if step >= 0 => 0,
+            None => last,
+        };
+        self.selected = Some(self.shown[row]);
+        self.scroll_to = Some(row);
+    }
+
     /// Recompute the shown matches when a filter changed
     fn refilter(&mut self) {
         let key = format!(
-            "{}{}{}{}{}",
-            self.show_linear, self.show_crosslinks, self.targets_only, self.max_q, self.search
+            "{}{}{}{}{}{}{}",
+            self.show_linear, self.show_pairs, self.show_loops, self.show_multi, self.targets_only, self.max_q, self.search
         );
         if key == self.filter_key {
             return;
@@ -267,7 +340,9 @@ impl Viewer {
             .enumerate()
             .filter(|(_, m)| match m.kind {
                 Kind::Linear => self.show_linear,
-                _ => self.show_crosslinks,
+                Kind::Crosslink => self.show_pairs,
+                Kind::Loop => self.show_loops,
+                Kind::Multi => self.show_multi,
             })
             .filter(|(_, m)| !self.targets_only || m.target)
             .filter(|(_, m)| m.spectrum_q <= self.max_q)
@@ -295,8 +370,9 @@ impl Viewer {
         ui.label(
             RichText::new(
                 "Pick a match to see its spectrum annotated by Annotator's engine (mzcore / mzannotate, \
-                 github.com/snijderlab/annotator), built into XNova. Spectra are read as Sage read them; \
-                 for timsTOF that is the precursor's merged spectrum.",
+                 github.com/snijderlab/annotator), built into XNova; the Up and Down arrow keys step through \
+                 the list. Spectra are read as Sage read them; for timsTOF that is the precursor's merged \
+                 spectrum.",
             )
             .weak(),
         );
@@ -345,8 +421,24 @@ impl Viewer {
 
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.show_linear, "linear");
-            ui.checkbox(&mut self.show_crosslinks, "crosslinks");
+            // any combination of the kinds of match; a kind not in the results is greyed out
+            for (kind, label, tip) in [
+                (Kind::Linear, "linear", "Linear peptides."),
+                (Kind::Crosslink, "crosslinks", "Crosslinks of two peptides (XL in the list)."),
+                (Kind::Loop, "loop-links", "Loop-links: both ends of a linker on one peptide (loop in the list)."),
+                (
+                    Kind::Multi,
+                    "multivalent",
+                    "Multivalent species: three or more peptides, or two joined by more than one linker \
+                     (multi in the list).",
+                ),
+            ] {
+                let present = self.present[kind as usize];
+                ui.add_enabled(present, egui::Checkbox::new(self.shows(kind), label))
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text(format!("No {label} in these results."));
+            }
+            ui.separator();
             ui.checkbox(&mut self.targets_only, "targets only")
                 .on_hover_text("Crosslinks: target-target matches only.");
             ui.label("spectrum q ≤");
@@ -412,6 +504,7 @@ impl Viewer {
             }
         });
         ui.add_space(4.0);
+        self.arrow_keys(ui.ctx());
 
         ui.horizontal_top(|ui| {
             // the list may not squeeze the spectrum below its minimum (e.g. after the window shrank)
@@ -497,11 +590,19 @@ impl Viewer {
             // one line per match (rows must be of equal height): long titles end in "…",
             // shown whole on hover or by widening the list
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-            egui::ScrollArea::vertical()
+            let mut area = egui::ScrollArea::vertical()
                 .id_salt("viewer_matches")
                 .auto_shrink([false, false])
-                .max_height(LIST_HEIGHT)
-                .show_rows(ui, row_height, self.shown.len(), |ui, rows| {
+                .max_height(LIST_HEIGHT);
+            // a row the arrow keys moved to: scroll just enough to show it whole
+            if let Some(row) = self.scroll_to.take() {
+                let pitch = row_height + ui.spacing().item_spacing.y;
+                let (offset, view) = self.list_scroll;
+                if let Some(offset) = scroll_into_view(row, pitch, row_height, (offset, view.height())) {
+                    area = area.vertical_scroll_offset(offset);
+                }
+            }
+            let out = area.show_rows(ui, row_height, self.shown.len(), |ui, rows| {
                     for &i in &self.shown[rows] {
                         let m = &results.matches[i];
                         in_view.push(m.key());
@@ -530,6 +631,7 @@ impl Viewer {
                         }
                     }
                 });
+            self.list_scroll = (out.state.offset.y, out.inner_rect);
         });
         // the spectra of the rows in view, after the one picked
         if let Some(i) = self.selected {
@@ -2119,5 +2221,189 @@ mod test {
         assert_eq!(heights.len(), 3, "{heights:?}");
         assert!(heights.iter().all(|h| (h - heights[0]).abs() < 0.5), "{heights:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A results folder (`name`) of `n` crosslink matches, best first: by
+    /// turns two crosslinks, a loop-link and a multivalent species
+    fn every_kind(name: &str, n: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sage-gui-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("results.json"), r#"{"mzml_paths": ["a.d"]}"#).unwrap();
+        let mut tsv = String::from(
+            "filename\tscannr\trank\tlabel\tclass\tlink_type\tpeptide_a\tpeptide_b\tlink_a\tlink_b\t\
+             proteins_a\tproteins_b\tcharge\thyperscore\tspectrum_q\tcrosslink_q\trt\ttopology\tspecies\n",
+        );
+        const AA: &[u8] = b"ACDEFGHILMNPQSTVWY";
+        // a peptide of its own for each match
+        let peptide = |i: usize, j: usize| format!("K{}{}{}R", AA[i / 18 % 18] as char, AA[i % 18] as char, AA[j] as char);
+        for i in 0..n {
+            let (a, b, c) = (peptide(i, 0), peptide(i, 1), peptide(i, 2));
+            let (kind, partner, links, topology, species) = match i % 4 {
+                2 => ("loop", String::new(), "1\t4", "", String::new()),
+                3 => ("multivalent", b.clone(), "1\t1", "a1b1c", format!("[1] {a} [2] {b} [3] {c} | 1:K1-2:K1; 2:K1-3:K1")),
+                _ => ("crosslink", b.clone(), "1\t1", "", String::new()),
+            };
+            tsv.push_str(&format!(
+                "a.d\t{i}\t1\t1\tTT\t{kind}\t{a}\t{partner}\t{links}\tsp|P1|A\tsp|P2|B\t4\t{}\t0.001\t0.001\t30\t{topology}\t{species}\n",
+                500 - i
+            ));
+        }
+        std::fs::write(dir.join("crosslinks.sage.tsv"), tsv).unwrap();
+        dir
+    }
+
+    /// A harness drawing the tab with the results in `dir`
+    fn viewer_harness(dir: &std::path::Path) -> egui_kittest::Harness<'static, Viewer> {
+        let mut viewer = Viewer::default();
+        viewer.open(&dir.display().to_string());
+        viewer.wait_until_open();
+        let mut installed = false;
+        let mut harness = egui_kittest::Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_ui_state(
+            move |ui, v: &mut Viewer| {
+                // fonts take effect on the frame after they are set
+                if !installed {
+                    crate::theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                v.ui(ui, "", &mut crate::library::Library::default());
+            },
+            viewer,
+        );
+        harness.run_steps(4);
+        harness
+    }
+
+    /// The Up and Down arrow keys step through the list from the match
+    /// picked, scrolling it into view; not while a text box has the keyboard
+    #[test]
+    fn arrow_keys_step_through_the_list() {
+        use egui_kittest::{kittest::Queryable, Harness};
+        let dir = every_kind("arrow-keys", 60);
+        let mut harness = viewer_harness(&dir);
+        let row = |h: &Harness<'_, Viewer>| {
+            let v = h.state();
+            v.selected.and_then(|s| v.shown.iter().position(|&i| i == s))
+        };
+        let press = |h: &mut Harness<'_, Viewer>, key: egui::Key, times: usize| {
+            for _ in 0..times {
+                h.press_key(key);
+                h.run_steps(2);
+            }
+        };
+        assert_eq!(harness.state().shown.len(), 60);
+        assert_eq!(row(&harness), Some(0), "the best match is picked when the results open");
+        press(&mut harness, egui::Key::ArrowDown, 3);
+        assert_eq!(row(&harness), Some(3));
+        press(&mut harness, egui::Key::ArrowUp, 1);
+        assert_eq!(row(&harness), Some(2));
+        press(&mut harness, egui::Key::ArrowUp, 5);
+        assert_eq!(row(&harness), Some(0), "stops at the top");
+
+        // the row picked is in view, whole, however far down it is
+        let in_view = |h: &Harness<'_, Viewer>| {
+            let v = h.state();
+            let m = &v.results.as_ref().unwrap().matches[v.selected.unwrap()];
+            let tag = match m.kind {
+                Kind::Crosslink => "XL ",
+                Kind::Loop => "loop ",
+                Kind::Multi => "multi ",
+                Kind::Linear => "",
+            };
+            let start = format!("{tag}{}", m.title());
+            let node = h
+                .get_all_by_role(egui::accesskit::Role::Button)
+                .find(|n| n.label().is_some_and(|l| l.starts_with(&start)))
+                .unwrap_or_else(|| panic!("no row {start} drawn"));
+            let b = node.bounding_box().unwrap();
+            let list = v.list_scroll.1;
+            b.y0 as f32 >= list.top() - 0.5 && b.y1 as f32 <= list.bottom() + 0.5
+        };
+        assert!(in_view(&harness));
+        for (key, times, expected) in
+            [(egui::Key::ArrowDown, 45, 45), (egui::Key::ArrowDown, 100, 59), (egui::Key::ArrowUp, 30, 29), (egui::Key::ArrowUp, 40, 0)]
+        {
+            press(&mut harness, key, times);
+            assert_eq!(row(&harness), Some(expected), "after {key:?} x{times}");
+            assert!(in_view(&harness), "row {expected} is in view (scrolled to {})", harness.state().list_scroll.0);
+        }
+        assert_eq!(harness.state().list_scroll.0, 0.0, "back at the top");
+
+        // a match picked that is filtered out: Down starts from the top
+        harness.state_mut().selected = Some(3);
+        harness.state_mut().show_multi = false;
+        harness.run_steps(2);
+        press(&mut harness, egui::Key::ArrowDown, 1);
+        assert_eq!(harness.state().selected, Some(harness.state().shown[0]));
+
+        // typing in a text box: the keys are the box's
+        let search = harness.get_all_by_role(egui::accesskit::Role::TextInput).last().unwrap();
+        search.focus();
+        harness.run_steps(2);
+        let picked = harness.state().selected;
+        press(&mut harness, egui::Key::ArrowDown, 2);
+        assert_eq!(harness.state().selected, picked, "not while typing");
+        // Escape leaves the box, and the keys step through the list again
+        press(&mut harness, egui::Key::Escape, 1);
+        press(&mut harness, egui::Key::ArrowDown, 2);
+        assert_eq!(row(&harness), Some(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Any combination of crosslinks, loop-links and multivalent species is
+    /// listed, picked with the check boxes; a kind not in the results is
+    /// greyed out
+    #[test]
+    fn kind_filters_show_any_combination() {
+        use egui_kittest::kittest::Queryable;
+        let dir = every_kind("kind-filters", 40);
+        let mut harness = viewer_harness(&dir);
+        let kinds = |v: &Viewer| {
+            let matches = &v.results.as_ref().unwrap().matches;
+            let mut n = [0; 4];
+            v.shown.iter().for_each(|&i| n[matches[i].kind as usize] += 1);
+            n
+        };
+        assert_eq!(kinds(harness.state()), [0, 20, 10, 10], "every kind at first");
+        // as a user clicks the boxes
+        harness.get_by_label("loop-links").click();
+        harness.run_steps(2);
+        assert_eq!(kinds(harness.state()), [0, 20, 0, 10]);
+        if let Ok(out) = std::env::var("SAGE_GUI_FIGURES") {
+            std::fs::create_dir_all(&out).unwrap();
+            harness.render().unwrap().save(std::path::Path::new(&out).join("viewer_kind_filters.png")).unwrap();
+        }
+        harness.get_by_label("crosslinks").click();
+        harness.run_steps(2);
+        assert_eq!(kinds(harness.state()), [0, 0, 0, 10]);
+        harness.get_by_label("multivalent").click();
+        harness.run_steps(2);
+        assert_eq!(kinds(harness.state()), [0, 0, 0, 0]);
+        harness.get_by_label("loop-links").click();
+        harness.run_steps(2);
+        assert_eq!(kinds(harness.state()), [0, 0, 10, 0]);
+        // every combination
+        for mask in 0..8 {
+            let v = harness.state_mut();
+            (v.show_pairs, v.show_loops, v.show_multi) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+            harness.run_steps(2);
+            let on = |bit: usize, count: usize| if mask & bit != 0 { count } else { 0 };
+            assert_eq!(kinds(harness.state()), [0, on(1, 20), on(2, 10), on(4, 10)], "mask {mask}");
+        }
+        // no linear matches in these results
+        assert!(harness.get_by_label("linear").is_disabled());
+        assert!(!harness.get_by_label("multivalent").is_disabled());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rows_scroll_into_view() {
+        // rows 30 apart, 24 tall; 300 in view
+        assert_eq!(scroll_into_view(2, 30.0, 24.0, (0.0, 300.0)), None);
+        assert_eq!(scroll_into_view(9, 30.0, 24.0, (0.0, 300.0)), None, "the last whole row");
+        assert_eq!(scroll_into_view(10, 30.0, 24.0, (0.0, 300.0)), Some(24.0), "just enough to show it");
+        assert_eq!(scroll_into_view(3, 30.0, 24.0, (120.0, 300.0)), Some(90.0), "above: at the top");
+        assert_eq!(scroll_into_view(4, 30.0, 24.0, (120.0, 300.0)), None);
     }
 }

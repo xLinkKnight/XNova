@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Annotated spectra: the Up and Down arrow keys step through the match list from the match picked, scrolling it into view (not while typing in a text box).
+- Annotated spectra: the matches listed are picked by kind in any combination, with check boxes for linear peptides, crosslinks, loop-links and multivalent species (before: linear and crosslinks, with loop-links and multivalent species counted as crosslinks). A kind not in the results is greyed out.
+
 ### Fixed
 - Modifications tab: the motif box of the Site rule column was squeezed to its smallest width, so its hint showed only "mot" (of "motif, e.g. N-{P}-[ST]"), and the Neutral loss box was cut to the width of its heading ("Da, e.g. 97.9"). Both are now 150 points wide, in the table and in the Saved modifications editor: the motif hint shows in full, and two neutral losses fit. A text box in a table took at most the width of its column on the previous frame, which started at the heading's.
 - At start-up sage-gui grows its window to fit the widest tab, as it already did for the tallest (within the screen), so the wider Modifications table shows whole.
