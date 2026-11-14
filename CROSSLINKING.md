@@ -52,7 +52,9 @@ Output: `crosslinks.sage.tsv` (+ `results.json`): every candidate match, one per
 spectrum, targets and decoys, with their q-values (decoys are needed to estimate
 the FDR, and for viewers that filter themselves). `crosslinks_FDRfiltered.sage.tsv`
 has the same columns but only the accepted results: target-target matches with
-`spectrum_q` <= 0.01 (the CSM count reported in the log). A linear peptide search of the same
+`spectrum_q` <= 0.01 (the CSM count reported in the log). `crosslinks_CSMs.csv`
+is a report to read: the target matches at 5% FDR, each peptide in columns of its
+own (see [CSM report](#csm-report)). A linear peptide search of the same
 spectra also runs first (`"linear_search"`, on unless set to `false`) and writes the usual bottom-up
 results: `results.sage.tsv` (PSMs), `peptides.sage.tsv` (peptides at 1% FDR) and `proteins.sage.tsv`
 (their protein groups, each with its `protein_group_q`), plus the LFQ/TMT tables and HTML report when
@@ -321,9 +323,11 @@ inclusion–exclusion estimate (`N1 − N2 + …`) this never turns negative whe
 all-decoy species are common, as they are with copies. The species compete
 with pairs and loop-links for each spectrum.
 
-**Output.** `crosslinks.sage.tsv` lists them with `link_type` `multivalent`;
-`peptide_a` / `peptide_b` and `link_a` / `link_b` hold the first link, and two
-columns describe the whole species:
+**Output.** `crosslinks.sage.tsv` lists them with `link_type` `multivalent`, one
+row per species: `peptide_a` / `peptide_b`, `link_a` / `link_b`, `proteins_a` /
+`proteins_b` and `score_a` / `score_b` hold the first link only, and two columns
+describe the whole species (the [CSM report](#csm-report) gives every peptide
+columns of its own, with its proteins and score):
 
 * `topology`: `a2b`, `a1b1c`, … (`a1b` or `a1a` for ordinary crosslinks, `loop`
   for loop-links);
@@ -471,6 +475,39 @@ intra-protein links, inter-protein links and multivalent species.
   pass assigns the q-values among the matches within centre +- 2.58 spreads
   (the central 99%). Matches outside keep their row with `spectrum_q` and
   `crosslink_q` of 1. The log gives each run's window.
+
+## CSM report
+
+`crosslinks_CSMs.csv` lists the accepted crosslink-spectrum matches as a table
+to read, in the manner of MS Annika's and xiSEARCH's CSM tables (it opens in
+Excel). Every target CSM at 5% FDR or better is a row, best first: pairs,
+loop-links and multivalent species alike. Decoys are left out; they and every
+other candidate stay in `crosslinks.sage.tsv`.
+
+* **The match:** `CSM ID` (`psm_id` of `crosslinks.sage.tsv`), `Confidence`
+  (`High`: CSM q-value at most 1%, `Medium`: at most 5%), `CSM q-value`,
+  `Crosslink q-value`, `Crosslink type` (`Inter-protein`, `Intra-protein`,
+  `Homomeric` for two copies of one peptide, `Loop-link`, `Multivalent`),
+  `Topology` (`a1b`, `a1a`, `loop`, `a2b`, `a1b1c`, ...), `Peptides` (how
+  many), `Sequence` (the peptides, `-` between them) and `Crosslinks`: each
+  link in its proteins, `RPAB5_YEAST:K59-RPB2_YEAST:K813` (UniProt entry names;
+  the first protein of a peptide found in several), `;` between the links of
+  a species.
+* **Scores:** `Score` (what the FDR ranks: a pair's weaker peptide, a
+  loop-link's or species' hyperscore), `Hyperscore` (the joint score), `Stub
+  peaks` and `Topology peaks` (MS-cleavable linkers), `Crosslinker`.
+* **The spectrum:** `Spectrum file`, `Scan`, `RT [min]`, `Ion mobility
+  [1/K0]` (timsTOF), `Charge`, `Precursor m/z`, `Experimental mass [Da]`,
+  `Calculated mass [Da]` (neutral masses) and `Mass error [ppm]`.
+* **Each peptide**, in columns of its own: `A` and `B` for a pair, `A` for a
+  loop-link, and `A`, `B`, `C`, ... for the peptides of a multivalent species
+  in its order (copies of one peptide each have their own), as many as the
+  largest species in the file has: `Peptide`, `Modified peptide` (as in
+  `crosslinks.sage.tsv`), `Link sites` (residue and 1-based position in the
+  peptide; two or more for a loop-link or a peptide with several links),
+  `Proteins`, `Peptide start` (1-based, in each protein), `Protein link sites`
+  (in each protein, `;` between proteins), `Score` (the peptide's own) and
+  `Matched ions`.
 
 ## Output columns
 

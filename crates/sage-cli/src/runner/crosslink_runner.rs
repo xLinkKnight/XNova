@@ -223,13 +223,8 @@ impl Runner {
         // the crosslinked proteins at 1%, 5% and 10% FDR, as FASTA files
         let fastas = self.write_xlink_proteins(&matches)?;
         self.parameters.output_paths.extend(fastas);
-        // xiVIEW, ProXL and mzIdentML describe pairs and loop-links only
-        let pairs: Vec<CrosslinkMatch> = matches.iter().filter(|m| m.kind != LinkKind::Multi).cloned().collect();
-        let multi = matches.len() - pairs.len();
-        if multi > 0 {
-            info!("{multi} multivalent matches are in crosslinks.sage.tsv only (not in the xiVIEW, ProXL and mzIdentML files)");
-        }
-        self.write_viewer_exports(&pairs, &settings, &filenames)?;
+        // the CSM report, then the files for xiVIEW, ProXL and mzIdentML
+        self.write_viewer_exports(&matches, &settings, &filenames)?;
         if self.parameters.write_annotator {
             let path = self.write_annotator_crosslinks(&matches, &settings)?;
             self.parameters.output_paths.push(path);
@@ -471,18 +466,27 @@ impl Runner {
 
     /// `crosslinks_xiView.csv` and `crosslinks_proXL.xml` for the xiVIEW and
     /// ProXL viewers (see `crosslink_export`)
+    /// `crosslinks_CSMs.csv` (every match), and the files for xiVIEW, ProXL
+    /// and mzIdentML, which describe pairs and loop-links only
     fn write_viewer_exports(
         &mut self,
-        matches: &[CrosslinkMatch],
+        all: &[CrosslinkMatch],
         settings: &sage_core::crosslink::CrosslinkSettings,
         filenames: &[String],
     ) -> anyhow::Result<()> {
         use super::crosslink_export::{proxl_xml, xiview_csv, ExportContext, SpectrumFile};
+        use super::crosslink_report::{csm_report, members, FILE as REPORT};
+        let pairs: Vec<CrosslinkMatch> = all.iter().filter(|m| m.kind != LinkKind::Multi).cloned().collect();
+        let multi = all.len() - pairs.len();
+        if multi > 0 {
+            info!("{multi} multivalent matches are in crosslinks.sage.tsv and {REPORT} only (not in the xiVIEW, ProXL and mzIdentML files)");
+        }
+        let matches = pairs.as_slice();
         // Protein sequences locate each peptide in its protein
         let fasta = super::read_protein_databases(&mut self.parameters.database.clone())?;
-        let wanted: std::collections::HashSet<&str> = matches
+        let wanted: std::collections::HashSet<&str> = all
             .iter()
-            .flat_map(|m| std::iter::once(m.alpha).chain(m.beta))
+            .flat_map(|m| members(m).into_iter().map(|(ix, _)| ix))
             .flat_map(|ix| self.database[ix].proteins.iter().map(|p| p.as_ref()))
             .collect();
         let proteins: HashMap<String, String> = fasta
@@ -544,6 +548,13 @@ impl Runner {
             precursor_tol: self.parameters.precursor_tol,
             version: &self.parameters.version,
         };
+
+        // the CSM report: every kind of match, multivalent species too
+        let (report, high, medium) = csm_report(&ctx, all, filenames)?;
+        let path = self.make_path(REPORT);
+        sage_cloudpath::write_bytes_sync(&path, report)?;
+        info!("wrote {REPORT}: {high} target crosslink-spectrum matches at 1% FDR (High), {medium} more at 5% (Medium)");
+        self.parameters.output_paths.push(path);
 
         let (csv, loops) = xiview_csv(&ctx, matches)?;
         let path = self.make_path("crosslinks_xiView.csv");

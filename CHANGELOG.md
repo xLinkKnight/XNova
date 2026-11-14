@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- CSM report, `crosslinks_CSMs.csv`, written by every crosslink search: the target crosslink-spectrum matches at 5% FDR as a table to read, in the manner of MS Annika's and xiSEARCH's CSM tables, best first, with their confidence (High: CSM q-value at most 1%, Medium: at most 5%), crosslink type (inter-protein, intra-protein, homomeric, loop-link, multivalent), topology, each crosslink in its proteins (`RPAB5_YEAST:K59-RPB2_YEAST:K813`), scores, the spectrum (file, scan, RT, ion mobility, charge, m/z, masses, mass error) and each peptide in columns of its own (sequence, modified sequence, link sites, proteins, start and link sites in each protein, its own score and matched ions): A and B for a pair, A for a loop-link, and A, B, C, ... for every peptide of a multivalent species, as many as the largest species in the file has. In `crosslinks.sage.tsv` a species keeps one row whose peptide, protein and score columns hold its first link only, with the whole species in `species`.
+- Multivalent species keep each peptide's own score (shown in the CSM report).
+
 ## [v1.8.0] - 2026-11-14
 
 ### Changed

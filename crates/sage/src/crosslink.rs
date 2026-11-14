@@ -653,6 +653,8 @@ pub struct Species {
     pub links: Vec<(u8, u16, u8, u16)>,
     /// Matched fragment ions per peptide, and those carrying a linker
     pub matched: Vec<u16>,
+    /// Each peptide's own score (as `alpha_score` / `beta_score` of a pair)
+    pub scores: Vec<f64>,
     pub linked: Vec<u16>,
     /// Decoy peptides in the species
     pub decoys: u8,

@@ -29,6 +29,7 @@ use report_builder::{
 mod annotator_export;
 mod crosslink_export;
 mod crosslink_mzid;
+mod crosslink_report;
 mod crosslink_runner;
 mod entrapment;
 mod lfq_long;
