@@ -1,4 +1,6 @@
-<img src="assets/xnova-logo.png" alt="XNova" width="300">
+<p align="center">
+  <img src="assets/xnova-logo.png" alt="XNova" width="300">
+</p>
 
 # XNova: Ultra-Fast Crosslinking Search Engine, Powered by Sage
 
@@ -135,6 +137,15 @@ With `"multivalent": 2` to `4`, XNova also searches species held together by mor
 ### Crosslink plots (Circos), drawn on your computer
 
 Every crosslink search ends with a circular plot of its crosslinks in the style of [Circos](https://circos.ca) (Martin Krzywinski), drawn by `sage-gui` itself: no Circos, Perl, web service or internet connection is needed. Each protein is an arc of the circle, scaled to its length, with residue ticks. Each crosslink at 1% FDR is a curve between its two linked residues, coloured by kind (between proteins, within a protein, loop-link, multivalent) and wider the more CSMs it has. Tracks inside the ring show the crosslinked sites, the linear search's sequence coverage, the linker's reactive residues and your own annotations (domains or subunits, from a table of protein, start, end, label and colour).
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/circos-polii-dsso-dark.svg">
+    <img src="assets/circos-polii-dsso.svg" alt="Circular crosslink plot of RNA polymerase II and PRP40: each protein is an arc of the circle, and each crosslink a curve between its two residues, coloured by kind" width="720">
+  </picture>
+  <br>
+  <em>RNA polymerase II with PRP40, crosslinked with DSSO (21 timsTOF runs): 416 crosslinks from 2,162 CSMs at 1% FDR, drawn by <code>sage-gui</code> after the search.</em>
+</p>
 
 * **After each search:** `crosslinks_circos.svg`, `.pdf` and `.png` (300 dpi) in the `circos` folder of the results, with the style used (`circos_style.json`), a protein-by-protein table for Circos' [table viewer](https://mk.bcgsc.ca/tableviewer/) (`crosslink_table.txt`) and, in `circos_input`, the plot as input files for Circos itself (karyotype, links, tracks and a `circos.conf` in the same colours).
 * **Every choice is yours:** **Crosslink plot...** on the Annotated spectra tab opens the plot with a live preview. Set the q-value and CSM thresholds and the kinds of crosslink drawn; which proteins appear, their order, labels and colours (Tableau 20, colour-blind-safe Okabe-Ito, grey, or your own); ring size, gaps, start angle, tick spacing and label placement; each track; link colours (by kind, protein, score, q-value or CSMs, or one colour), width, opacity and curvature; canvas size, background, title and legend; and the text: any font installed on your computer, with its own size, bold and italic for the title, protein labels, tick numbers, legend and annotation labels. Export as SVG, PDF, PNG or TIFF (72 to 1200 dpi).
