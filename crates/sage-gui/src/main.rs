@@ -2937,10 +2937,17 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: 
                 r
             });
             if cleavable {
-                row(ui, "Complete doublets", "Require both stub peaks for BOTH peptides. Stricter, fewer hits. \
-                    Default: both stubs of one peptide and at least one of the other.",
+                row(ui, "Complete doublets", "Require a doublet (two stub peaks) of BOTH peptides. Stricter, fewer hits. \
+                    Default: a doublet of one peptide (for DSSO: alkene + sulfenic acid, or alkene + thiol); the \
+                    partner's mass follows from the precursor, and its stub peaks are counted (stub_peaks) but \
+                    not required. Asymmetric linkers always need one stub peak of the partner's own arm.",
                     |ui| ui.checkbox(&mut xl.require_complete_doublets, "require complete doublets"));
             }
+            row(ui, "Precursor mass window", "Learn each run's precursor mass error from the confident matches of a \
+                first pass, and accept only matches within the central 99% of it. Random matches spread over the \
+                whole precursor tolerance, true ones do not, and an uncalibrated run is centred off zero. Matches \
+                outside keep their row with q = 1; the log gives each run's window. On by default.",
+                |ui| ui.checkbox(&mut xl.precursor_window, "learn it per run"));
             row(ui, "Min peaks per chain", "Each of the two peptides needs at least this many matched fragments. Default 3.",
                 |ui| num(ui, &mut xl.min_chain_peaks, 1..=20, 1.0));
             row(ui, "Min linked ions per chain", "Non-cleavable linkers: each peptide needs at least this many matched                 fragments that carry the linker (ions containing the link site; for loop-links, both sites). They are                 the direct evidence of the link: without them, a correct peptide carrying any modification of about                 the linker's mass, or a strong peptide paired with a barely matched partner, is reported as a                 crosslink. Default 2; 0 turns the check off. MS-cleavable linkers rely on their stub doublets instead.",

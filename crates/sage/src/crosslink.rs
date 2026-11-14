@@ -322,10 +322,21 @@ pub struct CrosslinkSettings {
     /// Minimum matched fragment ions required on *each* chain
     #[serde(default = "default_chain_peaks")]
     pub min_chain_peaks: u16,
-    /// MS-cleavable linkers only: demand both stub peaks of *both* peptides
-    /// (default: both of one peptide, at least one of the partner)
+    /// MS-cleavable linkers only: demand a doublet (two of its stub peaks)
+    /// of *both* peptides. Default: a doublet of one peptide; the partner's
+    /// mass follows from the precursor, and its stub peaks are counted as
+    /// evidence (`stub_peaks`) but not required (asymmetric linkers: one
+    /// stub peak of the partner's own arm is)
     #[serde(default)]
     pub require_complete_doublets: bool,
+    /// Learn each run's precursor mass error from the confident matches of a
+    /// first pass, and accept only matches within the central 99% of it
+    /// (centre +- 2.58 robust standard deviations). Random matches spread
+    /// over the whole precursor tolerance, true ones do not; an uncalibrated
+    /// run is centred off zero. Matches outside keep their row with q = 1.
+    /// On unless set to `false`.
+    #[serde(default = "default_true")]
+    pub precursor_window: bool,
     /// Search algorithm / hardware, see [`Backend`]
     #[serde(default)]
     pub backend: Backend,
@@ -368,6 +379,7 @@ impl Default for CrosslinkSettings {
             candidates: default_candidates(),
             min_chain_peaks: default_chain_peaks(),
             require_complete_doublets: false,
+            precursor_window: true,
             backend: Backend::Cpu,
             chain_survivors: default_chain_survivors(),
             linear_search: default_linear_search(),
@@ -764,8 +776,15 @@ pub struct CrosslinkMatch {
     pub delta_next: f64,
     /// Number of candidate pairs scored for this spectrum
     pub pairs_scored: u32,
-    /// MS-cleavable linkers: number of stub-peptide (doublet) peaks supporting the pair (0-4)
+    /// MS-cleavable linkers: number of stub-peptide (doublet) peaks supporting
+    /// the pair: 2 of the peptide the doublet was found for, and up to 3 of
+    /// its partner (short, long and alternative stub)
     pub stub_peaks: u8,
+    /// The precursor's charge was not recorded: this is the best of the
+    /// charges tried (`precursor_charge`). Such matches get their FDR among
+    /// themselves
+    #[serde(skip)]
+    pub charge_guessed: bool,
     /// Precursor inverse ion mobility (0 if the instrument doesn't report one)
     pub ims: f32,
     pub spectrum_q: f32,
@@ -1574,6 +1593,10 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             found.extend(multi.into_iter().filter(|m| m.hyperscore.is_finite()));
             pairs_scored += scored;
         }
+        let guessed = !matches!(query.precursors.first().and_then(|p| p.charge), Some(_) if !self.scorer.override_precursor_charge);
+        for m in &mut found {
+            m.charge_guessed = guessed;
+        }
         found.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
         found.truncate(self.scorer.report_psms.max(1));
         for idx in 0..found.len() {
@@ -1833,15 +1856,25 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
 
     /// Search for an MS-cleavable crosslink (DSSO, DSBU, ...).
     ///
-    /// 1. A stub-bearing peptide appears in the spectrum as a *doublet* (short
-    ///    and long stub of its linker arm), spaced `long - short` apart.
-    /// 2. If `a = m(A) + short` is the first peak of A's doublet, the partner
-    ///    peptide B (with mass `M - m(A) - linker`) shows up at `m(B) + short`
-    ///    and `m(B) + long` of the other arm. For symmetric linkers both arms
-    ///    are alike; an asymmetric linker (cliXlink) is tried both ways round.
-    /// 3. Both peptide masses are therefore known directly; each is looked up in
-    ///    the (mass-sorted) database with a narrow window and scored on its own
-    ///    as a linear peptide bearing a stub. No pairwise enumeration is needed.
+    /// 1. A stub-bearing peptide appears in the spectrum as a *doublet*: two
+    ///    of the stubs of its linker arm, a known distance apart. For DSSO
+    ///    that is alkene + sulfenic acid (`short` + `long`), but the sulfenic
+    ///    acid readily loses water to the thiol (`alt`), so alkene + thiol
+    ///    (`short` + `alt`, 31.97 apart) counts as well; in many spectra it is
+    ///    the only doublet there is.
+    /// 2. A doublet gives the mass of its peptide A, and the precursor then
+    ///    that of the partner: `m(B) = M - m(A) - linker`. That mass is as
+    ///    uncertain as the precursor (in Da of the whole precursor, which is
+    ///    much in ppm of a small B) plus A's peak, so B's window is sized from
+    ///    the precursor tolerance, and the pair must fit it. B's own stub
+    ///    peaks are counted as evidence (`stub_peaks`) but not required
+    ///    (`require_complete_doublets`: a doublet of B as well): often only
+    ///    one of the two peptides shows any. For symmetric linkers both arms
+    ///    are alike; an asymmetric linker (cliXlink) is tried both ways round,
+    ///    and B must show a stub of its own arm, the only sign of that arm.
+    /// 3. Both peptide masses are therefore known; each is looked up in the
+    ///    (mass-sorted) database and scored on its own as a linear peptide
+    ///    bearing a stub. No pairwise enumeration is needed.
     fn score_cleavable(&self, query: &ProcessedSpectrum) -> Vec<CrosslinkMatch> {
         let sc = self.scorer;
         let cfg = self.settings;
@@ -1888,11 +1921,13 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
             let mut loops_seen: HashSet<usize> = HashSet::new();
             for iso in sc.min_isotope_err..=sc.max_isotope_err {
                 let m = mass - iso as f32 * NEUTRON;
+                // the calculated masses this precursor accepts
+                let (plo, phi) = sc.precursor_tol.bounds(m);
 
                 // Loop-links: one peptide plus the linker explains the precursor;
                 // the opened ring shows as stub-carrying fragment ions
                 if cfg.loop_links && !db.two_databases() {
-                    let (lo, hi) = sc.precursor_tol.bounds(m);
+                    let (lo, hi) = (plo, phi);
                     let start = db.peptides.partition_point(|p| p.monoisotopic < lo - linker);
                     let end = db.peptides[start..]
                         .iter()
@@ -1940,27 +1975,48 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                 for &(arm_a, arm_b) in &stubs.arm_pairs() {
                 let (x, y) = (&arms[arm_a], &arms[arm_b]);
                 for &a in &peaks {
-                    // A's complete doublet on its arm
-                    if !has_peak(a + x.delta()) {
+                    // A's doublet on its arm, with `a` its short stub: short + long, or
+                    // short + alt. (alt + long, DSSO's thiol and sulfenic acid, are a
+                    // water apart, as is every fragment and its water loss: on real
+                    // data that form added candidates and no identifications.)
+                    let doublet = has_peak(a + x.delta()) || x.alt.iter().any(|&alt| alt > x.short && has_peak(a + (alt - x.short)));
+                    if !doublet {
                         continue;
                     }
                     let mass_a = a - x.short;
                     let mass_b = m - mass_a - linker;
-                    // B's doublet on the other arm
-                    let comp_long = has_peak(mass_b + y.long);
-                    let comp_short = has_peak(mass_b + y.short);
-                    let complement = comp_long as u8 + comp_short as u8;
-                    let needed = if cfg.require_complete_doublets { 2 } else { 1 };
-                    if complement < needed {
-                        continue;
-                    }
                     if mass_a < min_peptide_mass || mass_b < min_peptide_mass {
                         continue;
                     }
+                    // B's mass is as uncertain as the precursor and A's peak
+                    let (flo, fhi) = sc.fragment_tol.bounds(a);
+                    let fa = (fhi - flo) / 2.0;
+                    let (b_lo, b_hi) = (plo - mass_a - linker - fa, phi - mass_a - linker + fa);
+                    // B's stub peaks on the other arm, at the mass of the peptide
+                    // tried for B: evidence, required only on request (an asymmetric
+                    // linker's second arm shows only in its own stubs: there one is)
+                    let stubs_of_b = |peptide_mass: f32| -> u8 {
+                        has_peak(peptide_mass + y.long) as u8 + has_peak(peptide_mass + y.short) as u8 + y.alt.iter().any(|&alt| has_peak(peptide_mass + alt)) as u8
+                    };
+                    let needed = if cfg.require_complete_doublets {
+                        2
+                    } else if arms.len() > 1 {
+                        1
+                    } else {
+                        0
+                    };
                     // (peptide, linker end, site, tally, chain score)
-                    let mut side = |mass: f32, arm: usize| -> Vec<(u32, usize, usize, Tally, f64)> {
+                    let mut side = |mass: f32, arm: usize, window: Option<(f32, f32)>| -> Vec<(u32, usize, usize, Tally, f64)> {
                         let mut v = Vec::new();
-                        for ix in self.peptides_with_mass(mass) {
+                        let range = match window {
+                            Some((lo, hi)) => {
+                                let start = db.peptides.partition_point(|p| p.monoisotopic < lo);
+                                let len = db.peptides[start..].iter().take_while(|p| p.monoisotopic <= hi).take(MAX_PARTNERS_PER_SEED).count();
+                                start..start + len
+                            }
+                            None => self.peptides_with_mass(mass),
+                        };
+                        for ix in range {
                             let entry = chain_cache.entry((ix as u32, arm)).or_insert_with(|| {
                                 self.score_stubbed_chain(query, &db.peptides[ix], &arms[arm], max_fc)
                             });
@@ -1974,8 +2030,8 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                         v.truncate(ends * MAX_CHAINS_PER_SIDE.min(cfg.candidates));
                         v
                     };
-                    let side_a = side(mass_a, arm_a);
-                    let side_b = side(mass_b, arm_b);
+                    let side_a = side(mass_a, arm_a, None);
+                    let side_b = side(mass_b, arm_b, Some((b_lo, b_hi)));
 
                     // Best end assignment per peptide pair: the two peptides must
                     // carry different ends of a heterobifunctional linker
@@ -1986,6 +2042,14 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                                 continue;
                             }
                             if !db.may_crosslink(PeptideIx(ix_a), PeptideIx(ix_b)) {
+                                continue;
+                            }
+                            // the pair must fit the precursor
+                            let calc = db.peptides[ix_a as usize].monoisotopic + db.peptides[ix_b as usize].monoisotopic + linker;
+                            if calc < plo || calc > phi {
+                                continue;
+                            }
+                            if stubs_of_b(db.peptides[ix_b as usize].monoisotopic) < needed {
                                 continue;
                             }
                             let pair = (ix_a, site_a, tally_a, score_a, ix_b, site_b, tally_b, score_b);
@@ -2041,7 +2105,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                             beta_score: sc_b,
                             alpha_matched: n_a.matched(),
                             beta_matched: n_b.matched(),
-                            stub_peaks: 2 + complement,
+                            stub_peaks: 2 + stubs_of_b(pb.monoisotopic),
                             ..Default::default()
                         };
                         match replace {
@@ -2137,11 +2201,31 @@ fn ppm_delta(observed: f32, isotope_error: i8, calculated: f32) -> f32 {
 // FDR
 // ---------------------------------------------------------------------------
 
+/// What a crosslink-spectrum match is ranked by for its FDR.
+///
+/// A pair is as good as its weaker peptide: the smaller of the two peptides'
+/// own scores. The joint hyperscore lets one long, well-matched peptide carry
+/// a partner matched by chance, and such pairs then outrank true ones (as do
+/// MS Annika, pLink and Kojak, which all rank by the weaker peptide).
+/// Loop-links and multivalent species keep their hyperscore.
+pub fn rank_score(m: &CrosslinkMatch) -> f64 {
+    match (m.kind, m.beta) {
+        (LinkKind::Inter, Some(_)) => m.alpha_score.min(m.beta_score),
+        _ => m.hyperscore,
+    }
+}
+
 /// q-values for items sorted by score (best first).
 ///
-/// Inter-peptide links use the standard target/decoy crosslink estimate
-/// `(TD - DD) / TT` (Walzthoeni et al., Nat. Methods 2012): a random false pair
-/// is TD or DD, and the TD count over-counts by the DD count. Loop-links are
+/// Inter-peptide links: a false target pair is estimated by each target-decoy
+/// pair, `TD / TT`, and never fewer than the decoy-decoy pairs. The classic
+/// `(TD - DD) / TT` (Walzthoeni et al., Nat. Methods 2012) assumes the two
+/// peptides of a false pair are wrong independently. They are not when pairs
+/// are ranked by their weaker peptide: two peptides that share fragments
+/// (overlapping, or one twice) match by chance together, and are both targets
+/// or both decoys. `TD - DD` is then a lower bound and `TD + DD` an upper
+/// one; against the precursor mass errors of real data `TD - DD` let through
+/// about three times the nominal rate, `TD` the nominal rate. Loop-links are
 /// single peptides, so they use the ordinary `decoys / targets`.
 fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
     let (mut tt, mut td, mut dd) = (0f64, 0f64, 0f64);
@@ -2152,7 +2236,7 @@ fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
             PairClass::TD => td += 1.0,
             PairClass::DD => dd += 1.0,
         }
-        let false_hits = if loops { td + dd } else { td - dd };
+        let false_hits = if loops { td + dd } else { td.max(dd) };
         q.push((false_hits / tt.max(1.0)).clamp(0.0, 1.0) as f32);
     }
     // q-values are monotone: the best FDR at which a hit would be accepted
@@ -2195,14 +2279,24 @@ fn q_multivalent(species: &[(bool, u8)]) -> Vec<f32> {
 /// multivalent species. Intra-protein links are far more likely to be true
 /// than inter-protein links, so pooling them would hide inter-protein false
 /// positives (Fischer & Rappsilber, Anal. Chem. 2017).
+///
+/// Matches of precursors without a recorded charge form the same four groups
+/// of their own. Each such spectrum is searched at every charge of
+/// `precursor_charge` and keeps its best match; the higher charges mean
+/// larger masses, longer peptides and higher scores by chance, so pooled with
+/// the others these matches would set the score threshold for all.
 fn fdr_group(m: &CrosslinkMatch) -> usize {
-    match (m.kind, m.intra_protein) {
+    let kind = match (m.kind, m.intra_protein) {
         (LinkKind::Loop, _) => 0,
         (LinkKind::Inter, true) => 1,
         (LinkKind::Inter, false) => 2,
         (LinkKind::Multi, _) => 3,
-    }
+    };
+    kind + if m.charge_guessed { FDR_KINDS } else { 0 }
 }
+
+/// Kinds of match with an FDR of their own (see [`fdr_group`])
+const FDR_KINDS: usize = 4;
 
 /// Canonical identity of a unique crosslink (peptide pair + link sites),
 /// independent of which chain is called alpha; multivalent species add a
@@ -2237,17 +2331,94 @@ fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16, u64) {
 }
 
 /// Assign `spectrum_q` (per CSM) and `crosslink_q` (per unique peptide pair +
-/// sites, scored by its best CSM), separately within each FDR group.
+/// sites, scored by its best CSM), separately within each FDR group, ranked
+/// by [`rank_score`].
 ///
 /// Returns `(target CSMs, unique target crosslinks)` at 1% FDR.
 pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
-    let (mut csm_count, mut link_count) = (0, 0);
+    let all = vec![true; matches.len()];
+    assign_q(matches, &all)
+}
 
-    for group in 0..4 {
-        let loops = group == 0;
+/// Fewest confident matches of a run (or of all runs) to learn its precursor
+/// mass error from
+const WINDOW_MIN_MATCHES: usize = 50;
+/// Half-width of the window in robust standard deviations: the central 99%
+const WINDOW_SIGMAS: f32 = 2.576;
+
+/// Each run's precursor mass error, from the matches accepted at 1% FDR by a
+/// first pass ([`assign_q_values`]): `file_id -> (lowest, highest)` accepted
+/// error in ppm, the median +- 2.58 robust standard deviations (from the
+/// median absolute deviation; at least 1 ppm). Runs with fewer than 50
+/// confident matches take the window of all runs together; no window at all
+/// if those are fewer than 50 too. Pairs and loop-links of recorded charge
+/// count; multivalent species and guessed charges do not.
+pub fn precursor_windows(matches: &[CrosslinkMatch]) -> HashMap<usize, (f32, f32)> {
+    fn window(errors: &mut [f32]) -> (f32, f32) {
+        errors.sort_by(f32::total_cmp);
+        let median = errors[errors.len() / 2];
+        let mut deviations: Vec<f32> = errors.iter().map(|e| (e - median).abs()).collect();
+        deviations.sort_by(f32::total_cmp);
+        let sigma = (1.4826 * deviations[deviations.len() / 2]).max(1.0);
+        (median - WINDOW_SIGMAS * sigma, median + WINDOW_SIGMAS * sigma)
+    }
+    let mut by_file: HashMap<usize, Vec<f32>> = HashMap::new();
+    let mut files: HashSet<usize> = HashSet::new();
+    for m in matches {
+        files.insert(m.file_id);
+        let confident = m.class == PairClass::TT && m.spectrum_q <= 0.01 && m.kind != LinkKind::Multi && !m.charge_guessed;
+        if confident {
+            by_file.entry(m.file_id).or_default().push(m.precursor_ppm);
+        }
+    }
+    let mut pooled: Vec<f32> = by_file.values().flatten().copied().collect();
+    let everywhere = (pooled.len() >= WINDOW_MIN_MATCHES).then(|| window(&mut pooled));
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let own = by_file.get_mut(&file).filter(|e| e.len() >= WINDOW_MIN_MATCHES).map(|e| window(e));
+            own.or(everywhere).map(|w| (file, w))
+        })
+        .collect()
+}
+
+/// [`assign_q_values`] in two passes: the first learns each run's precursor
+/// mass error ([`precursor_windows`]), the second assigns the q-values among
+/// the matches within it. Matches outside get `spectrum_q` and `crosslink_q`
+/// of 1. Returns the counts at 1% FDR and the windows (empty: too few
+/// confident matches to learn from, and one pass).
+pub fn assign_q_values_in_window(matches: &mut [CrosslinkMatch]) -> ((usize, usize), HashMap<usize, (f32, f32)>) {
+    let first = assign_q_values(matches);
+    let windows = precursor_windows(matches);
+    if windows.is_empty() {
+        return (first, windows);
+    }
+    let inside: Vec<bool> = matches
+        .iter()
+        .map(|m| windows.get(&m.file_id).is_none_or(|&(lo, hi)| m.precursor_ppm >= lo && m.precursor_ppm <= hi))
+        .collect();
+    (assign_q(matches, &inside), windows)
+}
+
+/// The q-values of the matches marked in `include`; the others get 1
+fn assign_q(matches: &mut [CrosslinkMatch], include: &[bool]) -> (usize, usize) {
+    let (mut csm_count, mut link_count) = (0, 0);
+    for (m, &inside) in matches.iter_mut().zip(include) {
+        if !inside {
+            m.spectrum_q = 1.0;
+            m.crosslink_q = 1.0;
+        }
+    }
+    // best first: by the rank score, then the joint hyperscore
+    let better = |a: &CrosslinkMatch, b: &CrosslinkMatch| {
+        rank_score(b).total_cmp(&rank_score(a)).then(b.hyperscore.total_cmp(&a.hyperscore))
+    };
+
+    for group in 0..2 * FDR_KINDS {
+        let loops = group % FDR_KINDS == 0;
         // q-values of matches sorted best first, by the group's estimate
         let q_of = |sorted: &[usize], matches: &[CrosslinkMatch]| {
-            if group == 3 {
+            if group % FDR_KINDS == 3 {
                 let species: Vec<(bool, u8)> = sorted
                     .iter()
                     .map(|&i| match &matches[i].species {
@@ -2269,9 +2440,9 @@ pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
 
         // CSM level
         let mut idx = (0..matches.len())
-            .filter(|&i| fdr_group(&matches[i]) == group)
+            .filter(|&i| include[i] && fdr_group(&matches[i]) == group)
             .collect::<Vec<_>>();
-        idx.sort_by(|&a, &b| matches[b].hyperscore.total_cmp(&matches[a].hyperscore));
+        idx.sort_by(|&a, &b| better(&matches[a], &matches[b]));
         for (&i, q) in idx.iter().zip(q_of(&idx, matches)) {
             matches[i].spectrum_q = q;
             if q <= 0.01 && matches[i].class == PairClass::TT {
@@ -2284,19 +2455,14 @@ pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
         for &i in &idx {
             best.entry(link_key(&matches[i]))
                 .and_modify(|j| {
-                    if matches[i].hyperscore > matches[*j].hyperscore {
+                    if better(&matches[i], &matches[*j]).is_lt() {
                         *j = i
                     }
                 })
                 .or_insert(i);
         }
         let mut reps = best.values().copied().collect::<Vec<_>>();
-        reps.sort_by(|&a, &b| {
-            matches[b]
-                .hyperscore
-                .total_cmp(&matches[a].hyperscore)
-                .then(link_key(&matches[a]).cmp(&link_key(&matches[b])))
-        });
+        reps.sort_by(|&a, &b| better(&matches[a], &matches[b]).then(link_key(&matches[a]).cmp(&link_key(&matches[b]))));
         let mut link_q = HashMap::new();
         for (&i, q) in reps.iter().zip(q_of(&reps, matches)) {
             link_q.insert(link_key(&matches[i]), q);
@@ -3601,15 +3767,100 @@ mod test {
         // good fragment ions, but no stub-peptide doublets
         let mut ions = stubbed_ions(&a, &db.modifications, 3, &stubs);
         ions.extend(stubbed_ions(&b, &db.modifications, 9, &stubs));
-        let query = spectrum(a.monoisotopic + b.monoisotopic + cfg.linker_mass(), 4, &ions);
+        let precursor = a.monoisotopic + b.monoisotopic + cfg.linker_mass();
+        let query = spectrum(precursor, 4, &ions);
         assert!(xl.score(&query).is_empty());
 
-        // one peptide's doublet only (no complement) is also rejected
+        // one peptide's doublet is enough: the partner's mass follows from
+        // the precursor, and its own stub peaks are evidence, not a condition
         let mut partial = ions.clone();
         partial.push((Kind::B, a.monoisotopic + stubs.short));
         partial.push((Kind::B, a.monoisotopic + stubs.long));
-        let query = spectrum(a.monoisotopic + b.monoisotopic + cfg.linker_mass(), 4, &partial);
-        assert!(xl.score(&query).is_empty());
+        let hits = xl.score(&spectrum(precursor, 4, &partial));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].stub_peaks, 2, "the doublet, nothing of the partner");
+        assert_eq!(pair_set(&db, &hits[0]), vec![("GLEKVSTAAMQR".to_string(), 3), ("TDYHFPNEWKLIR".to_string(), 9)]);
+
+        // ... unless both peptides' doublets are asked for
+        let strict_cfg = CrosslinkSettings { require_complete_doublets: true, ..dsso() };
+        let strict = CrosslinkScorer::new(&sc, &strict_cfg);
+        assert!(strict.score(&spectrum(precursor, 4, &partial)).is_empty());
+        let mut complete = partial.clone();
+        complete.push((Kind::B, b.monoisotopic + stubs.short));
+        complete.push((Kind::B, b.monoisotopic + stubs.long));
+        let hits = strict.score(&spectrum(precursor, 4, &complete));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].stub_peaks, 4);
+
+        // a single stub peak of a peptide is no doublet
+        let mut single = ions.clone();
+        single.push((Kind::B, a.monoisotopic + stubs.short));
+        single.push((Kind::B, b.monoisotopic + stubs.long));
+        assert!(xl.score(&spectrum(precursor, 4, &single)).is_empty());
+    }
+
+    /// DSSO's sulfenic acid stub loses water to the thiol: the alkene + thiol
+    /// doublet (31.97 apart) finds the pair where alkene + sulfenic acid is absent
+    #[test]
+    fn finds_cleavable_crosslink_by_its_alkene_thiol_doublet() {
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let cfg = dsso();
+        let stubs = cfg.stubs().unwrap();
+        let thiol = stubs.alt[0];
+        assert!((thiol - stubs.short - 31.97208).abs() < 1e-3);
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let xl = CrosslinkScorer::new(&sc, &cfg);
+        let precursor = a.monoisotopic + b.monoisotopic + cfg.linker_mass();
+
+        let mut ions = stubbed_ions(&a, &db.modifications, 3, &stubs);
+        ions.extend(stubbed_ions(&b, &db.modifications, 9, &stubs));
+        // the first peptide as alkene and thiol; the second as thiol only
+        ions.push((Kind::B, a.monoisotopic + stubs.short));
+        ions.push((Kind::B, a.monoisotopic + thiol));
+        ions.push((Kind::B, b.monoisotopic + thiol));
+        let hits = xl.score(&spectrum(precursor, 4, &ions));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].stub_peaks, 3, "the doublet and the partner's thiol");
+        assert_eq!(hits[0].class, PairClass::TT);
+        assert!(hits[0].precursor_ppm.abs() < 1.0);
+        assert_eq!(pair_set(&db, &hits[0]), vec![("GLEKVSTAAMQR".to_string(), 3), ("TDYHFPNEWKLIR".to_string(), 9)]);
+    }
+
+    /// The partner's mass comes from the precursor, whose error (in Da) is
+    /// large against a small partner: a precursor 8 ppm off still finds it
+    #[test]
+    fn cleavable_partner_window_follows_the_precursor() {
+        let a = peptide("AEFGHDSTWKLMNPQSTVKGYEDFAR", "PROT_A", Position::Internal);
+        let b = peptide("ELLKR", "PROT_B", Position::Internal);
+        let cfg = dsso();
+        let stubs = cfg.stubs().unwrap();
+        let mut targets = distractors(400);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let sc = scorer(&db);
+        let loose = CrosslinkSettings { min_chain_peaks: 2, ..cfg.clone() };
+        let xl = CrosslinkScorer::new(&sc, &loose);
+        let exact = a.monoisotopic + b.monoisotopic + cfg.linker_mass();
+        // 8 ppm of the precursor is about 45 ppm of the small peptide
+        let off = exact * (1.0 + 8e-6);
+        assert!((off - exact) / b.monoisotopic * 1e6 > 30.0);
+        let mut ions = stubbed_ions(&a, &db.modifications, 9, &stubs);
+        ions.extend(stubbed_ions(&b, &db.modifications, 3, &stubs));
+        ions.push((Kind::B, a.monoisotopic + stubs.short));
+        ions.push((Kind::B, a.monoisotopic + stubs.long));
+        ions.push((Kind::B, b.monoisotopic + stubs.short));
+        let hits = xl.score(&spectrum(off, 4, &ions));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!((hits[0].precursor_ppm - 8.0).abs() < 1.0, "{}", hits[0].precursor_ppm);
+        assert_eq!(hits[0].stub_peaks, 3);
+        // beyond the precursor tolerance (10 ppm here) there is no match
+        assert!(xl.score(&spectrum(exact * (1.0 + 14e-6), 4, &ions)).is_empty());
     }
 
     fn kernel_for(db: &IndexedDatabase, cfg: &CrosslinkSettings) -> crate::crosslink_kernel::CpuKernel {
@@ -4213,18 +4464,105 @@ mod test {
     }
 
     #[test]
-    fn q_values_use_td_minus_dd() {
+    fn q_values_count_each_target_decoy_pair() {
         use PairClass::*;
         // sorted best-first: 8 TT, then TD, DD, TT ...
         let classes = [TT, TT, TT, TT, TT, TT, TT, TT, TD, DD, TT, TD, TD];
         let q = q_from_sorted(&classes, false);
-        // After 8 TT: fdr 0. After TD: 1/8. After DD: (1-1)/8 = 0. After TT: 0.
+        // After 8 TT: fdr 0. After TD: 1/8. After DD: still 1 false of 8 (a
+        // decoy-decoy pair takes nothing off). After the next TT: 1/9
         assert_eq!(q[7], 0.0);
-        assert_eq!(q[9], 0.0);
-        // After the next two TD: td=3, dd=1, tt=9 -> 2/9
-        assert!((q[12] - 2.0 / 9.0).abs() < 1e-6);
+        assert!((q[8] - 1.0 / 9.0).abs() < 1e-6, "the best FDR at or beyond the rank");
+        assert!((q[10] - 1.0 / 9.0).abs() < 1e-6);
+        // After the next two TD: td=3, tt=9 -> 3/9
+        assert!((q[12] - 3.0 / 9.0).abs() < 1e-6);
+        // never fewer than the decoy-decoy pairs
+        let q = q_from_sorted(&[TT, TT, TT, TT, DD, DD, TD], false);
+        assert!((q[5] - 2.0 / 4.0).abs() < 1e-6);
+        assert!((q[6] - 2.0 / 4.0).abs() < 1e-6);
         // monotone non-decreasing along the list
         assert!(q.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// A pair with one strong and one barely matched peptide ranks below a
+    /// pair of two fair peptides, whatever their joint scores
+    #[test]
+    fn pairs_rank_by_their_weaker_peptide() {
+        use PairClass::*;
+        let pair = |joint: f64, a: f64, b: f64, class, alpha| CrosslinkMatch { alpha_score: a, beta_score: b, ..csm(joint, class, LinkKind::Inter, alpha, Some(alpha + 100)) };
+        let mut m = Vec::new();
+        // ten true pairs of two fair peptides, joint scores around 60
+        for i in 0..10 {
+            m.push(pair(60.0 + i as f64, 30.0, 28.0 + i as f64 * 0.1, TT, i));
+        }
+        // lopsided chance pairs with higher joint scores: one target, two decoys
+        m.push(pair(90.0, 80.0, 8.0, TD, 50));
+        m.push(pair(88.0, 78.0, 9.0, TD, 51));
+        m.push(pair(86.0, 76.0, 7.0, TT, 52));
+        assert_eq!(rank_score(&m[0]), 28.0);
+        assert_eq!(rank_score(&m[10]), 8.0);
+        let (csms, _) = assign_q_values(&mut m);
+        assert_eq!(csms, 10, "the fair pairs pass, the lopsided target does not");
+        assert!(m[..10].iter().all(|x| x.spectrum_q == 0.0));
+        assert!(m[12].spectrum_q > 0.01);
+        // loop-links keep their hyperscore
+        assert_eq!(rank_score(&csm(40.0, TT, LinkKind::Loop, 1, None)), 40.0);
+    }
+
+    /// Matches of precursors whose charge was guessed do not set the
+    /// threshold for the others
+    #[test]
+    fn guessed_charges_have_their_own_fdr() {
+        use PairClass::*;
+        let pair = |score: f64, class, alpha, guessed| CrosslinkMatch { alpha_score: score, beta_score: score, charge_guessed: guessed, ..csm(2.0 * score, class, LinkKind::Inter, alpha, Some(alpha + 100)) };
+        let mut m = Vec::new();
+        for i in 0..20 {
+            m.push(pair(30.0 + i as f64, TT, i, false));
+        }
+        // guessed charges: chance matches with the highest scores of all
+        for i in 0..6 {
+            m.push(pair(100.0 + i as f64, if i % 3 == 0 { TT } else { TD }, 40 + i, true));
+        }
+        let (csms, _) = assign_q_values(&mut m);
+        assert_eq!(csms, 20);
+        assert!(m[..20].iter().all(|x| x.spectrum_q == 0.0), "untouched by the guessed-charge decoys above them");
+        assert!(m[20..].iter().all(|x| x.spectrum_q > 0.5));
+    }
+
+    /// The precursor mass error of each run is learned from a first pass, and
+    /// matches outside it are left out
+    #[test]
+    fn precursor_window_is_learned_per_run() {
+        use PairClass::*;
+        let pair = |score: f64, class, alpha, file, ppm: f32| CrosslinkMatch { alpha_score: score, beta_score: score, file_id: file, precursor_ppm: ppm, ..csm(2.0 * score, class, LinkKind::Inter, alpha, Some(alpha + 1000)) };
+        let mut m = Vec::new();
+        // run 0: 60 confident pairs around +6 ppm; run 1: 60 around -2 ppm
+        for i in 0..60u32 {
+            m.push(pair(50.0 + i as f64, TT, i, 0, 6.0 + (i % 7) as f32 - 3.0));
+            m.push(pair(50.0 + i as f64, TT, 200 + i, 1, -2.0 + (i % 5) as f32 - 2.0));
+        }
+        // weaker matches: a target of run 0 at -12 ppm (outside), one at +7 (inside), and decoys between
+        m.push(pair(20.0, TT, 500, 0, -12.0));
+        m.push(pair(19.0, TT, 501, 0, 7.0));
+        m.push(pair(21.0, TD, 502, 0, -9.0));
+        m.push(pair(20.5, TD, 503, 0, -14.0));
+        assert_eq!(assign_q_values(&mut m).0, 120, "one pass: the decoys keep both weak targets out");
+        let windows = precursor_windows(&m);
+        let (lo, hi) = windows[&0];
+        assert!(lo > -4.0 && lo < 2.0 && hi > 10.0 && hi < 16.0, "{lo} {hi}");
+        let (lo, hi) = windows[&1];
+        assert!(lo < -4.0 && hi < 4.0, "{lo} {hi}");
+        let ((csms, _), windows) = assign_q_values_in_window(&mut m);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(csms, 121, "the weak target inside the window passes: the decoys were outside");
+        assert_eq!(m[120].spectrum_q, 1.0, "outside the window");
+        assert_eq!(m[120].crosslink_q, 1.0);
+        assert_eq!(m[121].spectrum_q, 0.0);
+        // too few confident matches: one pass, no window
+        let mut few: Vec<CrosslinkMatch> = (0..10).map(|i| pair(50.0, TT, i, 0, 6.0)).collect();
+        let ((csms, _), windows) = assign_q_values_in_window(&mut few);
+        assert!(windows.is_empty());
+        assert_eq!(csms, 10);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::telemetry;
 use log::info;
 use rayon::prelude::*;
 use sage_core::crosslink::{
-    assign_q_values, CrosslinkMatch, CrosslinkScorer, LinkKind, PairClass,
+    assign_q_values, assign_q_values_in_window, CrosslinkMatch, CrosslinkScorer, LinkKind, PairClass,
 };
 use sage_core::crosslink_quant::{quantify_lfq, CrosslinkLfq};
 use sage_core::mass::Tolerance;
@@ -169,7 +169,23 @@ impl Runner {
             matches.extend(found);
         }
 
-        let (csms, links) = assign_q_values(&mut matches);
+        let (csms, links) = if settings.precursor_window {
+            // each run's precursor mass error, learned from a first pass
+            let (counts, windows) = assign_q_values_in_window(&mut matches);
+            if windows.is_empty() {
+                info!("precursor mass window: too few confident matches to learn it from; none applied");
+            }
+            let mut files: Vec<_> = windows.into_iter().collect();
+            files.sort_by_key(|(file, _)| *file);
+            for (file, (lo, hi)) in files {
+                let outside = matches.iter().filter(|m| m.file_id == file && (m.precursor_ppm < lo || m.precursor_ppm > hi)).count();
+                let name = self.parameters.mzml_paths.get(file).and_then(sage_cloudpath::filename).unwrap_or_default();
+                info!("precursor mass window of {name}: {lo:+.1} to {hi:+.1} ppm ({outside} matches outside, left out)");
+            }
+            counts
+        } else {
+            assign_q_values(&mut matches)
+        };
         matches.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
 
         info!(

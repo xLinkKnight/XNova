@@ -403,9 +403,6 @@ impl Input {
         }
 
         if crosslink.is_cleavable() {
-            if crosslink.loop_links {
-                log::info!("MS-cleavable crosslinker: loop-links are not searched");
-            }
             // Stub-peptide (doublet) peaks are often weak; keep more peaks than the
             // linear default of 150 unless the user chose a value
             if self.max_peaks.is_none() {

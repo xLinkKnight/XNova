@@ -423,6 +423,8 @@ pub struct Crosslink {
     pub candidates: u32,
     pub min_chain_peaks: u32,
     pub require_complete_doublets: bool,
+    /// Learn each run's precursor mass error and keep matches within it
+    pub precursor_window: bool,
     pub backend: Backend,
     pub chain_survivors: u32,
     /// Also run a linear peptide search (results.sage.tsv)
@@ -459,6 +461,7 @@ impl Default for Crosslink {
             candidates: 30,
             min_chain_peaks: 3,
             require_complete_doublets: false,
+            precursor_window: true,
             backend: Backend::Cpu,
             chain_survivors: 20000,
             linear_search: true,
@@ -567,6 +570,7 @@ impl Crosslink {
             "require_complete_doublets".into(),
             json!(self.require_complete_doublets),
         );
+        m.insert("precursor_window".into(), json!(self.precursor_window));
         m.insert("backend".into(), json!(self.backend.key()));
         m.insert("chain_survivors".into(), json!(self.chain_survivors));
         // always written: Sage turns the linear search on when it is absent
@@ -636,6 +640,7 @@ impl Crosslink {
         c.min_chain_peaks = u32_or(v.get("min_chain_peaks"), c.min_chain_peaks);
         c.require_complete_doublets =
             bool_or(v.get("require_complete_doublets"), c.require_complete_doublets);
+        c.precursor_window = bool_or(v.get("precursor_window"), c.precursor_window);
         if let Some(b) = v.get("backend").and_then(Value::as_str) {
             if let Some(b) = Backend::ALL.iter().find(|x| x.key() == b) {
                 c.backend = *b;

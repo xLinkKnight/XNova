@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Crosslink FDR ranks a peptide pair by its weaker peptide's score (the smaller of `score_a` and `score_b`, then the joint hyperscore) instead of the joint hyperscore, which let one long, well-matched peptide carry a partner matched by chance past true pairs. Loop-links and multivalent species keep their hyperscore; `crosslinks.sage.tsv` stays sorted by hyperscore.
+- Crosslink FDR counts each target-decoy pair as one false target pair (`TD / TT`, never fewer than the decoy-decoy pairs) instead of `(TD - DD) / TT`, which is a lower bound and was too optimistic once pairs are ranked by their weaker peptide (about three times the nominal 1% on a DSSO dataset, by the precursor mass errors of the accepted matches).
+- Matches of precursors without a recorded charge get their FDR among themselves. Such precursors are searched at every charge of `precursor_charge`; the higher charges match long peptides by chance with high scores, and with a wide range (e.g. 2-8) those matches set the score threshold for every crosslink.
+- MS-cleavable linkers: a peptide's doublet may be its short stub with the alternative stub as well as with the long one (DSSO: alkene + thiol, 31.97 apart, beside alkene + sulfenic acid), and the partner peptide no longer has to show a stub peak: its mass follows from the precursor, in a window sized from the precursor tolerance (it was the fragment tolerance of the partner's own mass, too tight for a small partner of a large precursor), and the pair must fit the precursor tolerance. The partner's stub peaks are counted in `stub_peaks` (now up to 5: short, long and alternative), at the peptide's exact mass. `require_complete_doublets` asks for two of them; asymmetric linkers (cliXlink) still need one of the partner's own arm.
+
+### Added
+- `crosslink.precursor_window` (on by default; sage-gui: Crosslinking > Precursor mass window): each run's precursor mass error is learned from the confident matches of a first pass (median +- 2.58 robust standard deviations, the central 99%), and the q-values are assigned among the matches within it; matches outside keep their row with q = 1. Random matches spread over the whole precursor tolerance, true ones do not, and an uncalibrated run is centred off zero. The log gives each run's window.
+
+### Fixed
+- The log no longer says "MS-cleavable crosslinker: loop-links are not searched": they are.
+
 ## [v1.7.5] - 2026-11-12
 
 ### Added

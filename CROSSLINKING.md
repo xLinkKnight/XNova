@@ -37,7 +37,8 @@ before. Two strategies are used, chosen by the reagent:
 | `chain_survivors` | `20000` | `reflect`/`gpu` only: peptides kept per spectrum after the per-chain filter (best by chain score) |
 | `min_linked_peaks` | `2` | matched fragment ions that carry the linker required on *each* chain, reported as `linked_a` / `linked_b`. Non-cleavable: ions that contain the link site (loop-links: both sites). Cleavable loop-links: stub-carrying ions inside the opened ring. They are the only direct evidence of the link; without them a correct peptide with any modification of about the linker's mass passes as a loop-link, and a strong peptide with a barely matched partner as a crosslink. `0` turns the check off |
 | `linear_search` | `true` | also run an ordinary linear peptide search first, written to `results.sage.tsv`, `peptides.sage.tsv` and `proteins.sage.tsv` (plus the usual LFQ/TMT tables, `.pin` and HTML report when enabled). It uses the crosslink search's database settings, e.g. `peptide_min_mass` 350 Da. `false` skips it |
-| `require_complete_doublets` | `false` | cleavable only: require both stub peaks of *both* peptides (default: both of one, at least one of the other) |
+| `require_complete_doublets` | `false` | cleavable only: require a doublet (two stub peaks) of *both* peptides. Default: a doublet of one peptide; the partner's mass follows from the precursor, and its stub peaks are counted in `stub_peaks` but not required (asymmetric linkers: one stub peak of the partner's own arm is) |
+| `precursor_window` | `true` | learn each run's precursor mass error from the confident matches of a first pass and accept only matches within the central 99% of it, see [FDR](#fdr-of-crosslink-searches). `false`: one pass, the whole precursor tolerance |
 | `residues` | `"K"` | residues the linker reacts with (e.g. `"KST"`) |
 | `protein_nterm` | `true` | allow linking the protein N-terminal amine |
 | `site1`, `site2` | none | heterobifunctional chemistry, set both: what each end reacts with, as residue letters plus `[` (protein N-terminus) and `]` (protein C-terminus). Replaces `residues` / `protein_nterm`; overrides a reagent's sites |
@@ -205,15 +206,26 @@ better-scoring orientation is kept.
 
 The search exploits this:
 
-1. Find peak pairs spaced by the doublet mass. If `a = m(A) + short`, the partner
-   peptide B (mass `M - m(A) - linker`, precursor mass `M`) must show its doublet at
-   `m(B) + short` and `m(B) + long` (of the other arm, for an asymmetric linker).
-2. Both peptide masses are now known, so each is looked up directly in the
-   mass-sorted peptide list with a narrow window. **No pairwise enumeration and no
-   wide seed search.**
-3. Each peptide is scored independently as a linear peptide with a stub on one
-   residue (any of the stubs may be on fragment ions that contain the link). The
-   pair's score is the joint hyperscore.
+1. Find a doublet: two peaks a stub difference apart, `a = m(A) + short` and either
+   `m(A) + long` or `m(A) + alt`. For DSSO the sulfenic acid stub readily loses
+   water to the thiol, so in many spectra alkene + thiol (31.97208 apart) is the
+   only doublet there is; both forms count. (Thiol + sulfenic acid are a water
+   apart, like every fragment and its water loss, and are not used.)
+2. The doublet gives `m(A)`, and the precursor mass `M` then gives the partner:
+   `m(B) = M - m(A) - linker`. That mass is only as exact as the precursor, whose
+   error in Da is large against a small B, so B is looked up in a window sized
+   from the precursor tolerance (plus the fragment tolerance of A's peak), and the
+   pair must fit the precursor tolerance. **No pairwise enumeration and no wide
+   seed search.**
+3. B's own stub peaks (`m(B)` + short, long, alt, at fragment accuracy) are
+   counted as evidence in `stub_peaks` (2 for A's doublet, up to 3 more for B)
+   but not required: often only one of the two peptides shows any.
+   `require_complete_doublets` asks for two of B's as well. An asymmetric linker's
+   second arm shows only in its own stubs, so there B must show one.
+4. Each peptide is scored independently as a linear peptide with a stub on one
+   residue (any of the stubs may be on fragment ions that contain the link), and
+   needs `min_chain_peaks` matched ions. The pair's `hyperscore` is the joint
+   score; its FDR ranks it by the weaker of `score_a` and `score_b`.
 
 Because candidates come from narrow mass windows, cost grows roughly with database
 size rather than quadratically, which is what makes proteome-scale searching practical.
@@ -422,10 +434,43 @@ peptides, but raise `chain_survivors` if you suspect misses.
    *contains* residue `i` carries the whole other chain plus the linker.
 4. **Score** - joint hyperscore over both chains, requiring `min_chain_peaks`
    matched ions on each. `alpha` is the better-supported chain.
-5. **FDR** - target-decoy, `(TD - DD) / TT` for crosslinks (Walzthoeni 2012);
-   `decoys / targets` for loop-links. Computed **separately** for loop-links,
-   intra-protein and inter-protein links. `spectrum_q` is per CSM;
-   `crosslink_q` is per unique (peptide pair + sites).
+5. **FDR** - see [FDR of crosslink searches](#fdr-of-crosslink-searches).
+
+## FDR of crosslink searches
+
+`spectrum_q` is per CSM; `crosslink_q` is per unique crosslink (peptide pair +
+sites), from its best CSM. Both are computed separately for loop-links,
+intra-protein links, inter-protein links and multivalent species.
+
+* **Pairs are ranked by their weaker peptide:** the smaller of `score_a` and
+  `score_b`, then the joint `hyperscore`. A pair is only as good as its weaker
+  half; ranked by the joint score, one long, well-matched peptide carries a
+  partner matched by chance past true pairs. (MS Annika, pLink and Kojak rank
+  the same way.) Loop-links and multivalent species are ranked by their
+  hyperscore. The rows of `crosslinks.sage.tsv` stay sorted by hyperscore.
+* **Each target-decoy pair counts as one false target pair:** `TD / TT`, and
+  never fewer than the decoy-decoy pairs. The classic `(TD - DD) / TT`
+  (Walzthoeni 2012) assumes the two peptides of a false pair are wrong
+  independently. Ranked by the weaker peptide they are not: two peptides that
+  share fragments (overlapping ones, or one twice) match by chance together and
+  are both targets or both decoys. `TD - DD` is then a lower bound and
+  `TD + DD` an upper one. Measured against the precursor mass errors of a DSSO
+  dataset, `TD - DD` let through about three times the nominal 1%, `TD` about
+  1%. Loop-links: `decoys / targets`.
+* **Guessed charges apart.** A precursor without a recorded charge is searched
+  at every charge of `precursor_charge` and keeps its best match. Higher charges
+  mean larger masses, longer peptides and higher scores by chance, so these
+  matches get their FDR among themselves (in the same four groups) and cannot
+  set the threshold for the precursors whose charge the instrument recorded.
+* **Precursor mass window** (`precursor_window`, on by default). Random matches
+  spread over the whole precursor tolerance; true ones cluster, and in an
+  uncalibrated run not around zero. A first pass assigns q-values; each run's
+  confident pairs and loop-links (1% FDR, recorded charge, at least 50, else
+  those of all runs together) give the centre (median) and spread (1.4826 x the
+  median absolute deviation, at least 1 ppm) of its precursor error; the second
+  pass assigns the q-values among the matches within centre +- 2.58 spreads
+  (the central 99%). Matches outside keep their row with `spectrum_q` and
+  `crosslink_q` of 1. The log gives each run's window.
 
 ## Output columns
 

@@ -713,6 +713,7 @@ pub(super) mod test {
             delta_next: 3.25,
             pairs_scored: 100,
             stub_peaks: 0,
+            charge_guessed: false,
             ims: 0.0,
             spectrum_q: 0.001,
             crosslink_q: q,
