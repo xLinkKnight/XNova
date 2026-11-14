@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.8.7] - 2026-11-14
 
 ### Added
 - Annotated spectra: the Up and Down arrow keys step through the match list from the match picked, scrolling it into view (not while typing in a text box).
