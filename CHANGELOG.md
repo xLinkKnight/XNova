@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.0] - 2026-11-14
 
 ### Added
 - Annotated spectra: the spectrum and the peptide map are linked, both ways, by hovering (or clicking, to keep it; again, elsewhere or Esc to let go). A peak: the residues its ions hold are framed in the map and in bold, their hooks or triangles drawn thicker and the other glyphs faded; a b/y ion holding a link residue with the linker intact carries the whole partner (as Annotator's engine computes its mass), so both peptides are framed; internal ions frame their stretch. A hook, nested stub hook or stub triangle (pairs and multivalent species): all its peaks are picked out in the spectrum, every charge and neutral loss, with a band behind each, a wider bar and every interpretation in bold (stacked where they would overlap), the other peaks faded. A line above the map names the ions with their m/z, mass error and residues.
