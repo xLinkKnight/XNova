@@ -200,8 +200,8 @@ struct SageGui {
     dark: bool,
     /// Start-up frames spent measuring the tabs, see `measure_step`
     fit_step: usize,
-    /// Largest height (points) by which a tab overflowed the scroll area
-    overflow: f32,
+    /// Largest width and height (points) by which a tab overflowed the scroll area
+    overflow: egui::Vec2,
     /// CPU threads sage.exe may use (`--threads`)
     threads: usize,
     /// RAM cap for sage.exe in GB, 0 = no cap
@@ -258,7 +258,7 @@ impl SageGui {
             usage: usage::Monitor::start(system::gpus()),
             dark: false,
             fit_step: 0,
-            overflow: 0.0,
+            overflow: egui::Vec2::ZERO,
             threads: system::cpu_threads(),
             max_ram_gb: 0.0,
             gpus: system::gpus(),
@@ -692,32 +692,26 @@ impl SageGui {
     }
 
     /// Start-up only: record how far `tab` overflows the scroll area, and
-    /// once every tab has been measured, grow the window so the tallest tab
-    /// needs no scrolling (limited by the screen height). Each tab is drawn
-    /// invisibly for two frames, since grids size their rows from the previous frame.
-    fn measure_step(&mut self, ctx: &egui::Context, overflow: f32) {
+    /// once every tab has been measured, grow the window so the widest tab
+    /// fits and the tallest needs no scrolling (limited by the screen). Each
+    /// tab is drawn invisibly for two frames, since grids size their rows and
+    /// columns from the previous frame.
+    fn measure_step(&mut self, ctx: &egui::Context, overflow: egui::Vec2) {
         if self.fit_step % 2 == 1 {
             self.overflow = self.overflow.max(overflow);
         }
         self.fit_step += 1;
         ctx.request_repaint();
-        if self.fit_step < FIT_STEPS || self.overflow <= 0.0 {
+        if self.fit_step < FIT_STEPS || (self.overflow.x <= 0.0 && self.overflow.y <= 0.0) {
             return;
         }
-        let window = ctx.screen_rect().size();
-        let mut height = window.y + self.overflow + 8.0;
-        let monitor = ctx.input(|i| i.viewport().monitor_size);
-        if let Some(monitor) = monitor {
-            // egui-winit reports the monitor in physical pixels
-            let monitor = monitor / ctx.pixels_per_point();
-            // leave room for the title bar and the taskbar
-            height = height.min(monitor.y - 90.0);
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                ((monitor.x - window.x) / 2.0).max(0.0),
-                ((monitor.y - height) / 2.0 - 30.0).max(0.0),
-            )));
+        // egui-winit reports the monitor in physical pixels
+        let monitor = ctx.input(|i| i.viewport().monitor_size).map(|m| m / ctx.pixels_per_point());
+        let (size, position) = fitted_window(ctx.screen_rect().size(), self.overflow, monitor);
+        if let Some(position) = position {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(position));
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(window.x, height)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
@@ -987,7 +981,7 @@ impl SageGui {
                 });
             });
             if measuring {
-                self.measure_step(ctx, out.content_size.y - out.inner_rect.height());
+                self.measure_step(ctx, out.content_size - out.inner_rect.size());
             }
         });
     }
@@ -2412,14 +2406,46 @@ pub fn site_rule_ui(
                     ui.selectable_value(position, p, label);
                 }
             });
-        ui.add(
-            TextEdit::singleline(motif)
-                .hint_text("motif, e.g. N-{P}-[ST]")
-                .desired_width(120.0)
-                .text_color_opt(bad.then_some(Color32::RED)),
+        text_box(
+            ui,
+            TextEdit::singleline(motif).hint_text("motif, e.g. N-{P}-[ST]").text_color_opt(bad.then_some(Color32::RED)),
+            MOTIF_WIDTH,
         );
     })
     .response
+}
+
+/// The window size at which no tab overflows, given how far the widest and
+/// the tallest tab overflow a `window`-sized one, within the screen
+/// (`monitor`, in points), and where to put the window to centre it there.
+/// The window never shrinks.
+fn fitted_window(
+    window: egui::Vec2,
+    overflow: egui::Vec2,
+    monitor: Option<egui::Vec2>,
+) -> (egui::Vec2, Option<egui::Pos2>) {
+    let grow = |o: f32| if o > 0.0 { o + 8.0 } else { 0.0 };
+    let mut size = window + egui::vec2(grow(overflow.x), grow(overflow.y));
+    let Some(monitor) = monitor else {
+        return (size, None);
+    };
+    // leave room for the window's borders, the title bar and the taskbar
+    size.x = size.x.min(monitor.x - 20.0).max(window.x);
+    size.y = size.y.min(monitor.y - 90.0).max(window.y);
+    let position = egui::pos2(((monitor.x - size.x) / 2.0).max(0.0), ((monitor.y - size.y) / 2.0 - 30.0).max(0.0));
+    (size, Some(position))
+}
+
+/// Widths of the motif and neutral-loss boxes (their hints show in full)
+const MOTIF_WIDTH: f32 = 150.0;
+const LOSS_WIDTH: f32 = 150.0;
+
+/// A one-line text box `width` wide. A text box takes at most the width left
+/// in its grid cell, and a grid sizes its columns from the previous frame
+/// (from the heading at first), so a box in a table never grew past a narrow
+/// heading: the motif box showed "mot" of its hint.
+fn text_box(ui: &mut Ui, edit: TextEdit, width: f32) -> egui::Response {
+    ui.allocate_ui(egui::vec2(width, ui.spacing().interact_size.y), |ui| ui.add(edit.desired_width(width))).inner
 }
 
 /// How a variable modification is searched (indexed, library sites, mass offset)
@@ -2441,7 +2467,7 @@ pub fn search_ui(ui: &mut Ui, id: impl std::hash::Hash, search: &mut settings::M
 /// Neutral losses of a modification, Da
 pub fn neutral_loss_ui(ui: &mut Ui, losses: &mut String) -> egui::Response {
     let bad = settings::parse_losses(losses).is_err();
-    ui.add(TextEdit::singleline(losses).hint_text("Da, e.g. 97.976896").desired_width(110.0).text_color_opt(bad.then_some(Color32::RED)))
+    text_box(ui, TextEdit::singleline(losses).hint_text("Da, e.g. 97.976896").text_color_opt(bad.then_some(Color32::RED)), LOSS_WIDTH)
         .on_hover_text(NEUTRAL_LOSS_TIP)
 }
 
@@ -3312,6 +3338,79 @@ mod screenshots {
         println!("{}", path.display());
     }
 
+    /// The motif and neutral-loss boxes keep their width in the Modifications
+    /// table, under headings narrower than they are; a plain text box there
+    /// stays as narrow as its heading (the motif box showed "mot")
+    #[test]
+    fn text_boxes_in_a_table_keep_their_width() {
+        let (mut plain, mut motif, mut loss, mut rule) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut harness = Harness::builder().with_size(egui::vec2(900.0, 200.0)).build_ui(|ui| {
+            egui::Grid::new("table").show(ui, |ui| {
+                for heading in ["Plain", "Site rule", "Loss"] {
+                    ui.label(heading);
+                }
+                ui.end_row();
+                let (mut text, mut position, mut losses) = (String::new(), settings::SitePosition::Anywhere, String::new());
+                plain.push(ui.add(TextEdit::singleline(&mut text).hint_text("motif, e.g. N-{P}-[ST]").desired_width(MOTIF_WIDTH)).rect.width());
+                let r = site_rule_ui(ui, "rule", &mut position, &mut text, false);
+                rule.push(r.rect.width());
+                loss.push(neutral_loss_ui(ui, &mut losses).rect.width());
+                ui.end_row();
+                // the motif box alone, in a cell of its own
+                ui.label("");
+                motif.push(text_box(ui, TextEdit::singleline(&mut text), MOTIF_WIDTH).rect.width());
+                ui.end_row();
+            });
+        });
+        harness.run_steps(4);
+        drop(harness);
+        // (a text box's response is its inside, without its 4-point margins)
+        let inside = |width: f32| width - 8.0;
+        assert!(plain.iter().all(|w| *w < 60.0), "a plain text box stays narrow: {plain:?}");
+        assert!(motif.iter().all(|w| (w - inside(MOTIF_WIDTH)).abs() < 0.5), "{motif:?}");
+        assert!(loss.iter().all(|w| (w - inside(LOSS_WIDTH)).abs() < 0.5), "{loss:?}");
+        assert!(rule.iter().all(|w| *w >= 95.0 + MOTIF_WIDTH), "the position menu and the motif box: {rule:?}");
+    }
+
+    /// The window grows to the widest and the tallest tab, within the screen,
+    /// centred there, and never shrinks
+    #[test]
+    fn window_fits_the_tabs() {
+        let window = egui::vec2(1040.0, 780.0);
+        assert_eq!(fitted_window(window, egui::vec2(150.0, -20.0), None), (egui::vec2(1198.0, 780.0), None));
+        assert_eq!(fitted_window(window, egui::vec2(-5.0, 100.0), None), (egui::vec2(1040.0, 888.0), None));
+        let (size, at) = fitted_window(window, egui::vec2(150.0, 100.0), Some(egui::vec2(1920.0, 1080.0)));
+        assert_eq!(size, egui::vec2(1198.0, 888.0));
+        assert_eq!(at, Some(egui::pos2(361.0, 66.0)));
+        // a small screen: as wide and tall as it allows, never smaller than before
+        let (size, at) = fitted_window(window, egui::vec2(400.0, 400.0), Some(egui::vec2(1280.0, 720.0)));
+        assert_eq!(size, egui::vec2(1260.0, 780.0));
+        assert_eq!(at, Some(egui::pos2(10.0, 0.0)));
+    }
+
+    /// At start-up the tabs are measured in the default window, and the
+    /// Modifications table, with its motif and neutral-loss boxes, is wider
+    #[test]
+    fn start_up_measures_the_widest_tab() {
+        let mut app: Option<SageGui> = None;
+        let mut overflow = egui::Vec2::ZERO;
+        let mut harness = Harness::builder().with_size(egui::vec2(1040.0, 780.0)).build(|ctx| {
+            let Some(app) = app.as_mut() else {
+                theme::install(ctx, false);
+                let mut new = SageGui::new(ctx);
+                new.s = Settings::default();
+                app = Some(new);
+                return;
+            };
+            app.draw(ctx);
+            overflow = app.overflow;
+        });
+        harness.run_steps(FIT_STEPS + 2);
+        drop(harness);
+        assert!(app.as_ref().is_some_and(|a| a.fit_step >= FIT_STEPS), "every tab was measured");
+        assert!(overflow.x > 0.0 && overflow.x < 400.0, "the Modifications table: {overflow:?}");
+    }
+
     /// The whole window (toolbar, tabs, settings, Run button) in the light and
     /// dark themes, on the Files, Crosslinking and Scoring & output tabs:
     /// `SAGE_GUI_FIGURES=<folder> cargo test -p sage-gui window_previews -- --ignored`
@@ -3410,7 +3509,7 @@ mod screenshots {
     ) -> Harness<'static> {
         let mut installed = false;
         let mut lookup = unimod::Lookup::default();
-        Harness::builder().with_size(egui::vec2(1100.0, 2000.0)).build_ui(move |ui| {
+        Harness::builder().with_size(egui::vec2(1300.0, 2000.0)).build_ui(move |ui| {
             // fonts take effect on the frame after they are set
             if !installed {
                 theme::install(ui.ctx(), false);
