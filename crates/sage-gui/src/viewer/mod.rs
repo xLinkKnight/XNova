@@ -2269,6 +2269,11 @@ mod test {
         point(&mut harness, at_peak(strongest.peak));
         assert_eq!(harness.state().hovered_ion, Some(Focus::Peak(strongest.peak)), "the peak under the pointer");
         println!("peak: {} {:?}", strongest.text, strongest.residues);
+        let texts = |p: usize| peaks[p].labels.iter().map(|l| format!("{} ({:.4})", l.text, l.theoretical_mz)).collect::<Vec<_>>();
+        println!("its labels at {:.4}: {:?}", peaks[strongest.peak].mz, texts(strongest.peak));
+        for p in (0..peaks.len()).filter(|&p| peaks[p].labels.iter().any(|l| l.series == Series::Internal)).take(12) {
+            println!("internal at {:.4}: {:?}", peaks[p].mz, texts(p));
+        }
         shot(&mut harness, "highlight_1_peak.png");
         if let Some(both) = hooks().filter(|i| i.residues.len() > 1).max_by(|x, y| intensity(x).total_cmp(&intensity(y))) {
             point(&mut harness, at_peak(both.peak));

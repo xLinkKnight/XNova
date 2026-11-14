@@ -1435,6 +1435,113 @@ fn superscript(n: usize) -> String {
     n.to_string().chars().map(|c| DIGITS[c.to_digit(10).unwrap_or(0) as usize]).collect()
 }
 
+/// The residues an internal fragment holds, first and last (0-based)
+fn internal_stretch(ion: &FragmentType) -> Option<(usize, usize)> {
+    use mzcore::sequence::SequencePosition::Index;
+    match ion {
+        FragmentType::Internal(_, first, last) => match (first.sequence_index, last.sequence_index) {
+            (Index(i, _), Index(j, _)) => Some((i.min(j), i.max(j))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Label the peaks with internal ions at their right masses.
+///
+/// Annotator's engine (mzannotate 0.2.0) builds an internal fragment from
+/// its stretch's formula combined with itself (`specific.get(n).unwrap_or(&mass)
+/// * specific.get(c).unwrap_or(&mass)`, where `*` adds formulas), so each
+/// internal ion comes out the stretch's mass too heavy: IST of FISTLQVKLYGR
+/// at m/z 603.33 rather than 302.17. The excess is measured per stretch,
+/// against the engine's own backbone ions (the stretch is b(c+1) − b(n), or
+/// y(len−n) − y(len−1−c)), and taken off every ion of it, so a fixed engine
+/// needs no change here. A stretch holding a link residue is left out (its
+/// fragments carry the partner, intact or cleaved). Each ion labels the
+/// nearest peak within `tolerance`.
+fn add_internal_ions(
+    views: &mut [PeakView],
+    internal: &[mzannotate::fragment::Fragment<OutputMolecularFormula>],
+    backbone: &[mzannotate::fragment::Fragment<OutputMolecularFormula>],
+    lengths: &[usize],
+    link: Option<&Link>,
+    tolerance: Tolerance,
+) {
+    use mzannotate::fragment::{BackboneCFragment as C, BackboneNFragment as N};
+    // singly charged backbone ions without losses: (peptide, series, residues held) → m/z
+    let mut series: HashMap<(usize, char, usize), f64> = HashMap::new();
+    for f in backbone.iter().filter(|f| f.charge.value == 1 && f.neutral_loss.is_empty()) {
+        let (kind, p) = match &f.ion {
+            FragmentType::a(p, 0) => ('a', p),
+            FragmentType::b(p, 0) => ('b', p),
+            FragmentType::c(p, 0) => ('c', p),
+            FragmentType::x(p, 0) => ('x', p),
+            FragmentType::y(p, 0) => ('y', p),
+            FragmentType::z(p, 0) => ('z', p),
+            _ => continue,
+        };
+        if let Some(mz) = f.mz(MassMode::Monoisotopic) {
+            series.entry((f.peptidoform_index.unwrap_or(0), kind, p.series_number)).or_insert(mz.value);
+        }
+    }
+    let ends = |peptide: usize| link.map_or_else(Vec::new, |l| l.ends_of(peptide));
+    // the residue mass of first..=last, from the ions on its side away from the links
+    let stretch_mass = |peptide: usize, first: usize, last: usize| -> Option<f64> {
+        let len = *lengths.get(peptide)?;
+        let ends = ends(peptide);
+        if ends.iter().any(|e| (first..=last).contains(e)) {
+            return None;
+        }
+        let ion = |kind: char, held: usize| series.get(&(peptide, kind, held)).copied();
+        let n_side = || ['b', 'a', 'c'].into_iter().find_map(|k| Some(ion(k, last + 1)? - ion(k, first)?));
+        let c_side = || ['y', 'x', 'z'].into_iter().find_map(|k| Some(ion(k, len - first)? - ion(k, len.checked_sub(last + 1)?)?));
+        let n_ok = ends.iter().all(|&e| e > last);
+        let c_ok = ends.iter().all(|&e| e < first);
+        n_ok.then(n_side).flatten().or_else(|| c_ok.then(c_side).flatten())
+    };
+    // each stretch's excess: its ion with no change at the cleavages (x/a, y/b,
+    // z/c), singly charged and without losses, is the stretch + a proton
+    let mut excess: HashMap<(usize, usize, usize), f64> = HashMap::new();
+    for f in internal.iter().filter(|f| f.charge.value == 1 && f.neutral_loss.is_empty()) {
+        let plain = match &f.ion {
+            FragmentType::Internal(names, ..) => matches!(names, None | Some((C::x, N::a) | (C::y, N::b) | (C::z, N::c))),
+            _ => false,
+        };
+        let (Some((first, last)), Some(mz), true) = (internal_stretch(&f.ion), f.mz(MassMode::Monoisotopic), plain) else { continue };
+        let peptide = f.peptidoform_index.unwrap_or(0);
+        if let Some(mass) = stretch_mass(peptide, first, last) {
+            excess.entry((peptide, first, last)).or_insert(mz.value - (mass + PROTON));
+        }
+    }
+    for f in internal {
+        let peptide = f.peptidoform_index.unwrap_or(0);
+        let Some((first, last)) = internal_stretch(&f.ion) else { continue };
+        let (Some(extra), Some(mz)) = (excess.get(&(peptide, first, last)), f.mz(MassMode::Monoisotopic)) else { continue };
+        let z = f.charge.value.unsigned_abs().max(1) as f64;
+        let mz = mz.value - extra / z;
+        // the nearest peak within the tolerance
+        let at = views.partition_point(|p| p.mz < mz);
+        let nearest = [at.checked_sub(1), Some(at)]
+            .into_iter()
+            .flatten()
+            .filter(|&i| i < views.len() && within(tolerance, mz, views[i].mz))
+            .min_by(|&x, &y| (views[x].mz - mz).abs().total_cmp(&(views[y].mz - mz).abs()));
+        let Some(i) = nearest else { continue };
+        let text = fragment_text(f);
+        if views[i].labels.iter().any(|l| l.text == text && l.peptide == peptide) {
+            continue;
+        }
+        views[i].labels.push(IonLabel {
+            text,
+            series: Series::Internal,
+            peptide,
+            theoretical_mz: mz,
+            backbone: None,
+            internal: Some((first, last)),
+        });
+    }
+}
+
 /// Annotate `peaks` with the peptidoform `proforma` at precursor `charge`;
 /// for a crosslink, `link` adds its stub ions (MS-cleavable linkers)
 pub fn annotate(
@@ -1458,6 +1565,9 @@ pub fn annotate(
         Charge::new::<mzcore::system::e>(charge.max(1) as isize),
         model.model(),
     );
+    // internal ions are matched below, at their right masses (see `add_internal_ions`)
+    let (internal, fragments): (Vec<_>, Vec<_>) =
+        fragments.into_iter().partition(|f| matches!(f.ion, FragmentType::Internal(..)));
 
     let mut description = SpectrumDescription::default();
     description.ms_level = 2;
@@ -1510,16 +1620,7 @@ pub fn annotate(
                 }
                 _ => None,
             };
-            // an internal ion holds the residues from its first to its last cleavage
-            let internal = match &f.ion {
-                FragmentType::Internal(_, first, last) => match (first.sequence_index, last.sequence_index) {
-                    (mzcore::sequence::SequencePosition::Index(i, _), mzcore::sequence::SequencePosition::Index(j, _)) => {
-                        Some((i.min(j), i.max(j)))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            };
+            let internal = internal_stretch(&f.ion);
             labels.push(IonLabel {
                 text: fragment_text(f),
                 series: Series::of(&f.ion),
@@ -1532,6 +1633,8 @@ pub fn annotate(
         views.push(PeakView { mz: peak.mz.value, intensity: peak.intensity, labels });
     }
     views.sort_by(|a, b| a.mz.total_cmp(&b.mz));
+    let lengths: Vec<usize> = coverage.iter().map(|c| c.residues.len()).collect();
+    add_internal_ions(&mut views, &internal, &fragments, &lengths, link, tolerance);
 
     let stub_ions = match link {
         Some(link) if !link.stubs.is_empty() && link.kind == Kind::Multi => {
@@ -2064,6 +2167,36 @@ pub(crate) mod test {
         assert!(a.peaks.iter().any(|p| p.labels[0].text == "P+A"));
         // stub ions are not counted as plain backbone coverage
         assert!(a.coverage[1].c_term.iter().all(|c| !c));
+    }
+
+    /// Internal ions at their stretch's mass + a proton (Annotator's engine
+    /// has them the stretch's mass too heavy): IST of FISTLQVKLYGR at
+    /// 302.171, not 603.335; a modified stretch, EPM[ox] of PEPM[ox]IDEK, too
+    #[test]
+    fn internal_ions_have_their_right_masses() {
+        // monoisotopic residue masses, apart from the engine
+        let residue = |c: char| match c {
+            'I' | 'L' => 113.084064,
+            'S' => 87.032028,
+            'T' => 101.047679,
+            'E' => 129.042593,
+            'P' => 97.052764,
+            'M' => 131.040485,
+            _ => panic!("{c}"),
+        };
+        for (proforma, stretch, modified, held) in [("FISTLQVKLYGR", "IST", 0.0, (1, 3)), ("PEPM[+15.9949]IDEK", "EPM", 15.9949, (1, 3))] {
+            let mass = stretch.chars().map(residue).sum::<f64>() + modified;
+            let (right, doubled) = (mass + PROTON, 2.0 * mass + PROTON);
+            let peaks = Peaks { mz: vec![right, doubled], intensity: vec![100.0, 100.0], precursor_mz: None, ion_mobility: None };
+            let a = annotate(&peaks, proforma, 2, Model::CidHcd, Tolerance::Ppm(-10.0, 10.0), None).unwrap();
+            let internal = |p: &PeakView| p.labels.iter().filter(|l| l.series == Series::Internal).cloned().collect::<Vec<_>>();
+            let at_right = internal(&a.peaks[0]);
+            assert!(
+                at_right.iter().any(|l| l.internal == Some(held) && (l.theoretical_mz - right).abs() < 1e-3),
+                "{proforma}: {stretch} at {right:.4}: {at_right:?}"
+            );
+            assert!(internal(&a.peaks[1]).is_empty(), "{proforma}: nothing at the doubled mass: {:?}", a.peaks[1].labels);
+        }
     }
 
     /// A DSSO crosslink spectrum after linker cleavage: each peptide with the

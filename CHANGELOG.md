@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Annotated spectra: the spectrum and the peptide map are linked, both ways, by hovering (or clicking, to keep it; again, elsewhere or Esc to let go). A peak: the residues its ions hold are framed in the map and in bold, their hooks or triangles drawn thicker and the other glyphs faded; a b/y ion holding a link residue with the linker intact carries the whole partner (as Annotator's engine computes its mass), so both peptides are framed; internal ions frame their stretch. A hook, nested stub hook or stub triangle (pairs and multivalent species): all its peaks are picked out in the spectrum, every charge and neutral loss, with a band behind each, a wider bar and every interpretation in bold (stacked where they would overlap), the other peaks faded. A line above the map names the ions with their m/z, mass error and residues.
 - Export figure: **picked ions** picks out the peak or glyph clicked in the figure too.
 
+### Fixed
+- Annotated spectra: internal ions were labelled at the wrong masses. Annotator's engine (mzannotate 0.2.0) builds an internal fragment from its stretch's formula combined with itself, so every internal ion came out the stretch's mass too heavy (IST of FISTLQVKLYGR at m/z 603.33 instead of 302.17): peaks were labelled with internal ions they are not, and the real ones were missed, which also counted towards the peaks and intensity annotated. XNova now takes the excess off each internal ion, measured per stretch against the engine's own b and y ions (so a fixed engine needs no change), and matches them itself. Internal ions spanning a link residue are left out.
+
 ## [v1.8.7] - 2026-11-14
 
 ### Added
