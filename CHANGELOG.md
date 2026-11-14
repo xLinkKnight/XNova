@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.8.0] - 2026-11-14
 
 ### Changed
 - Crosslink FDR ranks a peptide pair by its weaker peptide's score (the smaller of `score_a` and `score_b`, then the joint hyperscore) instead of the joint hyperscore, which let one long, well-matched peptide carry a partner matched by chance past true pairs. Loop-links and multivalent species keep their hyperscore; `crosslinks.sage.tsv` stays sorted by hyperscore.
