@@ -1002,7 +1002,9 @@ pub struct IonLabel {
     pub peptide: usize,
     pub theoretical_mz: f64,
     /// Backbone ions: (N-terminal ion?, residue it ends after / starts at)
-    backbone: Option<(bool, usize)>,
+    pub backbone: Option<(bool, usize)>,
+    /// Internal ions: their first and last residue (0-based)
+    pub internal: Option<(usize, usize)>,
 }
 
 /// Where a stub-carrying ion lies on its peptide
@@ -1408,6 +1410,7 @@ fn add_stub_label(views: &mut [PeakView], peak: usize, mz: f64, peptide: usize, 
             peptide,
             theoretical_mz: mz,
             backbone: None,
+            internal: None,
         },
     );
 }
@@ -1507,12 +1510,23 @@ pub fn annotate(
                 }
                 _ => None,
             };
+            // an internal ion holds the residues from its first to its last cleavage
+            let internal = match &f.ion {
+                FragmentType::Internal(_, first, last) => match (first.sequence_index, last.sequence_index) {
+                    (mzcore::sequence::SequencePosition::Index(i, _), mzcore::sequence::SequencePosition::Index(j, _)) => {
+                        Some((i.min(j), i.max(j)))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
             labels.push(IonLabel {
                 text: fragment_text(f),
                 series: Series::of(&f.ion),
                 peptide,
                 theoretical_mz: f.mz(MassMode::Monoisotopic).map_or(peak.mz.value, |mz| mz.value),
                 backbone,
+                internal,
             });
         }
         views.push(PeakView { mz: peak.mz.value, intensity: peak.intensity, labels });
@@ -2373,7 +2387,15 @@ mod real_data {
                     m.title(), m.charge, m.scan, m.rt, peaks.ion_mobility.unwrap_or(0.0)
                 );
                 for (background, suffix) in [(true, "white"), (false, "transparent")] {
-                    let opts = FigureOptions { background, title: Some(title.clone()), label_all: false, mz_range: None, coverage: true, dpi: 300 };
+                    let opts = FigureOptions {
+                        background,
+                        title: Some(title.clone()),
+                        label_all: false,
+                        mz_range: None,
+                        coverage: true,
+                        dpi: 300,
+                        highlight: None,
+                    };
                     let text = svg(&a, &opts);
                     for format in [Format::Svg, Format::Png, Format::Tiff] {
                         let path = Path::new(&dir).join(format!("{name}_{suffix}.{}", format.extension()));

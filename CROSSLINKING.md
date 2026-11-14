@@ -713,8 +713,9 @@ generates and matches its fragments. Nothing else needs to be installed.
 * Open it with **View spectra** after a search (bottom bar or Progress tab), by
   loading any results folder on the tab, or with `sage-gui --view <folder>`.
 * The list holds the matches of `results.sage.tsv` and `crosslinks.sage.tsv`,
-  filtered by kind, targets, spectrum q-value and a text search (peptide,
-  protein, scan), best score first.
+  filtered by kind (linear, crosslinks, loop-links, multivalent, in any
+  combination), targets, spectrum q-value and a text search (peptide, protein,
+  scan), best score first. The Up and Down arrow keys step through it.
 * For the match picked: its spectrum with each peak coloured by ion series and
   labelled (`y7`, `b5²+`, `y4-H2O`; in a crosslink `1:` / `2:` name the
   peptide), zoom and pan, hover for m/z, mass error and every interpretation; the
@@ -764,6 +765,19 @@ generates and matches its fragments. Nothing else needs to be installed.
   Hover the map for every stub ion. With an asymmetric linker (cliXlink)
   either arm's stubs are looked for at every end, as the species does not
   record which way round each linker sits.
+* **The spectrum and the map, linked.** Hover over a labelled peak, or click it
+  to keep it, and the residues its ions hold are framed in the map and in
+  bold, with their hooks or triangles drawn thicker and the other glyphs
+  faded. A b/y ion that holds a link residue with the linker intact carries
+  the whole partner (as Annotator's engine computes its mass), so both
+  peptides are framed; a stub ion holds its own peptide only; an internal ion
+  frames its stretch. The other way, hover over or click a hook, a nested stub
+  hook or a stub triangle, and all its peaks are picked out in the spectrum
+  (charges and neutral losses alike): a band behind each, a wider solid bar
+  and every interpretation in bold, stacked where they would overlap, the
+  other peaks faded. A line above the map names the ions with their observed
+  m/z and mass error, and the residues they hold. Click again, elsewhere, or
+  press Esc to let go.
 * The header gives charge, scan, score, q-value, retention time, mass and mass
   error, the precursor m/z and, for timsTOF (Bruker `.d`) data, the precursor's
   ion mobility 1/K0 (V·s/cm²).
@@ -771,7 +785,8 @@ generates and matches its fragments. Nothing else needs to be installed.
   (the current zoom, or the whole spectrum), labelled as in the viewer
   (internal fragments only with "label all matched peaks"), the peptide map with
   the bridge and stub glyphs, a legend, and optionally a title with the
-  peptides, charge, scan, retention time and ion mobility. Formats: SVG and PDF
+  peptides, charge, scan, retention time and ion mobility, and (**picked
+  ions**) the peak or glyph clicked picked out as on screen. Formats: SVG and PDF
   (vector, editable in Illustrator / Inkscape), PNG and TIFF at 300, 600 or
   1200 dpi; 7 inches wide (two-column width); white or transparent background
   (PNG and TIFF then carry an alpha channel; opaque figures have none).

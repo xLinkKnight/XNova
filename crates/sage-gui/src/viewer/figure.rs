@@ -5,6 +5,7 @@
 //! The figure is 7 inches wide (a two-column journal figure): the SVG's user
 //! units are 150 per inch, so 1050 wide.
 
+use super::highlight::{stub_mask, Glyph, Highlight};
 use super::model::{Annotation, Kind, Link, PeakView, Series, StubIonKind};
 use super::{bridge_end_stubs, label_text, peptide_stub_sets, series_color, species, stub_color, UNMATCHED};
 use eframe::egui::Color32;
@@ -67,6 +68,37 @@ pub struct FigureOptions {
     pub coverage: bool,
     /// Raster resolution (PNG, TIFF)
     pub dpi: u32,
+    /// The ions picked out in the viewer (clicked), picked out the same way
+    pub highlight: Option<Highlight>,
+}
+
+/// Colour of what is picked out (the viewer's accent, light theme)
+const ACCENT: &str = "#e8650a";
+
+/// How a glyph of the map is drawn: as is, picked out, or faded while
+/// others are picked out
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    Plain,
+    Picked,
+    Faded,
+}
+
+fn look(hl: Option<&Highlight>, glyph: &Glyph) -> Look {
+    match hl {
+        Some(h) if h.glyphs.contains(glyph) => Look::Picked,
+        Some(_) => Look::Faded,
+        None => Look::Plain,
+    }
+}
+
+/// The attribute that fades a faded glyph
+fn fade(look: Look) -> &'static str {
+    if look == Look::Faded {
+        r#" opacity="0.3""#
+    } else {
+        ""
+    }
 }
 
 fn hex(c: Color32) -> String {
@@ -126,8 +158,10 @@ pub fn svg(a: &Annotation, opts: &FigureOptions) -> String {
         }
         (((min * 0.95) / 100.0).floor() * 100.0, (max * 1.03).max(min + 100.0))
     });
-    let peaks: Vec<_> = a.peaks.iter().filter(|p| p.mz >= lo && p.mz <= hi).collect();
-    let base = peaks.iter().map(|p| p.intensity).fold(0.0f32, f32::max).max(f32::MIN_POSITIVE);
+    let peaks: Vec<(usize, &PeakView)> = a.peaks.iter().enumerate().filter(|(_, p)| p.mz >= lo && p.mz <= hi).collect();
+    let base = peaks.iter().map(|(_, p)| p.intensity).fold(0.0f32, f32::max).max(f32::MIN_POSITIVE);
+    let hl = opts.highlight.as_ref().filter(|h| !h.is_empty());
+    let picked = |i: usize| hl.is_some_and(|h| h.peaks.contains(&i));
 
     let mut body = String::new();
     let mut y = 16.0;
@@ -166,40 +200,68 @@ pub fn svg(a: &Annotation, opts: &FigureOptions) -> String {
     );
     body.push_str("</g>");
 
-    // peaks: unmatched first, matched on top
-    for matched in [false, true] {
-        for p in peaks.iter().filter(|p| p.labels.is_empty() != matched) {
+    // a band behind each peak picked out
+    for &(_, p) in peaks.iter().filter(|(i, _)| picked(*i)) {
+        let _ = write!(
+            body,
+            r#"<rect x="{:.2}" y="{:.1}" width="10" height="{:.1}" fill="{ACCENT}" fill-opacity="0.15"/>"#,
+            px(p.mz) - 5.0,
+            top - 30.0,
+            bottom - top + 30.0
+        );
+    }
+    // peaks: unmatched first, matched on top, those picked out last and
+    // thicker (the others faded)
+    for pass in 0..3 {
+        let in_pass = |(i, p): &&(usize, &PeakView)| match pass {
+            0 => p.labels.is_empty() && !picked(*i),
+            1 => !p.labels.is_empty() && !picked(*i),
+            _ => picked(*i),
+        };
+        for &(_, p) in peaks.iter().filter(in_pass) {
             let (color, width) = match p.labels.first() {
-                Some(l) => (hex(series_color(l.series)), 1.6),
-                None => (hex(UNMATCHED), 1.0),
+                Some(l) => (hex(series_color(l.series)), if pass == 2 { 3.2 } else { 1.6 }),
+                None => (hex(UNMATCHED), if pass == 2 { 3.2 } else { 1.0 }),
             };
+            let faded = if hl.is_some() && pass < 2 { r#" stroke-opacity="0.3""# } else { "" };
             let x = px(p.mz);
             let _ = write!(
                 body,
-                r#"<line x1="{x:.2}" y1="{bottom:.1}" x2="{x:.2}" y2="{:.2}" stroke="{color}" stroke-width="{width}"/>"#,
+                r#"<line x1="{x:.2}" y1="{bottom:.1}" x2="{x:.2}" y2="{:.2}" stroke="{color}" stroke-width="{width}"{faded}/>"#,
                 py((p.intensity / base) as f64)
             );
         }
     }
 
-    // labels, strongest first, moved up (with a leader) to avoid overlaps
+    // labels: those picked out first (bold, every interpretation), then the
+    // strongest, moved up (with a leader) to avoid overlaps
     let threshold = if opts.label_all { 0.0 } else { 0.02 * base };
     // internal fragments only with "label all": their labels (`my:b7:10`) crowd a figure
-    let shown = |p: &&&PeakView| match p.labels.first() {
+    let shown = |p: &PeakView| match p.labels.first() {
         Some(l) => opts.label_all || !matches!(l.series, Series::Internal | Series::Other),
         None => false,
     };
-    let mut order: Vec<_> = peaks.iter().filter(|p| p.intensity >= threshold).filter(shown).collect();
-    order.sort_by(|a, b| b.intensity.total_cmp(&a.intensity));
+    let mut order: Vec<(usize, &PeakView)> = peaks
+        .iter()
+        .copied()
+        .filter(|&(i, p)| (picked(i) && !p.labels.is_empty()) || (p.intensity >= threshold && shown(p)))
+        .collect();
+    order.sort_by(|x, y| picked(y.0).cmp(&picked(x.0)).then(y.1.intensity.total_cmp(&x.1.intensity)));
     let mut placed: Vec<(f64, f64, f64, f64)> = Vec::new();
     let _ = write!(body, r#"<g font-family="{FONT}" font-size="11" text-anchor="middle">"#);
-    for p in order {
+    for (i, p) in order {
         let l = &p.labels[0];
-        let mut text = label_text(a, l);
-        if p.labels.len() > 1 {
-            text.push('*');
-        }
-        let width = text.chars().count() as f64 * 6.2 + 4.0;
+        let is_picked = picked(i);
+        let text = if is_picked {
+            p.labels.iter().map(|l| label_text(a, l)).collect::<Vec<_>>().join(" / ")
+        } else {
+            let mut text = label_text(a, l);
+            if p.labels.len() > 1 {
+                text.push('*');
+            }
+            text
+        };
+        let width = text.chars().count() as f64 * if is_picked { 7.0 } else { 6.2 } + 4.0;
         let x = px(p.mz);
         let peak_top = py((p.intensity / base) as f64);
         let mut baseline = peak_top - 4.0;
@@ -225,7 +287,12 @@ pub fn svg(a: &Annotation, opts: &FigureOptions) -> String {
                 baseline + 2.0
             );
         }
-        let _ = write!(body, r#"<text x="{x:.1}" y="{baseline:.1}" fill="{color}">{}</text>"#, label_svg(&text));
+        let style = match (is_picked, hl.is_some()) {
+            (true, _) => r#" font-weight="bold" font-size="12""#,
+            (false, true) => r#" fill-opacity="0.4""#,
+            (false, false) => "",
+        };
+        let _ = write!(body, r#"<text x="{x:.1}" y="{baseline:.1}" fill="{color}"{style}>{}</text>"#, label_svg(&text));
         placed.push((x - width / 2.0, x + width / 2.0, baseline - 11.0, baseline + 2.0));
     }
     body.push_str("</g>");
@@ -233,7 +300,7 @@ pub fn svg(a: &Annotation, opts: &FigureOptions) -> String {
 
     // ---- peptide map
     if opts.coverage {
-        y = coverage_svg(&mut body, a, y);
+        y = coverage_svg(&mut body, a, y, hl);
     }
 
     // ---- legend
@@ -256,37 +323,54 @@ const CELL_W: f64 = 21.0;
 const CELL_H: f64 = 26.0;
 
 /// Hook at a residue corner, as in the viewer: N-terminal ions over its
-/// right, C-terminal under its left; stubs nest outward
-fn hook_svg(out: &mut String, left: f64, top: f64, n_term: bool, level: usize, color: Color32) {
+/// right, C-terminal under its left; stubs nest outward. Picked out: thicker,
+/// on a halo.
+#[allow(clippy::too_many_arguments)]
+fn hook_svg(out: &mut String, left: f64, top: f64, n_term: bool, level: usize, color: Color32, look: Look) {
     let o = 3.0 * level as f64;
     let (cx, cy, dy, dx) = if n_term {
         (left + CELL_W + o * 0.6, top + 3.0 - o, 9.0 + o, -6.0 - o * 0.6)
     } else {
         (left - o * 0.6, top + CELL_H - 3.0 + o, -9.0 - o, 6.0 + o * 0.6)
     };
-    let _ = write!(
-        out,
-        r#"<path d="M{:.1},{:.1} L{cx:.1},{cy:.1} L{cx:.1},{:.1}" fill="none" stroke="{}" stroke-width="1.8"/>"#,
-        cx + dx,
-        cy,
-        cy + dy,
-        hex(color)
-    );
+    let d = format!("M{:.1},{:.1} L{cx:.1},{cy:.1} L{cx:.1},{:.1}", cx + dx, cy, cy + dy);
+    let color = hex(color);
+    if look == Look::Picked {
+        let _ = write!(out, r#"<path d="{d}" fill="none" stroke="{color}" stroke-opacity="0.3" stroke-width="7" stroke-linecap="round"/>"#);
+    }
+    let width = if look == Look::Picked { 3.2 } else { 1.8 };
+    let _ = write!(out, r#"<path d="{d}" fill="none" stroke="{color}" stroke-width="{width}"{}/>"#, fade(look));
 }
 
-fn peptide_svg(out: &mut String, a: &Annotation, peptide: usize, x: f64, top: f64, linked: &[usize]) {
+fn peptide_svg(out: &mut String, a: &Annotation, peptide: usize, x: f64, top: f64, linked: &[usize], hl: Option<&Highlight>) {
     let c = &a.coverage[peptide];
+    // the residues of the ions picked out, framed
+    for r in hl.map(|h| h.ranges(peptide)).unwrap_or_default() {
+        let _ = write!(
+            out,
+            r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="4" fill="{ACCENT}" fill-opacity="0.14" stroke="{ACCENT}" stroke-width="1.4"/>"#,
+            x + CELL_W * r.start as f64 + 1.0,
+            top + 2.0,
+            CELL_W * r.len() as f64 - 2.0,
+            CELL_H - 4.0
+        );
+    }
     for (i, residue) in c.residues.iter().enumerate() {
         let left = x + CELL_W * i as f64;
         if linked.contains(&i) {
             let _ = write!(out, r##"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="{:.1}" rx="3" fill="#000000" fill-opacity="0.12"/>"##, left + 1.0, top + 5.0, CELL_W - 2.0, CELL_H - 10.0);
         }
-        let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{MONO}" font-size="16" text-anchor="middle">{}</text>"#, left + CELL_W / 2.0, top + CELL_H / 2.0 + 6.0, esc(residue));
-        if c.n_term[i] {
-            hook_svg(out, left, top, true, 0, series_color(Series::B));
-        }
-        if c.c_term[i] {
-            hook_svg(out, left, top, false, 0, series_color(Series::Y));
+        let style = if hl.is_some_and(|h| h.has_residue(peptide, i)) {
+            format!(r#" fill="{ACCENT}" font-weight="bold""#)
+        } else {
+            String::new()
+        };
+        let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{MONO}" font-size="16" text-anchor="middle"{style}>{}</text>"#, left + CELL_W / 2.0, top + CELL_H / 2.0 + 6.0, esc(residue));
+        for (n_term, seen, series) in [(true, c.n_term[i], Series::B), (false, c.c_term[i], Series::Y)] {
+            if seen {
+                let glyph = Glyph::Hook { peptide, n_term, residue: i };
+                hook_svg(out, left, top, n_term, 0, series_color(series), look(hl, &glyph));
+            }
         }
         for n_term in [true, false] {
             let mut stubs: Vec<usize> = a
@@ -303,13 +387,14 @@ fn peptide_svg(out: &mut String, a: &Annotation, peptide: usize, x: f64, top: f6
             stubs.sort_unstable();
             stubs.dedup();
             for (level, stub) in stubs.into_iter().enumerate() {
-                hook_svg(out, left, top, n_term, level + 1, stub_color(stub));
+                let glyph = Glyph::StubHook { peptide, n_term, residue: i, stub };
+                hook_svg(out, left, top, n_term, level + 1, stub_color(stub), look(hl, &glyph));
             }
         }
     }
 }
 
-fn coverage_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
+fn coverage_svg(out: &mut String, a: &Annotation, y: f64, hl: Option<&Highlight>) -> f64 {
     let x0 = 110.0;
     let label = |out: &mut String, text: &str, top: f64| {
         let _ = write!(out, r#"<text x="24" y="{:.1}" font-family="{FONT}" font-size="13">{}</text>"#, top + CELL_H / 2.0 + 5.0, esc(text));
@@ -324,16 +409,16 @@ fn coverage_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
             let top1 = top0 + CELL_H + 2.0 * pad + bridge;
             label(out, "peptide 1", top0);
             label(out, "peptide 2", top1);
-            peptide_svg(out, a, 0, x0 + CELL_W * (shift - s0) as f64, top0, &[s0]);
-            peptide_svg(out, a, 1, x0 + CELL_W * (shift - s1) as f64, top1, &[s1]);
-            bridge_svg(out, a, link, x0 + CELL_W * (shift as f64 + 0.5), top0 + CELL_H - 2.0, top1 + 2.0);
+            peptide_svg(out, a, 0, x0 + CELL_W * (shift - s0) as f64, top0, &[s0], hl);
+            peptide_svg(out, a, 1, x0 + CELL_W * (shift - s1) as f64, top1, &[s1], hl);
+            bridge_svg(out, a, link, x0 + CELL_W * (shift as f64 + 0.5), top0 + CELL_H - 2.0, top1 + 2.0, hl);
             top1 + CELL_H + pad
         }
         Some(link) if link.kind == Kind::Loop && a.coverage.len() == 1 => {
             let (i0, i1) = (link.sites[0].1.min(link.sites[1].1), link.sites[0].1.max(link.sites[1].1));
             let top = y + pad;
             label(out, "loop-link", top);
-            peptide_svg(out, a, 0, x0, top, &[i0, i1]);
+            peptide_svg(out, a, 0, x0, top, &[i0, i1], hl);
             let (xa, xb) = (x0 + CELL_W * (i0 as f64 + 0.5), x0 + CELL_W * (i1 as f64 + 0.5));
             let (ya, yb) = (top + CELL_H + 4.0, top + CELL_H + pad + 8.0);
             let _ = write!(out, r##"<path d="M{xa:.1},{ya:.1} V{yb:.1} H{xb:.1} V{ya:.1}" fill="none" stroke="#888888" stroke-width="2.5"/>"##);
@@ -341,7 +426,7 @@ fn coverage_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
             yb + 22.0
         }
         Some(link) if link.kind == Kind::Multi && a.coverage.len() >= 2 && !link.links.is_empty() => {
-            species_svg(out, a, link, x0, y + pad)
+            species_svg(out, a, link, x0, y + pad, hl)
         }
         _ => {
             let mut top = y + pad;
@@ -349,7 +434,7 @@ fn coverage_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
                 if a.coverage.len() > 1 {
                     label(out, &format!("peptide {}", k + 1), top);
                 }
-                peptide_svg(out, a, k, x0, top, &[]);
+                peptide_svg(out, a, k, x0, top, &[], hl);
                 top += CELL_H + 2.0 * pad;
             }
             top
@@ -359,7 +444,8 @@ fn coverage_svg(out: &mut String, a: &Annotation, y: f64) -> f64 {
 
 /// The bridge between the linked residues, labelled with the linker; a
 /// triangle per peptide + stub ion found, pointing at its peptide
-fn bridge_svg(out: &mut String, a: &Annotation, link: &Link, x: f64, y_top: f64, y_bottom: f64) {
+#[allow(clippy::too_many_arguments)]
+fn bridge_svg(out: &mut String, a: &Annotation, link: &Link, x: f64, y_top: f64, y_bottom: f64, hl: Option<&Highlight>) {
     let _ = write!(out, r##"<line x1="{x:.1}" y1="{y_top:.1}" x2="{x:.1}" y2="{y_bottom:.1}" stroke="#888888" stroke-width="2.5"/>"##);
     let _ = write!(
         out,
@@ -377,16 +463,17 @@ fn bridge_svg(out: &mut String, a: &Annotation, link: &Link, x: f64, y_top: f64,
             .collect();
         stubs.sort_unstable();
         stubs.dedup();
-        stubs_svg(out, link, &stubs, x + 12.0, cy, up);
+        stubs_svg(out, link, &stubs, x + 12.0, cy, up, |stub| Glyph::Stub { peptide: k, stub, link: None }, hl);
     }
 }
 
-/// Filled triangle with its tip up or down (toward the peptide carrying the stub)
-fn triangle_svg(out: &mut String, cx: f64, cy: f64, up: bool, color: &str) {
+/// Filled triangle with its tip up or down (toward the peptide carrying the
+/// stub); `extra` attributes (fading)
+fn triangle_svg(out: &mut String, cx: f64, cy: f64, up: bool, color: &str, extra: &str) {
     let (tip, base) = if up { (-5.0, 4.0) } else { (5.0, -4.0) };
     let _ = write!(
         out,
-        r#"<polygon points="{cx:.1},{:.1} {:.1},{:.1} {:.1},{:.1}" fill="{color}"/>"#,
+        r#"<polygon points="{cx:.1},{:.1} {:.1},{:.1} {:.1},{:.1}" fill="{color}"{extra}/>"#,
         cy + tip,
         cx - 5.0,
         cy + base,
@@ -395,14 +482,20 @@ fn triangle_svg(out: &mut String, cx: f64, cy: f64, up: bool, color: &str) {
     );
 }
 
-/// A triangle and the name of each stub, left to right from `x`
-fn stubs_svg(out: &mut String, link: &Link, stubs: &[usize], x: f64, cy: f64, up: bool) {
+/// A triangle and the name of each stub, left to right from `x`; `glyph`
+/// says what each stands for (ringed when picked out, faded while others are)
+#[allow(clippy::too_many_arguments)]
+fn stubs_svg(out: &mut String, link: &Link, stubs: &[usize], x: f64, cy: f64, up: bool, glyph: impl Fn(usize) -> Glyph, hl: Option<&Highlight>) {
     let mut cx = x;
     for &stub in stubs {
         let color = hex(stub_color(stub));
-        triangle_svg(out, cx, cy, up, &color);
+        let look = look(hl, &glyph(stub));
+        if look == Look::Picked {
+            let _ = write!(out, r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="10" fill="{ACCENT}" fill-opacity="0.18" stroke="{ACCENT}" stroke-width="1.4"/>"#);
+        }
+        triangle_svg(out, cx, cy, up, &color, fade(look));
         let name = &link.stubs[stub].name;
-        let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="{color}">{}</text>"#, cx + 8.0, cy + 4.0, esc(name));
+        let _ = write!(out, r#"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="{color}"{}>{}</text>"#, cx + 8.0, cy + 4.0, fade(look), esc(name));
         cx += 8.0 + name.chars().count() as f64 * 7.0 + 10.0;
     }
 }
@@ -411,7 +504,7 @@ fn stubs_svg(out: &mut String, link: &Link, stubs: &[usize], x: f64, cy: f64, up
 /// link (`XLn`), the stubs found where each linker broke, and after a
 /// peptide with two or more links its peptide + stubs peaks. Returns the
 /// bottom.
-fn species_svg(out: &mut String, a: &Annotation, link: &Link, x0: f64, y: f64) -> f64 {
+fn species_svg(out: &mut String, a: &Annotation, link: &Link, x0: f64, y: f64, hl: Option<&Highlight>) -> f64 {
     const GAP: f64 = 52.0;
     const LANE: f64 = 12.0;
     let pad = 12.0;
@@ -430,22 +523,35 @@ fn species_svg(out: &mut String, a: &Annotation, link: &Link, x0: f64, y: f64) -
             t + CELL_H / 2.0 + 5.0,
             k + 1
         );
-        peptide_svg(out, a, k, x0 + CELL_W * l.offsets[row] as f64, t, &link.ends_of(k));
+        peptide_svg(out, a, k, x0 + CELL_W * l.offsets[row] as f64, t, &link.ends_of(k), hl);
         let mut x = cells_end + lanes_w + 14.0;
         for set in peptide_stub_sets(a, link, k) {
+            let look = look(hl, &Glyph::Stubs { peptide: k, stubs: stub_mask(&set) });
+            let start = x;
             for &stub in &set {
-                triangle_svg(out, x + 5.0, t + CELL_H / 2.0, true, &hex(stub_color(stub)));
+                triangle_svg(out, x + 5.0, t + CELL_H / 2.0, true, &hex(stub_color(stub)), fade(look));
                 x += 11.0;
             }
             let names = set.iter().map(|&j| link.stubs[j].name.as_str()).collect::<Vec<_>>().join("+");
             let _ = write!(
                 out,
-                r##"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="#666666">{}</text>"##,
+                r##"<text x="{:.1}" y="{:.1}" font-family="{FONT}" font-size="12" fill="#666666"{}>{}</text>"##,
                 x + 2.0,
                 t + CELL_H / 2.0 + 4.0,
+                fade(look),
                 esc(&names)
             );
-            x += 2.0 + names.chars().count() as f64 * 7.0 + 12.0;
+            x += 2.0 + names.chars().count() as f64 * 7.0;
+            if look == Look::Picked {
+                let _ = write!(
+                    out,
+                    r#"<rect x="{:.1}" y="{:.1}" width="{:.1}" height="20" rx="6" fill="none" stroke="{ACCENT}" stroke-width="1.4"/>"#,
+                    start - 4.0,
+                    t + CELL_H / 2.0 - 10.0,
+                    x - start + 8.0
+                );
+            }
+            x += 12.0;
         }
     }
     for b in &l.bridges {
@@ -482,7 +588,9 @@ fn species_svg(out: &mut String, a: &Annotation, link: &Link, x0: f64, y: f64) -
             }
         };
         for ((row, _), x, cy, up) in [(b.upper, x_upper_end, yu + 13.0, true), (b.lower, x_lower_end, yl - 13.0, false)] {
-            stubs_svg(out, link, &bridge_end_stubs(a, link, b.link, l.rows[row]), x + 12.0, cy, up);
+            let peptide = l.rows[row];
+            let glyph = |stub| Glyph::Stub { peptide, stub, link: Some(b.link) };
+            stubs_svg(out, link, &bridge_end_stubs(a, link, b.link, peptide), x + 12.0, cy, up, glyph, hl);
         }
     }
     top(l.rows.len() - 1) + CELL_H + pad
@@ -616,7 +724,32 @@ mod test {
             mz_range: None,
             coverage: true,
             dpi: 300,
+            highlight: None,
         }
+    }
+
+    /// A figure of an ion clicked in the viewer: its peak in a band, thicker
+    /// and labelled in bold; its residues framed and in bold; the rest faded
+    #[test]
+    fn picked_ions_are_picked_out_in_the_figure() {
+        use super::super::highlight::{ions, Focus};
+        let (_, a) = super::super::model::test::cleaved_dsso();
+        let ions = ions(&a);
+        let y5 = a.peaks.iter().position(|p| p.labels[0].text == "y5+S").unwrap();
+        let plain = svg(&a, &options(true));
+        let figure = svg(&a, &FigureOptions { highlight: Some(Highlight::of(&ions, Focus::Peak(y5))), ..options(true) });
+        assert!(!plain.contains(ACCENT) && !plain.contains(r#"opacity="0.3""#), "nothing picked out: as before");
+        // a band behind the peak; its label in bold
+        assert_eq!(figure.matches(&format!(r#"fill="{ACCENT}" fill-opacity="0.15""#)).count(), 1);
+        assert!(figure.contains(r#" font-weight="bold" font-size="12">2:y5+S</text>"#), "(peptide 2)");
+        // W9-R13 of peptide 2 framed once, its five residues in bold; the S hook thicker
+        assert_eq!(figure.matches(&format!(r#"fill="{ACCENT}" fill-opacity="0.14""#)).count(), 1);
+        assert_eq!(figure.matches(&format!(r#"fill="{ACCENT}" font-weight="bold""#)).count(), 5);
+        assert_eq!(figure.matches(r#"stroke-opacity="0.3" stroke-width="7""#).count(), 1, "the hook's halo");
+        // the other peaks, labels and glyphs faded
+        assert!(figure.contains(r#"stroke-opacity="0.3"/>"#) && figure.contains(r#"fill-opacity="0.4""#));
+        assert!(figure.contains(r#" opacity="0.3""#));
+        assert!(rasterize(&figure, 150).is_ok());
     }
 
     #[test]

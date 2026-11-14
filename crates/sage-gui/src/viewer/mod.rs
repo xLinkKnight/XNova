@@ -4,6 +4,7 @@
 pub mod circos;
 mod circos_view;
 pub mod figure;
+pub mod highlight;
 pub mod loader;
 pub mod mobiligram;
 pub mod model;
@@ -13,7 +14,8 @@ pub mod protein_info;
 pub mod species;
 
 use eframe::egui::{self, Color32, RichText, Ui};
-use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text};
+use egui_plot::{Bar, BarChart, Plot, PlotPoint, Text, VLine};
+use highlight::{Focus, Glyph, Highlight};
 use model::{annotate, Annotation, Kind, Model, Peaks, Results, Series, SpectrumKey, StubIonKind};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -64,6 +66,15 @@ pub struct Viewer {
     /// Its peptides' proteins and link positions, for the peptide map
     labels: Vec<model::PeptideLabel>,
     annotated: Option<(usize, Model)>,
+    /// The annotation's ions, with their glyphs in the map and residues
+    ions: Vec<highlight::Ion>,
+    /// The peak or map glyph under the pointer (last frame), and the one
+    /// clicked: its ions are picked out in the spectrum and the map
+    hovered_ion: Option<Focus>,
+    pinned_ion: Option<Focus>,
+    /// Where the spectrum and the map's glyphs were drawn (last frame)
+    plot_transform: Option<egui_plot::PlotTransform>,
+    map_hits: Vec<(Vec<egui::Pos2>, Glyph)>,
     mobiligram: MobiligramView,
     /// The crosslink plot (Circos) window
     circos: circos_view::CircosView,
@@ -114,6 +125,11 @@ impl Default for Viewer {
             annotation: None,
             labels: Vec::new(),
             annotated: None,
+            ions: Vec::new(),
+            hovered_ion: None,
+            pinned_ion: None,
+            plot_transform: None,
+            map_hits: Vec::new(),
             mobiligram: MobiligramView::default(),
             circos: circos_view::CircosView::default(),
             network: network_view::NetworkView::default(),
@@ -710,6 +726,13 @@ impl Viewer {
             self.annotation = Some(annotate(peaks, &proforma, m.charge, self.model, results.fragment_tol, results.link(m).as_ref()));
             self.labels = results.peptide_labels(m);
             self.annotated = Some((i, self.model));
+            // another spectrum: its own ions (peak numbers change)
+            self.ions = match &self.annotation {
+                Some(Ok(a)) => highlight::ions(a),
+                _ => Vec::new(),
+            };
+            self.hovered_ion = None;
+            self.pinned_ion = None;
         }
         let Some(annotation) = &self.annotation else { return };
         let a = match annotation {
@@ -740,11 +763,47 @@ impl Viewer {
                 .weak(),
             );
         });
-        let range = spectrum_plot(ui, a, self.label_all);
+        // the peak or glyph under the pointer (last frame), else the one clicked:
+        // its ions picked out in the spectrum, their residues framed in the map
+        let focus = self.hovered_ion.or(self.pinned_ion);
+        let hl = focus.map(|f| Highlight::of(&self.ions, f)).unwrap_or_default();
+        let plot = spectrum_plot(ui, a, self.label_all, &hl);
+        let range = plot.range;
+        self.plot_transform = Some(plot.transform);
+        // one line of one height either way, so the map below never moves under the pointer
+        let line = if hl.is_empty() {
+            RichText::new(
+                "Hover over or click a labelled peak to frame its residues in the map below; hover over or \
+                 click a hook or stub triangle in the map to pick out its peaks.",
+            )
+            .weak()
+        } else {
+            let pinned = if self.pinned_ion.is_some() && self.hovered_ion.is_none() {
+                "   (clicked: click it again, or press Esc, to clear)"
+            } else {
+                ""
+            };
+            RichText::new(format!("{}{pinned}", hl.describe(a, &self.ions))).color(crate::theme::accent(ui))
+        };
+        ui.add(egui::Label::new(line).truncate());
         // wide maps (long peptides, protein labels) scroll rather than clip
-        egui::ScrollArea::horizontal()
+        let (glyph, map_clicked, hits) = egui::ScrollArea::horizontal()
             .id_salt("viewer_map")
-            .show(ui, |ui| coverage_view(ui, a, &self.labels));
+            .show(ui, |ui| coverage_view(ui, a, &self.labels, &hl))
+            .inner;
+        self.map_hits = hits;
+        let hovered = plot.hovered.map(Focus::Peak).or(glyph.map(Focus::Glyph));
+        if plot.clicked || map_clicked {
+            // click a peak or glyph to keep it picked out; again (or elsewhere) to let go
+            self.pinned_ion = if hovered == self.pinned_ion { None } else { hovered };
+        }
+        if self.pinned_ion.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.pinned_ion = None;
+        }
+        if hovered != self.hovered_ion {
+            self.hovered_ion = hovered;
+            ui.ctx().request_repaint();
+        }
         legend(ui, a);
 
         // Figure export
@@ -780,6 +839,9 @@ impl Viewer {
             ui.checkbox(&mut self.export.map, "peptide map");
             ui.checkbox(&mut self.export.zoom, "current zoom")
                 .on_hover_text("Export the m/z range shown above; off: the whole spectrum.");
+            ui.add_enabled(self.pinned_ion.is_some(), egui::Checkbox::new(&mut self.export.picked, "picked ions"))
+                .on_hover_text("Pick out the peak or map glyph clicked above, as on screen: its peaks in a band and its residues framed, the rest faded.")
+                .on_disabled_hover_text("Click a peak or a glyph of the map to pick out its ions in the figure too.");
             export = ui.button("Save…").clicked();
         });
         if let Some((error, text)) = &self.export.message {
@@ -798,6 +860,7 @@ impl Viewer {
                 mz_range: if self.export.zoom { range } else { None },
                 coverage: self.export.map,
                 dpi: self.export.dpi,
+                highlight: self.pinned_ion.filter(|_| self.export.picked).map(|f| Highlight::of(&self.ions, f)),
             };
             let svg = figure::svg(a, &options);
             let format = self.export.format;
@@ -825,6 +888,8 @@ pub struct ExportSettings {
     title: bool,
     map: bool,
     zoom: bool,
+    /// Pick out the ions clicked, as on screen
+    picked: bool,
     message: Option<(bool, String)>,
 }
 
@@ -837,6 +902,7 @@ impl Default for ExportSettings {
             title: true,
             map: true,
             zoom: true,
+            picked: true,
             message: None,
         }
     }
@@ -1083,20 +1149,78 @@ fn label_text(a: &Annotation, label: &model::IonLabel) -> String {
     }
 }
 
-/// Draw the annotated spectrum; returns the m/z range shown (the zoom)
-fn spectrum_plot(ui: &mut Ui, a: &Annotation, label_all: bool) -> Option<(f64, f64)> {
+/// The spectrum drawn: the m/z range shown (the zoom), where, and the
+/// annotated peak under the pointer
+struct PlotOut {
+    range: Option<(f64, f64)>,
+    transform: egui_plot::PlotTransform,
+    hovered: Option<usize>,
+    clicked: bool,
+}
+
+/// How near (points) the pointer must be to a peak, or a glyph of the map,
+/// to pick it
+const PICK: f32 = 6.0;
+
+/// Height (points) of a row of labels of peaks picked out
+const PICKED_ROW: f32 = 17.0;
+
+/// Rows for labels so that none overlap: each label is `(x, width, y)`, its
+/// centre and the top of its peak (points, y down), and sits `row` points
+/// higher for each row up; each takes the lowest row clear of those before it
+fn label_levels(labels: &[(f32, f32, f32)], row: f32) -> Vec<usize> {
+    let mut placed: Vec<egui::Rect> = Vec::new();
+    labels
+        .iter()
+        .map(|&(x, width, top)| {
+            let at = |level: usize| {
+                // a hair short of the row, so rows next to each other do not touch
+                let bottom = top - level as f32 * row;
+                egui::Rect::from_min_max(egui::pos2(x - width / 2.0 - 2.0, bottom - row + 1.0), egui::pos2(x + width / 2.0 + 2.0, bottom))
+            };
+            let level = (0..).find(|&l| !placed.iter().any(|r| r.intersects(at(l)))).unwrap_or(0);
+            placed.push(at(level));
+            level
+        })
+        .collect()
+}
+
+/// Draw the annotated spectrum, with the peaks of `hl` picked out: wider,
+/// solid, outlined and labelled in bold over a band, the others faded
+fn spectrum_plot(ui: &mut Ui, a: &Annotation, label_all: bool, hl: &Highlight) -> PlotOut {
     let max_mz = a.peaks.iter().map(|p| p.mz).fold(0.0, f64::max).max(1.0);
     let width = max_mz / 1500.0;
+    let picking = !hl.peaks.is_empty();
+    let accent = crate::theme::accent(ui);
     let mut by_series: HashMap<Option<Series>, Vec<Bar>> = HashMap::new();
-    for p in &a.peaks {
+    let mut picked: Vec<Bar> = Vec::new();
+    for (i, p) in a.peaks.iter().enumerate() {
         let series = p.labels.first().map(|l| l.series);
-        by_series
-            .entry(series)
-            .or_default()
-            .push(Bar::new(p.mz, p.intensity as f64).width(width));
+        let color = series.map_or(UNMATCHED, series_color);
+        let bar = Bar::new(p.mz, p.intensity as f64);
+        if hl.peaks.contains(&i) {
+            picked.push(bar.width(width * 3.0).fill(color).stroke(egui::Stroke::new(1.5_f32, color)));
+        } else if picking {
+            let faded = color.gamma_multiply(0.3);
+            by_series.entry(series).or_default().push(bar.width(width).fill(faded.linear_multiply(0.2)).stroke(egui::Stroke::new(1.0_f32, faded)));
+        } else {
+            by_series.entry(series).or_default().push(bar.width(width));
+        }
     }
     // Labels: matched peaks above 2% of the base peak, or all
     let threshold = if label_all { 0.0 } else { 0.02 * a.max_intensity };
+    // the labels of the peaks picked out (every interpretation), left to right, and their widths
+    let mut picked_labels: Vec<(usize, String, f32)> = hl
+        .peaks
+        .iter()
+        .filter(|&&i| !a.peaks[i].labels.is_empty())
+        .map(|&i| {
+            let text = a.peaks[i].labels.iter().map(|l| label_text(a, l)).collect::<Vec<_>>().join(" / ");
+            let width = ui.fonts(|f| f.layout_no_wrap(text.clone(), egui::FontId::proportional(13.0), Color32::WHITE).size().x);
+            (i, text, width)
+        })
+        .collect();
+    picked_labels.sort_by(|x, y| a.peaks[x.0].mz.total_cmp(&a.peaks[y.0].mz));
     let peaks = &a.peaks;
     let hover = |_: &str, point: &PlotPoint| -> String {
         // the peak nearest to the pointer
@@ -1127,30 +1251,78 @@ fn spectrum_plot(ui: &mut Ui, a: &Annotation, label_all: bool) -> Option<(f64, f
         .include_y(a.max_intensity as f64 * 1.12)
         .label_formatter(hover)
         .show(ui, |plot| {
+            // a band behind each peak picked out, seen at any zoom
+            for &i in &hl.peaks {
+                plot.vline(VLine::new(a.peaks[i].mz).color(accent.gamma_multiply(0.22)).width(10.0_f32));
+            }
             for (s, bars) in series {
                 let (color, name) = s.map_or((UNMATCHED, "unmatched"), |s| (series_color(s), s.name()));
                 plot.bar_chart(BarChart::new(bars).color(color).name(name));
             }
-            for p in a.peaks.iter().filter(|p| !p.labels.is_empty() && p.intensity >= threshold) {
+            if !picked.is_empty() {
+                plot.bar_chart(BarChart::new(picked).name("picked"));
+            }
+            // labels (faded while others are picked out)
+            for p in a.peaks.iter().enumerate().filter(|(i, p)| !p.labels.is_empty() && p.intensity >= threshold && !hl.peaks.contains(i)).map(|(_, p)| p) {
                 let l = &p.labels[0];
                 let mut text = label_text(a, l);
                 if p.labels.len() > 1 {
                     text.push('*');
                 }
+                let color = if picking { series_color(l.series).gamma_multiply(0.35) } else { series_color(l.series) };
                 plot.text(
                     Text::new(PlotPoint::new(p.mz, p.intensity as f64), RichText::new(text).size(11.0))
-                        .color(series_color(l.series))
+                        .color(color)
                         .anchor(egui::Align2::CENTER_BOTTOM),
                 );
             }
+            // those picked out on top, in bold with every interpretation, stacked
+            // where they would overlap
+            let t = *plot.transform();
+            let boxes: Vec<(f32, f32, f32)> = picked_labels
+                .iter()
+                .map(|(i, _, w)| {
+                    let p = &a.peaks[*i];
+                    (t.position_from_point_x(p.mz), *w, t.position_from_point_y(p.intensity as f64))
+                })
+                .collect();
+            let per_point = t.dvalue_dpos()[1].abs();
+            for ((i, text, _), level) in picked_labels.iter().zip(label_levels(&boxes, PICKED_ROW)) {
+                let p = &a.peaks[*i];
+                let y = p.intensity as f64 + level as f64 * PICKED_ROW as f64 * per_point;
+                plot.text(
+                    Text::new(PlotPoint::new(p.mz, y), RichText::new(text).size(13.0).strong())
+                        .color(series_color(p.labels[0].series))
+                        .anchor(egui::Align2::CENTER_BOTTOM),
+                );
+            }
+            // the annotated peak under the pointer: the nearest across, up to its label above
+            let pointer = plot.response().hover_pos()?;
+            let t = plot.transform();
+            a.peaks
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !p.labels.is_empty())
+                .map(|(i, p)| (i, (t.position_from_point_x(p.mz) - pointer.x).abs(), t.position_from_point_y(p.intensity as f64)))
+                .filter(|&(_, dx, top)| dx <= PICK && pointer.y >= top - 22.0)
+                .min_by(|x, y| x.1.total_cmp(&y.1))
+                .map(|(i, ..)| i)
         });
+    if shown.inner.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     ui.label(
         RichText::new("Drag to pan, ctrl + scroll to zoom, double-click to reset. * = more than one interpretation (hover).")
             .weak()
             .small(),
     );
     let bounds = shown.transform.bounds();
-    Some((bounds.min()[0].max(0.0), bounds.max()[0]))
+    PlotOut {
+        range: Some((bounds.min()[0].max(0.0), bounds.max()[0])),
+        transform: shown.transform,
+        hovered: shown.inner,
+        clicked: shown.response.clicked(),
+    }
 }
 
 /// Width and height of one residue in the coverage map
@@ -1249,35 +1421,125 @@ fn peptide_label(ui: &mut Ui, painter: &egui::Painter, left: f32, y: f32, width:
 
 /// A hook at a residue corner: N-terminal ions over its right (ending after
 /// it), C-terminal ions under its left (starting at it). `level` 0 is a plain
-/// ion; stub ions nest outward at levels 1, 2, ...
-fn hook(painter: &egui::Painter, r: egui::Rect, n_term: bool, level: usize, color: Color32) {
+/// ion; stub ions nest outward at levels 1, 2, ... Picked out: thicker, on a
+/// halo. Returns its three points (for the pointer).
+fn hook(painter: &egui::Painter, r: egui::Rect, n_term: bool, level: usize, color: Color32, picked: bool) -> Vec<egui::Pos2> {
     let out = 3.0 * level as f32;
-    let stroke = egui::Stroke::new(2.0_f32, color);
     let (corner, down, back) = if n_term {
         (egui::pos2(r.right() + out * 0.6, r.top() + 3.0 - out), egui::vec2(0.0, 9.0 + out), egui::vec2(-6.0 - out * 0.6, 0.0))
     } else {
         (egui::pos2(r.left() - out * 0.6, r.bottom() - 3.0 + out), egui::vec2(0.0, -9.0 - out), egui::vec2(6.0 + out * 0.6, 0.0))
     };
+    let points = vec![corner + back, corner, corner + down];
+    if picked {
+        painter.add(egui::Shape::line(points.clone(), egui::Stroke::new(9.0_f32, color.gamma_multiply(0.3))));
+    }
+    let stroke = egui::Stroke::new(if picked { 3.5_f32 } else { 2.0 }, color);
     painter.line_segment([corner, corner + down], stroke);
     painter.line_segment([corner, corner + back], stroke);
+    points
+}
+
+/// Drawing the peptide map: what to pick out, and where its glyphs are drawn
+/// (for the pointer)
+struct MapCtx<'h> {
+    hl: &'h Highlight,
+    accent: Color32,
+    /// Each glyph's outline: a point, or a line through its points
+    hits: Vec<(Vec<egui::Pos2>, Glyph)>,
+    /// The map, to hover over and click
+    response: Option<egui::Response>,
+    /// Its part right of the peptide labels (where the stub summary shows)
+    area: Option<egui::Rect>,
+}
+
+impl MapCtx<'_> {
+    fn add(&mut self, response: egui::Response) {
+        self.response = Some(match self.response.take() {
+            Some(r) => r.union(response),
+            None => response,
+        });
+    }
+
+    /// Whether `glyph` is picked out, and its colour: as is, or faded while
+    /// other ions are picked out
+    fn look(&self, glyph: &Glyph, color: Color32) -> (bool, Color32) {
+        let picked = self.hl.glyphs.contains(glyph);
+        (picked, if self.hl.is_empty() || picked { color } else { color.gamma_multiply(0.3) })
+    }
+
+    /// A stub triangle (and its name, `names` right of it) that stands for
+    /// `glyph`: ringed when picked out, faded while others are
+    #[allow(clippy::too_many_arguments)]
+    fn stub_glyph(&mut self, painter: &egui::Painter, glyph: Glyph, center: egui::Pos2, up: bool, color: Color32, name: &str, font: egui::FontId) -> egui::Rect {
+        let (picked, color) = self.look(&glyph, color);
+        if picked {
+            painter.circle(center, 10.0, self.accent.gamma_multiply(0.18), egui::Stroke::new(1.6_f32, self.accent));
+        }
+        triangle(painter, center, up, color);
+        let text = painter.text(center + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, name, font, color);
+        self.hits.push((vec![center, text.right_center()], glyph));
+        text
+    }
+}
+
+/// How far `p` is from a glyph's outline
+fn glyph_distance(p: egui::Pos2, points: &[egui::Pos2]) -> f32 {
+    if let [only] = points {
+        return p.distance(*only);
+    }
+    points
+        .windows(2)
+        .map(|w| {
+            let (a, ab) = (w[0], w[1] - w[0]);
+            let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+            p.distance(a + ab * t)
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+/// The glyph nearest to `p`, if within reach
+fn glyph_at(hits: &[(Vec<egui::Pos2>, Glyph)], p: egui::Pos2) -> Option<Glyph> {
+    hits.iter()
+        .map(|(points, g)| (glyph_distance(p, points), *g))
+        .filter(|(d, _)| *d <= PICK)
+        .min_by(|x, y| x.0.total_cmp(&y.0))
+        .map(|(_, g)| g)
 }
 
 /// One peptide row starting at `origin` (top left of its first residue):
-/// residues, plain backbone hooks and the hooks of stub-carrying ions
-fn draw_peptide(painter: &egui::Painter, origin: egui::Pos2, a: &Annotation, peptide: usize, linked: &[usize], text_color: Color32) {
+/// residues, plain backbone hooks and the hooks of stub-carrying ions. The
+/// residues of the ions picked out are framed and in bold, their hooks thicker.
+fn draw_peptide(painter: &egui::Painter, origin: egui::Pos2, a: &Annotation, peptide: usize, linked: &[usize], text_color: Color32, m: &mut MapCtx) {
     let c = &a.coverage[peptide];
     let font = egui::FontId::monospace(16.0);
+    for range in m.hl.ranges(peptide) {
+        let frame = egui::Rect::from_min_max(
+            origin + egui::vec2(CELL.x * range.start as f32 + 1.0, 2.0),
+            origin + egui::vec2(CELL.x * range.end as f32 - 1.0, CELL.y - 2.0),
+        );
+        painter.rect(frame, 4.0, m.accent.gamma_multiply(0.14), egui::Stroke::new(1.6_f32, m.accent), egui::StrokeKind::Inside);
+    }
     for (i, residue) in c.residues.iter().enumerate() {
         let r = egui::Rect::from_min_size(origin + egui::vec2(CELL.x * i as f32, 0.0), CELL);
         if linked.contains(&i) {
             painter.rect_filled(r.shrink2(egui::vec2(1.0, 6.0)), 3.0, text_color.gamma_multiply(0.18));
         }
-        painter.text(r.center(), egui::Align2::CENTER_CENTER, residue, font.clone(), text_color);
-        if c.n_term[i] {
-            hook(painter, r, true, 0, series_color(Series::B));
+        if m.hl.has_residue(peptide, i) {
+            // bold: drawn twice, a hair apart
+            for dx in [0.0, 0.8] {
+                painter.text(r.center() + egui::vec2(dx, 0.0), egui::Align2::CENTER_CENTER, residue, font.clone(), m.accent);
+            }
+        } else {
+            painter.text(r.center(), egui::Align2::CENTER_CENTER, residue, font.clone(), text_color);
         }
-        if c.c_term[i] {
-            hook(painter, r, false, 0, series_color(Series::Y));
+        for (n_term, seen, series) in [(true, c.n_term[i], Series::B), (false, c.c_term[i], Series::Y)] {
+            if seen {
+                let glyph = Glyph::Hook { peptide, n_term, residue: i };
+                let (picked, color) = m.look(&glyph, series_color(series));
+                let points = hook(painter, r, n_term, 0, color, picked);
+                m.hits.push((points, glyph));
+            }
         }
         // stub-carrying ions, one nested hook per stub
         for n_term in [true, false] {
@@ -1295,7 +1557,10 @@ fn draw_peptide(painter: &egui::Painter, origin: egui::Pos2, a: &Annotation, pep
             stubs.sort_unstable();
             stubs.dedup();
             for (level, stub) in stubs.into_iter().enumerate() {
-                hook(painter, r, n_term, level + 1, stub_color(stub));
+                let glyph = Glyph::StubHook { peptide, n_term, residue: i, stub };
+                let (picked, color) = m.look(&glyph, stub_color(stub));
+                let points = hook(painter, r, n_term, level + 1, color, picked);
+                m.hits.push((points, glyph));
             }
         }
     }
@@ -1364,33 +1629,55 @@ fn stub_summary(a: &Annotation, link: &model::Link) -> String {
 /// Annotator: a hook over the right of a residue for an N-terminal (a/b/c)
 /// ion ending there, one under the left for a C-terminal (x/y/z) ion starting
 /// there. Crosslinked pairs are joined by a bridge between their linked
-/// residues; loop-links by a bracket.
-fn coverage_view(ui: &mut Ui, a: &Annotation, labels: &[model::PeptideLabel]) {
+/// residues; loop-links by a bracket. The residues and glyphs of `hl` are
+/// picked out. Returns the glyph under the pointer, whether the map was
+/// clicked, and where each glyph was drawn.
+fn coverage_view(
+    ui: &mut Ui,
+    a: &Annotation,
+    labels: &[model::PeptideLabel],
+    hl: &Highlight,
+) -> (Option<Glyph>, bool, Vec<(Vec<egui::Pos2>, Glyph)>) {
+    let mut m = MapCtx { hl, accent: crate::theme::accent(ui), hits: Vec::new(), response: None, area: None };
     match &a.link {
-        Some(link) if link.kind == Kind::Crosslink && a.coverage.len() == 2 => crosslink_map(ui, a, link, labels),
-        Some(link) if link.kind == Kind::Loop && a.coverage.len() == 1 => loop_map(ui, a, link, labels),
+        Some(link) if link.kind == Kind::Crosslink && a.coverage.len() == 2 => crosslink_map(ui, a, link, labels, &mut m),
+        Some(link) if link.kind == Kind::Loop && a.coverage.len() == 1 => loop_map(ui, a, link, labels, &mut m),
         Some(link) if link.kind == Kind::Multi && a.coverage.len() >= 2 && !link.links.is_empty() => {
-            species_map(ui, a, link, labels)
+            species_map(ui, a, link, labels, &mut m)
         }
         _ => {
             for k in 0..a.coverage.len() {
                 ui.horizontal(|ui| {
                     let width = CELL.x * a.coverage[k].residues.len() as f32;
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, CELL.y + 2.0 * PAD), egui::Sense::hover());
+                    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, CELL.y + 2.0 * PAD), egui::Sense::click());
                     let painter = ui.painter_at(rect.expand(4.0));
-                    draw_peptide(&painter, rect.min + egui::vec2(0.0, PAD), a, k, &[], ui.visuals().text_color());
+                    draw_peptide(&painter, rect.min + egui::vec2(0.0, PAD), a, k, &[], ui.visuals().text_color(), &mut m);
+                    m.add(response);
                     ui.label(RichText::new(format!("  {}", backbone_text(a, k))).weak());
                 });
             }
         }
     }
+    let Some(response) = m.response.take() else { return (None, false, m.hits) };
+    let pointer = response.hover_pos();
+    let glyph = pointer.and_then(|p| glyph_at(&m.hits, p));
+    let clicked = response.clicked();
+    if glyph.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    } else if let (Some(link), Some(area), Some(p)) = (&a.link, m.area, pointer) {
+        // off the glyphs: every stub ion found
+        if !link.stubs.is_empty() && area.contains(p) {
+            response.on_hover_text(stub_summary(a, link));
+        }
+    }
+    (glyph, clicked, m.hits)
 }
 
 /// Two peptides, their linked residues aligned and joined by a bridge. On the
 /// bridge, a triangle per stub found on the whole peptide (the doublet
 /// peaks), pointing to the peptide that carries it; around the residues,
 /// stub-carrying fragment ions as nested hooks in the stub's colour.
-fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel]) {
+fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel], m: &mut MapCtx) {
     let (s0, s1) = (link.sites[0].1, link.sites[1].1);
     let shift = s0.max(s1);
     let (o0, o1) = ((shift - s0) as f32, (shift - s1) as f32);
@@ -1400,7 +1687,9 @@ fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[mode
     let bridge_h = 54.0;
     let label_w = label_width(labels);
     let size = egui::vec2(label_w + CELL.x * cells + 330.0, 2.0 * row_h + bridge_h);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    m.add(response);
+    m.area = Some(rect.with_min_x(rect.left() + label_w - 6.0));
     let painter = ui.painter_at(rect.expand(4.0));
     let text_color = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
@@ -1412,7 +1701,7 @@ fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[mode
     for (k, top, offset) in [(0, top0, o0), (1, top1, o1)] {
         peptide_label(ui, &painter, rect.left(), top + CELL.y / 2.0, label_w, &format!("peptide {}", k + 1), labels.get(k));
         let origin = egui::pos2(x0 + CELL.x * offset, top);
-        draw_peptide(&painter, origin, a, k, &[link.sites[k].1], text_color);
+        draw_peptide(&painter, origin, a, k, &[link.sites[k].1], text_color, m);
         let end = x0 + CELL.x * cells + 14.0;
         painter.text(egui::pos2(end, top + CELL.y / 2.0), egui::Align2::LEFT_CENTER, backbone_text(a, k), small.clone(), weak);
     }
@@ -1441,15 +1730,10 @@ fn crosslink_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[mode
         stubs.dedup();
         let mut x = bx + 12.0;
         for stub in stubs {
-            let color = stub_color(stub);
-            triangle(&painter, egui::pos2(x, y), up, color);
-            let name = painter.text(egui::pos2(x + 8.0, y), egui::Align2::LEFT_CENTER, &link.stubs[stub].name, small.clone(), color);
+            let glyph = Glyph::Stub { peptide: k, stub, link: None };
+            let name = m.stub_glyph(&painter, glyph, egui::pos2(x, y), up, stub_color(stub), &link.stubs[stub].name, small.clone());
             x = name.right() + 12.0;
         }
-    }
-    if !link.stubs.is_empty() {
-        ui.interact(rect.with_min_x(x0 - 6.0), ui.id().with("stub_summary"), egui::Sense::hover())
-            .on_hover_text(stub_summary(a, link));
     }
 }
 
@@ -1502,7 +1786,7 @@ const LANE: f32 = 12.0;
 /// that linker broke (pointing at the side carrying it), after a peptide
 /// with two or more links its peptide + stubs peaks, and around the residues
 /// the stub-carrying fragment ions as nested hooks.
-fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel]) {
+fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel], m: &mut MapCtx) {
     let lengths: Vec<usize> = a.coverage.iter().map(|c| c.residues.len()).collect();
     let l = species::layout(&lengths, &link.links);
     let rows = l.rows.len() as f32;
@@ -1520,7 +1804,9 @@ fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model:
         .weak()
         .small(),
     );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    m.add(response);
+    m.area = Some(rect.with_min_x(rect.left() + label_w - 6.0));
     let painter = ui.painter_at(rect.expand(4.0));
     let text_color = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
@@ -1535,16 +1821,24 @@ fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model:
         let y = top(row);
         peptide_label(ui, &painter, rect.left(), y + CELL.y / 2.0, label_w, &format!("peptide {}", k + 1), labels.get(k));
         let origin = egui::pos2(x0 + CELL.x * l.offsets[row] as f32, y);
-        draw_peptide(&painter, origin, a, k, &link.ends_of(k), text_color);
+        draw_peptide(&painter, origin, a, k, &link.ends_of(k), text_color, m);
         // a peptide with two or more links, freed whole with its stubs
         let mut x = text_x;
         for set in peptide_stub_sets(a, link, k) {
+            let glyph = Glyph::Stubs { peptide: k, stubs: highlight::stub_mask(&set) };
+            let start = egui::pos2(x + 5.0, y + CELL.y / 2.0);
             for &stub in &set {
-                triangle(&painter, egui::pos2(x + 5.0, y + CELL.y / 2.0), true, stub_color(stub));
+                triangle(&painter, egui::pos2(x + 5.0, y + CELL.y / 2.0), true, m.look(&glyph, stub_color(stub)).1);
                 x += 11.0;
             }
             let names = set.iter().map(|&j| link.stubs[j].name.as_str()).collect::<Vec<_>>().join("+");
-            let r = painter.text(egui::pos2(x + 2.0, y + CELL.y / 2.0), egui::Align2::LEFT_CENTER, names, small.clone(), weak);
+            let (picked, color) = m.look(&glyph, weak);
+            let r = painter.text(egui::pos2(x + 2.0, y + CELL.y / 2.0), egui::Align2::LEFT_CENTER, names, small.clone(), color);
+            if picked {
+                let frame = egui::Rect::from_min_max(start - egui::vec2(10.0, 11.0), r.right_center() + egui::vec2(5.0, 11.0));
+                painter.rect_stroke(frame, 6.0, egui::Stroke::new(1.6_f32, m.accent), egui::StrokeKind::Outside);
+            }
+            m.hits.push((vec![start, r.right_center()], glyph));
             x = r.right() + 12.0;
         }
         painter.text(egui::pos2(x, y + CELL.y / 2.0), egui::Align2::LEFT_CENTER, backbone_text(a, k), small.clone(), weak);
@@ -1587,33 +1881,30 @@ fn species_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model:
         for ((row, _), x, y, up) in [(b.upper, x_upper_end, yu + 13.0, true), (b.lower, x_lower_end, yl - 13.0, false)] {
             let mut x = x + 12.0;
             for stub in bridge_end_stubs(a, link, b.link, l.rows[row]) {
-                let color = stub_color(stub);
-                triangle(&painter, egui::pos2(x, y), up, color);
-                let r = painter.text(egui::pos2(x + 8.0, y), egui::Align2::LEFT_CENTER, &link.stubs[stub].name, small.clone(), color);
+                let glyph = Glyph::Stub { peptide: l.rows[row], stub, link: Some(b.link) };
+                let r = m.stub_glyph(&painter, glyph, egui::pos2(x, y), up, stub_color(stub), &link.stubs[stub].name, small.clone());
                 x = r.right() + 12.0;
             }
         }
     }
-    if !link.stubs.is_empty() {
-        ui.interact(rect.with_min_x(x0 - 6.0), ui.id().with("stub_summary"), egui::Sense::hover())
-            .on_hover_text(stub_summary(a, link));
-    }
 }
 
 /// One peptide with a bracket under it joining its two linked residues
-fn loop_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel]) {
+fn loop_map(ui: &mut Ui, a: &Annotation, link: &model::Link, labels: &[model::PeptideLabel], m: &mut MapCtx) {
     let (i0, i1) = (link.sites[0].1.min(link.sites[1].1), link.sites[0].1.max(link.sites[1].1));
     let n = a.coverage[0].residues.len() as f32;
     let row_h = CELL.y + 2.0 * PAD;
     let label_w = label_width(labels);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(label_w + CELL.x * n + 330.0, row_h + 24.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(label_w + CELL.x * n + 330.0, row_h + 24.0), egui::Sense::click());
+    m.add(response);
+    m.area = Some(rect.with_min_x(rect.left() + label_w - 6.0));
     let painter = ui.painter_at(rect.expand(4.0));
     let text_color = ui.visuals().text_color();
     let weak = ui.visuals().weak_text_color();
     let x0 = rect.left() + label_w;
     let top = rect.top() + PAD;
     peptide_label(ui, &painter, rect.left(), top + CELL.y / 2.0, label_w, "loop-link", labels.first());
-    draw_peptide(&painter, egui::pos2(x0, top), a, 0, &[i0, i1], text_color);
+    draw_peptide(&painter, egui::pos2(x0, top), a, 0, &[i0, i1], text_color, m);
     let (xa, xb) = (x0 + CELL.x * (i0 as f32 + 0.5), x0 + CELL.x * (i1 as f32 + 0.5));
     let (y0, y1) = (top + CELL.y + 4.0, top + CELL.y + PAD + 8.0);
     let stroke = egui::Stroke::new(3.0_f32, weak);
@@ -1701,7 +1992,9 @@ mod test {
         let (_, a) = model::test::cleaved_dsso();
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a, &[]));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                coverage_view(ui, &a, &[], &Highlight::default());
+            });
         });
         let (mut triangles, mut segments, mut texts) = (Vec::new(), Vec::new(), Vec::new());
         for clipped in &output.shapes {
@@ -1764,7 +2057,9 @@ mod test {
         let texts = |a: &Annotation, labels: &[model::PeptideLabel]| {
             let ctx = egui::Context::default();
             let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, a, labels));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    coverage_view(ui, a, labels, &Highlight::default());
+                });
             });
             output
                 .shapes
@@ -1799,7 +2094,9 @@ mod test {
         let (_, a) = model::test::cleaved_multi();
         let ctx = egui::Context::default();
         let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| coverage_view(ui, &a, &[]));
+            egui::CentralPanel::default().show(ctx, |ui| {
+                coverage_view(ui, &a, &[], &Highlight::default());
+            });
         });
         let (mut triangles, mut segments, mut texts) = (Vec::new(), Vec::new(), Vec::new());
         for clipped in &output.shapes {
@@ -1909,6 +2206,153 @@ mod test {
                 println!("{name}: {:#?}", harness.state().labels);
                 harness.render().unwrap().save(Path::new(&out).join(name)).unwrap();
             }
+        }
+    }
+
+    /// Pictures of ions picked out both ways on a real crosslink, with the
+    /// pointer moved as a user would: onto a peak, a hook and a stub
+    /// triangle, and a peak clicked. `SAGE_GUI_RESULTS=<folder>
+    /// SAGE_GUI_FIGURES=<out>`; `SAGE_GUI_PICK=n` takes the n-th best crosslink.
+    #[test]
+    #[ignore]
+    fn ion_highlight_pictures() {
+        use egui_kittest::Harness;
+        let folder = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let pick: usize = std::env::var("SAGE_GUI_PICK").ok().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let mut viewer = Viewer::default();
+        viewer.open(&folder);
+        viewer.wait_until_open();
+        let results = viewer.results.clone().unwrap();
+        let i = viewer.shown.iter().copied().filter(|&i| results.matches[i].kind == Kind::Crosslink).nth(pick).unwrap();
+        viewer.selected = Some(i);
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1500.0, 1250.0)).build_ui_state(
+            move |ui, v: &mut Viewer| {
+                if !installed {
+                    crate::theme::install(ui.ctx(), false);
+                    installed = true;
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| v.ui(ui, "", &mut crate::library::Library::default()));
+            },
+            viewer,
+        );
+        let t = std::time::Instant::now();
+        while harness.state().annotated != Some((i, harness.state().model)) && t.elapsed().as_secs() < 90 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        harness.run_steps(4);
+        let shot = |h: &mut Harness<'_, Viewer>, name: &str| {
+            h.render().unwrap().save(out.join(name)).unwrap();
+            println!("{}", out.join(name).display());
+        };
+        let point = |h: &mut Harness<'_, Viewer>, at: egui::Pos2| {
+            h.input_mut().events.push(egui::Event::PointerMoved(at));
+            h.run_steps(4);
+        };
+        shot(&mut harness, "highlight_0_none.png");
+        let (ions, peaks, transform, first_hits) = {
+            let v = harness.state();
+            let Some(Ok(a)) = &v.annotation else { panic!("not annotated") };
+            println!("{} · {} ions", a.proforma, v.ions.len());
+            (v.ions.clone(), a.peaks.clone(), v.plot_transform.unwrap(), v.map_hits.clone())
+        };
+        let intensity = |ion: &highlight::Ion| peaks[ion.peak].intensity;
+        let at_peak = |p: usize| transform.position_from_point(&PlotPoint::new(peaks[p].mz, peaks[p].intensity as f64 * 0.5));
+
+        // 1. the pointer on a peak: the most intense backbone ion, and one holding both peptides
+        let hooks = || ions.iter().filter(|i| matches!(i.glyph, Some(Glyph::Hook { .. })));
+        let strongest = hooks().max_by(|x, y| intensity(x).total_cmp(&intensity(y))).expect("a backbone ion");
+        point(&mut harness, at_peak(strongest.peak));
+        assert_eq!(harness.state().hovered_ion, Some(Focus::Peak(strongest.peak)), "the peak under the pointer");
+        println!("peak: {} {:?}", strongest.text, strongest.residues);
+        shot(&mut harness, "highlight_1_peak.png");
+        if let Some(both) = hooks().filter(|i| i.residues.len() > 1).max_by(|x, y| intensity(x).total_cmp(&intensity(y))) {
+            point(&mut harness, at_peak(both.peak));
+            println!("peak holding both peptides: {} {:?}", both.text, both.residues);
+            shot(&mut harness, "highlight_2_peak_both_peptides.png");
+        }
+
+        // 2. the pointer on a glyph: the hook with the most peaks, a stub triangle, a stub hook
+        let peaks_of = |g: Glyph| Highlight::of(&ions, Focus::Glyph(g)).peaks.len();
+        for (name, wanted) in [
+            ("highlight_3_hook.png", 0),
+            ("highlight_4_stub_triangle.png", 1),
+            ("highlight_5_stub_hook.png", 2),
+        ] {
+            let hit = first_hits
+                .iter()
+                .filter(|(_, g)| match wanted {
+                    0 => matches!(g, Glyph::Hook { .. }),
+                    1 => matches!(g, Glyph::Stub { .. }),
+                    _ => matches!(g, Glyph::StubHook { .. }),
+                })
+                .max_by_key(|(_, g)| peaks_of(*g));
+            let Some(&(_, g)) = hit else { continue };
+            // where it is drawn now (the map does not move), on the hook's corner or the triangle
+            let points = harness.state().map_hits.iter().find(|(_, h)| *h == g).unwrap().0.clone();
+            assert_eq!(points, hit.unwrap().0, "the map stays put whatever is picked out");
+            let at = if points.len() == 3 { points[1] } else { points[0] };
+            point(&mut harness, at);
+            assert_eq!(harness.state().hovered_ion, Some(Focus::Glyph(g)), "the glyph under the pointer");
+            println!("{name}: {g:?}: {} peaks", peaks_of(g));
+            shot(&mut harness, name);
+        }
+
+        // 3. a peak clicked stays picked out with the pointer away
+        let at = at_peak(strongest.peak);
+        point(&mut harness, at);
+        for pressed in [true, false] {
+            harness.input_mut().events.push(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            });
+            harness.step();
+        }
+        point(&mut harness, egui::pos2(5.0, 1240.0));
+        assert_eq!(harness.state().pinned_ion, Some(Focus::Peak(strongest.peak)));
+        shot(&mut harness, "highlight_6_clicked.png");
+
+        // 4. the figure exported with the ion clicked picked out
+        {
+            let v = harness.state();
+            let Some(Ok(a)) = &v.annotation else { panic!("not annotated") };
+            let options = figure::FigureOptions {
+                background: true,
+                title: Some(results.matches[i].title()),
+                label_all: false,
+                mz_range: None,
+                coverage: true,
+                dpi: 150,
+                highlight: v.pinned_ion.map(|f| Highlight::of(&v.ions, f)),
+            };
+            let image = figure::rasterize(&figure::svg(a, &options), 150).unwrap();
+            image.save(out.join("highlight_7_figure.png")).unwrap();
+            println!("{}", out.join("highlight_7_figure.png").display());
+        }
+
+        // 5. a multivalent species: the pointer on a triangle by a bridge, or after a row
+        let species: Vec<usize> = harness.state().shown.iter().copied().filter(|&i| results.matches[i].kind == Kind::Multi).take(30).collect();
+        for j in species {
+            harness.state_mut().selected = Some(j);
+            let t = std::time::Instant::now();
+            while harness.state().annotated != Some((j, harness.state().model)) && t.elapsed().as_secs() < 60 {
+                harness.step();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            point(&mut harness, egui::pos2(5.0, 1240.0));
+            let hits = harness.state().map_hits.clone();
+            let Some((points, g)) = hits.iter().find(|(_, g)| matches!(g, Glyph::Stubs { .. })).or_else(|| hits.iter().find(|(_, g)| matches!(g, Glyph::Stub { link: Some(_), .. }))) else { continue };
+            point(&mut harness, points[0]);
+            assert_eq!(harness.state().hovered_ion, Some(Focus::Glyph(*g)));
+            println!("multivalent {}: {g:?}", results.matches[j].title());
+            shot(&mut harness, "highlight_8_multivalent.png");
+            break;
         }
     }
 
@@ -2405,5 +2849,79 @@ mod test {
         assert_eq!(scroll_into_view(10, 30.0, 24.0, (0.0, 300.0)), Some(24.0), "just enough to show it");
         assert_eq!(scroll_into_view(3, 30.0, 24.0, (120.0, 300.0)), Some(90.0), "above: at the top");
         assert_eq!(scroll_into_view(4, 30.0, 24.0, (120.0, 300.0)), None);
+    }
+
+    /// Draw the map of `a` headlessly with `hl`: its shapes, and where its glyphs are
+    fn draw_map(a: &Annotation, hl: &Highlight) -> (Vec<egui::epaint::ClippedShape>, Vec<(Vec<egui::Pos2>, Glyph)>) {
+        let ctx = egui::Context::default();
+        let mut hits = Vec::new();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| hits = coverage_view(ui, a, &[], hl).2);
+        });
+        (output.shapes, hits)
+    }
+
+    /// Every glyph of the map stands for peaks, and every ion with a glyph
+    /// has it drawn (to point at): a crosslink and a multivalent species
+    #[test]
+    fn every_glyph_has_its_peaks_and_every_ion_its_glyph() {
+        for (name, (_, a)) in [("crosslink", model::test::cleaved_dsso()), ("species", model::test::cleaved_multi())] {
+            let ions = highlight::ions(&a);
+            let (_, hits) = draw_map(&a, &Highlight::default());
+            let drawn: HashSet<Glyph> = hits.iter().map(|(_, g)| *g).collect();
+            for g in &drawn {
+                assert!(!Highlight::of(&ions, Focus::Glyph(*g)).peaks.is_empty(), "{name}: {g:?} has no peaks");
+            }
+            for ion in &ions {
+                if let Some(g) = ion.glyph {
+                    assert!(drawn.contains(&g), "{name}: {} ({g:?}) is not drawn", ion.text);
+                }
+            }
+            assert!(drawn.iter().any(|g| matches!(g, Glyph::Stub { .. })) && drawn.iter().any(|g| matches!(g, Glyph::StubHook { .. })));
+            if name == "species" {
+                assert!(drawn.iter().any(|g| matches!(g, Glyph::Stubs { .. })) && drawn.iter().any(|g| matches!(g, Glyph::Stub { link: Some(_), .. })));
+            }
+        }
+    }
+
+    /// A triangle picked out: ringed, the other glyphs faded; the pointer on
+    /// it (or its name) finds it
+    #[test]
+    fn picked_glyphs_stand_out_and_others_fade() {
+        let (_, a) = model::test::cleaved_dsso();
+        let ions = highlight::ions(&a);
+        let glyph = Glyph::Stub { peptide: 0, stub: 0, link: None };
+        let triangles = |shapes: &[egui::epaint::ClippedShape]| -> Vec<Color32> {
+            shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Path(path) if path.closed && path.points.len() == 3 => Some(path.fill),
+                    _ => None,
+                })
+                .collect()
+        };
+        let rings = |shapes: &[egui::epaint::ClippedShape]| shapes.iter().filter(|c| matches!(c.shape, egui::Shape::Circle(_))).count();
+        let (plain, hits) = draw_map(&a, &Highlight::default());
+        assert_eq!(triangles(&plain).iter().filter(|c| **c == stub_color(0)).count(), 2, "P+A on both peptides");
+        assert_eq!(rings(&plain), 0);
+        let (shapes, _) = draw_map(&a, &Highlight::of(&ions, Focus::Glyph(glyph)));
+        let colors = triangles(&shapes);
+        assert_eq!(colors.iter().filter(|c| **c == stub_color(0)).count(), 1, "the one picked keeps its colour");
+        assert_eq!(colors.iter().filter(|c| **c == stub_color(0).gamma_multiply(0.3)).count(), 1, "the other faded");
+        assert_eq!(rings(&shapes), 1);
+        // the pointer on the triangle or a little right of it, on its name
+        let (points, _) = hits.iter().find(|(_, g)| *g == glyph).unwrap();
+        assert_eq!(glyph_at(&hits, points[0]), Some(glyph));
+        assert_eq!(glyph_at(&hits, points[0] + egui::vec2(9.0, 2.0)), Some(glyph));
+        assert_eq!(glyph_at(&hits, points[0] + egui::vec2(0.0, 30.0)), None, "nothing there");
+    }
+
+    #[test]
+    fn picked_labels_stack_where_they_would_overlap() {
+        // 60 points wide on peaks of one height: the second overlaps the
+        // first, the fourth both; one far right, one on a taller peak
+        let labels = [(100.0, 60.0, 300.0), (130.0, 60.0, 300.0), (400.0, 60.0, 300.0), (160.0, 60.0, 300.0), (100.0, 60.0, 100.0)];
+        assert_eq!(label_levels(&labels, 17.0), vec![0, 1, 0, 2, 0]);
+        assert!(label_levels(&[], 17.0).is_empty());
     }
 }
