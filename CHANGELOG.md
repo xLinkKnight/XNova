@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- sage-gui always uses the sage.exe next to sage-gui.exe when it starts, whatever sage.exe it used before. It used to keep the sage.exe it remembered from an earlier run (`%APPDATA%\sage-gui\state.json`) as long as that file existed, so after an upgrade it could run an older sage.exe from another folder, which stopped at the new settings it did not know (e.g. `unknown field precursor_window`).
+- sage-gui asks sage.exe its version, and says so under Files > Programs, in the messages at start-up and when Run is pressed: an error (the search does not start) when sage.exe is missing or of another version than sage-gui, a warning when there is no sage.exe next to sage-gui.exe or another one is set, or when it does not report its version. Another sage.exe set under Files > Programs is used until sage-gui closes.
+
 ## [v1.8.5] - 2026-11-14
 
 ### Added

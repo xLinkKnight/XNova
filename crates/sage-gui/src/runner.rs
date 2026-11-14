@@ -206,12 +206,108 @@ fn read_lines(source: impl Read, push: &(dyn Fn(String) + Sync)) {
     }
 }
 
-/// `sage.exe` next to this program (both are built into `target\release`)
+/// `sage.exe` next to this program (both are built into `target\release`,
+/// and released in one folder)
 pub fn find_sage() -> Option<PathBuf> {
+    let candidate = sage_beside()?;
+    candidate.is_file().then_some(candidate)
+}
+
+/// Where `sage.exe` belongs: next to this program
+pub fn sage_beside() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let name = if cfg!(windows) { "sage.exe" } else { "sage" };
-    let candidate = exe.parent()?.join(name);
-    candidate.is_file().then_some(candidate)
+    Some(exe.parent()?.join(name))
+}
+
+/// The version a `sage.exe` reports for `--version` (`sage 1.8.6` → `1.8.6`);
+/// `None` if it cannot be run or does not say
+pub fn sage_version(sage: &Path) -> Option<String> {
+    if !sage.is_file() {
+        return None;
+    }
+    let mut cmd = Command::new(sage);
+    cmd.arg("--version");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    parse_sage_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The version in `sage --version`'s answer (`sage 1.8.6`)
+pub fn parse_sage_version(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("sage"), Some(v)) if v.chars().next().is_some_and(|c| c.is_ascii_digit()) => Some(v.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// What is wrong with the `sage.exe` sage-gui is set to run, as `(error?,
+/// message)`: errors stop a search, warnings do not. `chosen` is the one
+/// set (Files > Programs), `beside` the one next to sage-gui.exe if there is
+/// one, `beside_place` where that would be, `version` what `chosen` reports
+/// and `own` sage-gui's version. Empty when all is well.
+pub fn sage_problems(chosen: &Path, beside: Option<&Path>, beside_place: Option<&Path>, version: Option<&str>, own: &str) -> Vec<(bool, String)> {
+    let folder = beside_place.and_then(Path::parent).map_or_else(|| "sage-gui's folder".to_string(), |p| p.display().to_string());
+    let release = format!("the sage.exe of this release (XNova {own})");
+    if chosen.as_os_str().is_empty() || !chosen.is_file() {
+        return vec![(
+            true,
+            format!("sage.exe not found: put {release} next to sage-gui.exe ({folder}), or set its location under Files > Programs."),
+        )];
+    }
+    let mut out = Vec::new();
+    match beside {
+        None => out.push((
+            false,
+            format!(
+                "There is no sage.exe next to sage-gui.exe ({folder}), so {} is used. sage.exe and \
+                 sage-gui.exe of one release belong in the same folder.",
+                chosen.display()
+            ),
+        )),
+        Some(beside) if !same_file(beside, chosen) => out.push((
+            false,
+            format!("Using {} (set under Files > Programs), not the sage.exe next to sage-gui.exe ({}).", chosen.display(), beside.display()),
+        )),
+        Some(_) => {}
+    }
+    match version {
+        Some(v) if v == own => {}
+        Some(v) => out.push((
+            true,
+            format!(
+                "{} is version {v}, but this sage-gui is version {own}: sage.exe may not read the \
+                 settings sage-gui writes (an older one stops at settings it does not know). Use {release}: \
+                 put it next to sage-gui.exe, or set it under Files > Programs.",
+                chosen.display()
+            ),
+        )),
+        None => out.push((
+            false,
+            format!(
+                "{} did not report its version, so it may be from another release (this sage-gui is version \
+                 {own}); if the search stops at settings it does not know, use {release}.",
+                chosen.display()
+            ),
+        )),
+    }
+    out
+}
+
+/// Are two paths the same file (whatever their spelling)?
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 /// The newest ProteoWizard msconvert in the usual install locations
@@ -321,5 +417,55 @@ mod raw_conversion_test {
         let msconvert = args(conversion_step(Path::new("C:/ProteoWizard/msconvert.exe"), raw, out, true));
         assert!(msconvert.contains(&"--mzML".to_string()) && !msconvert.contains(&"-N".to_string()));
         assert_eq!(conversion_step(trfp, raw, out, false).skip_if_exists, Some(out.join("run1.mzML")));
+    }
+}
+
+#[cfg(test)]
+mod sage_exe_tests {
+    use super::*;
+
+    #[test]
+    fn sage_versions_are_read() {
+        assert_eq!(parse_sage_version("sage 1.8.6\n").as_deref(), Some("1.8.6"));
+        assert_eq!(parse_sage_version("[log] something\nsage 1.0.0\r\n").as_deref(), Some("1.0.0"));
+        assert_eq!(parse_sage_version("error: unexpected argument"), None);
+        assert_eq!(parse_sage_version("sage"), None);
+    }
+
+    /// The sage.exe next to sage-gui is the one to use; a missing one is an
+    /// error, one elsewhere a warning, one of another version an error
+    #[test]
+    fn sage_exe_problems() {
+        let dir = std::env::temp_dir().join(format!("xnova_sage_check_{}", std::process::id()));
+        let (gui_dir, other_dir) = (dir.join("release"), dir.join("old"));
+        std::fs::create_dir_all(&gui_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let (beside, other) = (gui_dir.join("sage.exe"), other_dir.join("sage.exe"));
+        std::fs::write(&beside, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        let errors = |p: &[(bool, String)]| p.iter().filter(|(e, _)| *e).count();
+        let warnings = |p: &[(bool, String)]| p.iter().filter(|(e, _)| !*e).count();
+
+        // next to sage-gui, same version: nothing to say
+        assert!(sage_problems(&beside, Some(&beside), Some(&beside), Some("1.8.6"), "1.8.6").is_empty());
+        // of another version: an error that names both versions
+        let p = sage_problems(&beside, Some(&beside), Some(&beside), Some("1.0.0"), "1.8.6");
+        assert_eq!((errors(&p), warnings(&p)), (1, 0));
+        assert!(p[0].1.contains("version 1.0.0") && p[0].1.contains("version 1.8.6"), "{}", p[0].1);
+        // none next to sage-gui, an old one elsewhere: a warning and an error
+        let p = sage_problems(&other, None, Some(&beside.with_file_name("missing.exe")), Some("1.0.0"), "1.8.6");
+        assert_eq!((errors(&p), warnings(&p)), (1, 1));
+        assert!(p[0].1.contains("no sage.exe next to sage-gui.exe"), "{}", p[0].1);
+        // another one chosen while one is next to sage-gui: a warning
+        let p = sage_problems(&other, Some(&beside), Some(&beside), Some("1.8.6"), "1.8.6");
+        assert_eq!((errors(&p), warnings(&p)), (0, 1));
+        // no version reported: a warning
+        let p = sage_problems(&beside, Some(&beside), Some(&beside), None, "1.8.6");
+        assert_eq!((errors(&p), warnings(&p)), (0, 1));
+        // none at all: an error, and nothing else
+        let p = sage_problems(Path::new(""), None, Some(&beside), None, "1.8.6");
+        assert_eq!((errors(&p), warnings(&p)), (1, 0));
+        assert!(p[0].1.starts_with("sage.exe not found") && p[0].1.contains("XNova 1.8.6"), "{}", p[0].1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -214,6 +214,8 @@ struct SageGui {
     estimate_text: Option<Result<String, String>>,
     /// sage.exe path the GPU support was checked for
     probed_sage: String,
+    /// sage.exe path whose version was asked, and its answer
+    sage_version: (String, Option<String>),
     /// The "Annotated spectra" tab
     viewer: viewer::Viewer,
     /// The local xiVIEW server, started on first use
@@ -265,6 +267,7 @@ impl SageGui {
             estimate: None,
             estimate_text: None,
             probed_sage: String::new(),
+            sage_version: (String::new(), None),
             viewer: Default::default(),
             xiview: None,
             xiview_fdr: Default::default(),
@@ -291,9 +294,14 @@ impl SageGui {
                 app.s = s;
             }
         }
-        if !Path::new(&app.sage_exe).is_file() {
-            app.sage_exe = runner::find_sage().map(|p| p.display().to_string()).unwrap_or_default();
+        // the sage.exe next to sage-gui.exe comes first, whatever was used
+        // before: the two are released together (an older one elsewhere
+        // stops at settings it does not know)
+        if let Some(beside) = runner::find_sage() {
+            app.sage_exe = beside.display().to_string();
         }
+        // a missing sage.exe, one elsewhere or of another version: said at once
+        app.problems = app.sage_checks();
         if app.converter_exe.is_empty() {
             app.converter_exe = runner::find_msconvert()
                 .map(|p| p.display().to_string())
@@ -483,12 +491,32 @@ impl SageGui {
         ui.horizontal(|ui| self.xiview_status(ui));
     }
 
+    /// What is wrong with the sage.exe set to run (see [`runner::sage_problems`]);
+    /// its version is asked once for each path
+    fn sage_checks(&mut self) -> Vec<(bool, String)> {
+        if self.sage_version.0 != self.sage_exe {
+            self.sage_version = (self.sage_exe.clone(), runner::sage_version(Path::new(&self.sage_exe)));
+        }
+        let beside = runner::find_sage();
+        runner::sage_problems(
+            Path::new(&self.sage_exe),
+            beside.as_deref(),
+            runner::sage_beside().as_deref(),
+            self.sage_version.1.as_deref(),
+            env!("CARGO_PKG_VERSION"),
+        )
+    }
+
     /// Check the settings, write the configuration into the output folder
     /// and start converting / searching
     fn start_run(&mut self, ctx: &egui::Context) {
         let (mut errors, mut warnings) = self.s.check();
-        if !Path::new(&self.sage_exe).is_file() {
-            errors.push("sage.exe not found: set its location under Files > Programs.".into());
+        for (is_error, message) in self.sage_checks() {
+            if is_error {
+                errors.push(message);
+            } else {
+                warnings.push(message);
+            }
         }
         // Only non-cleavable searches use the backend (see Crosslinking tab)
         let xl = &self.s.crosslink;
@@ -1298,14 +1326,32 @@ impl SageGui {
             row(
                 ui,
                 "sage.exe",
-                "The Sage search engine. Found automatically when sage.exe sits next to sage-gui.exe \
-                 (both are built into target\\release).",
+                "The Sage search engine: the sage.exe released with this sage-gui. The one next to \
+                 sage-gui.exe is always used when sage-gui starts (both are released in one folder, and \
+                 built into target\\release); another one set here is used until sage-gui closes. sage-gui \
+                 asks it its version and says so when it is missing, elsewhere or of another version.",
                 |ui| {
                     path_field(ui, &mut self.sage_exe, "C:\\Tools\\sage\\sage.exe", || {
                         rfd::FileDialog::new().add_filter("Programs", &["exe"]).pick_file()
                     })
                 },
             );
+            // what is wrong with it, under its field
+            let checks = self.sage_checks();
+            if !checks.is_empty() {
+                ui.label("");
+                ui.vertical(|ui| {
+                    for (is_error, message) in &checks {
+                        let (icon, color) = if *is_error {
+                            ("✖", Color32::from_rgb(210, 60, 60))
+                        } else {
+                            ("ℹ", Color32::from_rgb(200, 150, 30))
+                        };
+                        ui.add(egui::Label::new(RichText::new(format!("{icon} {message}")).color(color)).wrap());
+                    }
+                });
+                ui.end_row();
+            }
             row(ui, "Thermo .raw files", RAW_TIP, |ui| {
                 let r = ui.radio_value(&mut self.convert_raw, false, "read directly (sage.exe)");
                 r | ui.radio_value(&mut self.convert_raw, true, "convert to mzML first")
@@ -3225,6 +3271,45 @@ mod screenshots {
             harness.render().expect("render").save(&path).unwrap();
             println!("{}", path.display());
         }
+    }
+
+    /// An old sage.exe set to run (`SAGE_GUI_OLD_SAGE`, e.g. garlic 1.0.0):
+    /// sage-gui asks its version and says it is not this release's, under
+    /// its field and at Run, and that it is not the one beside sage-gui (as
+    /// the test binary's): `gui_old_sage.png` in `SAGE_GUI_FIGURES`
+    #[test]
+    #[ignore]
+    fn old_sage_exe_is_reported() {
+        let old = std::env::var("SAGE_GUI_OLD_SAGE").expect("set SAGE_GUI_OLD_SAGE");
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut app: Option<SageGui> = None;
+        let mut checks = Vec::new();
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1100.0, 1700.0))
+            .build_ui(|ui| {
+                let Some(app) = app.as_mut() else {
+                    theme::install(ui.ctx(), false);
+                    let mut new = SageGui::new(ui.ctx());
+                    new.s = Settings::default();
+                    new.sage_exe = old.clone();
+                    checks = new.sage_checks();
+                    app = Some(new);
+                    return;
+                };
+                egui::ScrollArea::vertical().show(ui, |ui| app.files_tab(ui));
+            });
+        // (a spinner keeps repainting: a set number of frames)
+        harness.run_steps(6);
+        let path = out.join("gui_old_sage.png");
+        harness.render().expect("render").save(&path).unwrap();
+        drop(harness);
+        for (is_error, message) in &checks {
+            println!("{} {message}", if *is_error { "ERROR" } else { "warning" });
+        }
+        assert!(checks.iter().any(|(e, m)| *e && m.contains(&format!("but this sage-gui is version {}", env!("CARGO_PKG_VERSION")))));
+        assert!(checks.iter().any(|(e, m)| !*e && m.contains("next to sage-gui.exe")), "said it is not the one beside sage-gui");
+        println!("{}", path.display());
     }
 
     /// The whole window (toolbar, tabs, settings, Run button) in the light and
