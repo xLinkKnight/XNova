@@ -24,7 +24,7 @@ const PROTON: f64 = 1.007_276_466_6;
 pub struct Fdr(pub f32);
 
 impl Default for Fdr {
-    /// 1%, as `crosslinks_FDRfiltered.sage.tsv`
+    /// 1%, the level of `crosslinks_FDRfiltered.sage.tsv`
     fn default() -> Self {
         Fdr(0.01)
     }

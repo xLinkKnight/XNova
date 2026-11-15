@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - An MS2 scan with no precursor (neither a selected ion nor an isolation window target) no longer stops the search with a panic: it is skipped, and the log says how many such scans each file had (as in lazear/sage#248).
 - mzML arrays in an MS-Numpress encoding are refused with an error naming the encoding. They used to be read as plain floats (wrong m/z values) or dropped, depending on the order of their parameters.
+- Crosslink FDR: `crosslinks_FDRfiltered.sage.tsv` kept target-target matches by their CSM q-value alone (`spectrum_q` <= 0.01), so the unique crosslinks counted from it were not at 1% FDR: on two synthetic DSSO libraries the maintainer of Sage Plus measured them at 12.3% and 5.3% true FDR, against 4.1% and 2.1% with `crosslink_q` <= 0.01 as well (issue #1). It now requires both, and its log line gives its unique crosslinks. The crosslinked-protein FASTA files (`xlinkProtein_*pctFDR.fasta`), which took a match when either q-value passed, require both too, as the crosslink plot and the spectral library already did.
 
 ## [v1.9.0] - 2026-11-14
 

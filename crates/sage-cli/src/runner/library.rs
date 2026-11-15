@@ -185,7 +185,8 @@ impl Runner {
         let loops = targets.iter().filter(|p| p.peptides.len() == 1).count();
         let multi = matches
             .iter()
-            .filter(|m| m.kind == LinkKind::Multi && m.class == PairClass::TT && m.spectrum_q <= settings.crosslink_fdr)
+            // as the library takes them: both q-values within its FDR
+            .filter(|m| m.kind == LinkKind::Multi && m.accepted(settings.crosslink_fdr))
             .count();
         info!(
             "crosslink library: {} ({loops} of them loop-links){}{}",

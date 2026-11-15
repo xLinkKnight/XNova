@@ -52,7 +52,10 @@ Output: `crosslinks.sage.tsv` (+ `results.json`): every candidate match, one per
 spectrum, targets and decoys, with their q-values (decoys are needed to estimate
 the FDR, and for viewers that filter themselves). `crosslinks_FDRfiltered.sage.tsv`
 has the same columns but only the accepted results: target-target matches with
-`spectrum_q` <= 0.01 (the CSM count reported in the log). `crosslinks_CSMs.csv`
+both `spectrum_q` <= 0.01 and `crosslink_q` <= 0.01, so that the unique
+crosslinks counted from it are at 1% FDR too (see
+[FDR of crosslink searches](#fdr-of-crosslink-searches)); the log gives its
+CSMs and unique crosslinks. `crosslinks_CSMs.csv`
 is a report to read: the target matches at 5% FDR, each peptide in columns of its
 own (see [CSM report](#csm-report)). A linear peptide search of the same
 spectra also runs first (`"linear_search"`, on unless set to `false`) and writes the usual bottom-up
@@ -446,6 +449,18 @@ peptides, but raise `chain_survivors` if you suspect misses.
 sites), from its best CSM. Both are computed separately for loop-links,
 intra-protein links, inter-protein links and multivalent species.
 
+**Count crosslinks with `crosslink_q`.** A CSM q-value controls CSMs, not
+crosslinks: false matches spread over many crosslinks of one CSM each, while
+true ones gather on fewer crosslinks with many CSMs, so the unique crosslinks
+of the CSMs at 1% hold several times more than 1% false ones (on two synthetic
+DSSO libraries, 12.3% and 5.3% true FDR, against 4.1% and 2.1% with
+`crosslink_q` <= 0.01 as well, as measured by the maintainer of Sage Plus).
+`crosslinks_FDRfiltered.sage.tsv`, the crosslinked-protein FASTA files, the
+crosslink plot and the spectral library require both q-values within the
+level; the log's count of unique crosslinks and xiVIEW (the matches of the
+crosslinks at the level) go by `crosslink_q`. The CSM report
+(`crosslinks_CSMs.csv`) is per CSM, with both q-values in its columns.
+
 * **Pairs are ranked by their weaker peptide:** the smaller of `score_a` and
   `score_b`, then the joint `hyperscore`. A pair is only as good as its weaker
   half; ranked by the joint score, one long, well-matched peptide carries a
@@ -537,11 +552,12 @@ all, in the file's order. Each level holds the proteins of the levels below
 it.
 
 * A crosslink-spectrum match counts at a level when it is target-target and
-  its CSM q-value (`spectrum_q`, as `crosslinks_FDRfiltered.sage.tsv` at 1%)
-  **or** its crosslink q-value (`crosslink_q`, as sage-gui's FDR setting for
-  xiVIEW and the crosslink plot) is at or below it. Whichever of the two
-  q-values the results are used at, no protein of them is missing from the
-  file of that level.
+  **both** its CSM q-value (`spectrum_q`) and its crosslink q-value
+  (`crosslink_q`) are at or below it, as in `crosslinks_FDRfiltered.sage.tsv`
+  (at 1%) and the crosslink plot: the file holds the proteins of the
+  crosslinks at that FDR. (Up to v1.9.0 either q-value was enough, which took
+  in proteins of crosslinks well over the level; see
+  [FDR of crosslink searches](#fdr-of-crosslink-searches).)
 * Both peptides of a pair, the peptide of a loop-link and every peptide of a
   multivalent species count, each with every protein it is found in (a
   peptide shared by several proteins brings all of them).

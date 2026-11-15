@@ -5,15 +5,15 @@
 //! proteins, e.g. for a second search or for structural modelling, at
 //! whichever FDR the results are used.
 //!
-//! A crosslink match counts at a level when it is target-target and its CSM
-//! q-value (`spectrum_q`, as `crosslinks_FDRfiltered.sage.tsv`) or its
-//! crosslink q-value (`crosslink_q`, as sage-gui's FDR setting for xiVIEW)
-//! is at or below it, so that no protein of the results at that level is
-//! missing, whichever of the two is used.
+//! A crosslink match counts at a level when it is accepted there
+//! ([`CrosslinkMatch::accepted`]: target-target, with both its CSM q-value
+//! and its crosslink's at or below it), as in `crosslinks_FDRfiltered.sage.tsv`
+//! and the crosslink plot: the proteins are those of the crosslinks at that
+//! FDR. (Either q-value alone took in proteins of crosslinks well over it.)
 
 use super::Runner;
 use log::{info, warn};
-use sage_core::crosslink::{CrosslinkMatch, PairClass};
+use sage_core::crosslink::CrosslinkMatch;
 use sage_core::database::IndexedDatabase;
 use std::collections::{BTreeSet, HashSet};
 
@@ -24,10 +24,10 @@ pub const LEVELS: [(f32, &str); 3] = [
     (0.10, "xlinkProtein_10pctFDR.fasta"),
 ];
 
-/// A crosslink match within FDR `level`: target-target, with its CSM or its
-/// crosslink q-value at or below `level`
+/// A crosslink match within FDR `level`: target-target, with both its CSM
+/// and its crosslink q-value at or below `level`
 pub fn within(m: &CrosslinkMatch, level: f32) -> bool {
-    m.class == PairClass::TT && (m.spectrum_q <= level || m.crosslink_q <= level)
+    m.accepted(level)
 }
 
 /// The proteins (accessions) of `matches`: both peptides of a pair, the
@@ -111,7 +111,7 @@ impl Runner {
 mod test {
     use super::*;
     use crate::runner::crosslink_export::test::{csm, find, fixture};
-    use sage_core::crosslink::{LinkKind, Species};
+    use sage_core::crosslink::{LinkKind, PairClass, Species};
 
     #[test]
     fn records_are_copied_whole() {
@@ -157,8 +157,8 @@ mod test {
         assert!(crosslinked_proteins(&db, []).is_empty());
     }
 
-    /// The levels nest: a match within 1% is within 5% and 10%; either
-    /// q-value counts; decoys never do
+    /// The levels nest: a match within 1% is within 5% and 10%; it needs both
+    /// q-values within the level, its CSM's and its crosslink's; decoys never
     #[test]
     fn matches_within_each_level() {
         let (db, ..) = fixture();
@@ -169,10 +169,12 @@ mod test {
             m.spectrum_q = spectrum_q;
             LEVELS.iter().filter(|(level, _)| within(&m, *level)).count()
         };
-        assert_eq!(at(0.004, 0.2, PairClass::TT), 3, "CSM q-value within 1%");
-        assert_eq!(at(0.5, 0.004, PairClass::TT), 3, "crosslink q-value within 1%");
-        assert_eq!(at(0.03, 0.2, PairClass::TT), 2, "5% and 10%");
-        assert_eq!(at(0.2, 0.08, PairClass::TT), 1, "10% only");
+        assert_eq!(at(0.004, 0.004, PairClass::TT), 3, "both within 1%");
+        assert_eq!(at(0.004, 0.2, PairClass::TT), 0, "its crosslink is not within 10%");
+        assert_eq!(at(0.5, 0.004, PairClass::TT), 0, "the match itself is not within 10%");
+        assert_eq!(at(0.004, 0.03, PairClass::TT), 2, "5% and 10%: the crosslink's q-value decides");
+        assert_eq!(at(0.03, 0.004, PairClass::TT), 2, "5% and 10%: the match's q-value decides");
+        assert_eq!(at(0.08, 0.08, PairClass::TT), 1, "10% only");
         assert_eq!(at(0.2, 0.2, PairClass::TT), 0);
         assert_eq!(at(0.001, 0.001, PairClass::TD), 0, "decoys never");
         assert_eq!(at(0.001, 0.001, PairClass::DD), 0);

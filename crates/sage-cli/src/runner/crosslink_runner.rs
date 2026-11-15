@@ -216,14 +216,18 @@ impl Runner {
         let reporters_out = tmt.as_ref().map(|_| &reporters);
         let path = self.write_crosslinks("crosslinks.sage.tsv", &matches, &filenames, reporters_out)?;
         self.parameters.output_paths.push(path);
-        // Only the accepted results: target-target CSMs at 1% FDR
-        let accepted = matches
-            .iter()
-            .filter(|m| m.class == PairClass::TT && m.spectrum_q <= FDR_CUTOFF)
-            .cloned()
-            .collect::<Vec<_>>();
+        // Only the accepted results: target-target CSMs at 1% FDR whose
+        // crosslinks are at 1% FDR too, so that unique crosslinks counted
+        // from the file are at 1% (`CrosslinkMatch::accepted`)
+        let accepted = matches.iter().filter(|m| m.accepted(FDR_CUTOFF)).cloned().collect::<Vec<_>>();
         let path = self.write_crosslinks(FDR_FILTERED, &accepted, &filenames, reporters_out)?;
-        info!("wrote {} ({} target crosslink-spectrum matches at 1% FDR)", FDR_FILTERED, accepted.len());
+        let unique = accepted.iter().map(sage_core::crosslink::link_key).collect::<std::collections::HashSet<_>>().len();
+        info!(
+            "wrote {} ({} target crosslink-spectrum matches of {} unique crosslinks, both at 1% FDR)",
+            FDR_FILTERED,
+            accepted.len(),
+            unique
+        );
         self.parameters.output_paths.push(path);
         // the crosslinked proteins at 1%, 5% and 10% FDR, as FASTA files
         let fastas = self.write_xlink_proteins(&matches)?;

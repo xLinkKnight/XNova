@@ -789,7 +789,10 @@ pub struct CrosslinkMatch {
     pub charge_guessed: bool,
     /// Precursor inverse ion mobility (0 if the instrument doesn't report one)
     pub ims: f32,
+    /// q-value of the match itself (CSM level)
     pub spectrum_q: f32,
+    /// q-value of its crosslink: the unique peptide pair + sites, scored by
+    /// its best match (see [`assign_q_values`])
     pub crosslink_q: f32,
     /// Multivalent species (`kind == Multi`): every peptide and link. `alpha`
     /// / `beta` and their sites are then the species' first link.
@@ -798,6 +801,18 @@ pub struct CrosslinkMatch {
     /// them (spectral libraries; see [`CrosslinkScorer::annotate`])
     #[serde(skip)]
     pub fragments: Option<Box<Vec<LinkedFragment>>>,
+}
+
+impl CrosslinkMatch {
+    /// Accepted at FDR `level`: target-target, with both the match's own
+    /// q-value and its crosslink's at or below `level`. The CSM q-value alone
+    /// does not control the crosslinks: false matches spread over many
+    /// crosslinks of one match each, true ones gather on fewer, so unique
+    /// crosslinks counted from matches at 1% CSM FDR can be several times over
+    /// 1% false. Both together give matches at 1% whose crosslinks are at 1%.
+    pub fn accepted(&self, level: f32) -> bool {
+        self.class == PairClass::TT && self.spectrum_q <= level && self.crosslink_q <= level
+    }
 }
 
 /// A matched fragment ion of a crosslink-spectrum match
@@ -2302,8 +2317,8 @@ const FDR_KINDS: usize = 4;
 
 /// Canonical identity of a unique crosslink (peptide pair + link sites),
 /// independent of which chain is called alpha; multivalent species add a
-/// hash of all their peptides and links
-fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16, u64) {
+/// hash of all their peptides and links. `crosslink_q` is per key.
+pub fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16, u64) {
     if let Some(s) = &m.species {
         use std::hash::{Hash, Hasher};
         // links by (peptide, residue) at both ends, ends and links in order
@@ -4484,6 +4499,37 @@ mod test {
         assert!((q[6] - 2.0 / 4.0).abs() < 1e-6);
         // monotone non-decreasing along the list
         assert!(q.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// Matches at 1% CSM FDR whose crosslinks are not at 1%: ten crosslinks
+    /// of ten matches each, then a target-decoy and three target crosslinks
+    /// of one match each. As matches the three are at 1/103 FDR; as
+    /// crosslinks, 1 false of 13. Only both q-values together leave them out.
+    #[test]
+    fn accepted_matches_need_their_crosslink_within_the_level_too() {
+        use PairClass::*;
+        let pair = |score: f64, class, alpha| CrosslinkMatch { alpha_score: score, beta_score: score, ..csm(score, class, LinkKind::Inter, alpha, Some(alpha + 100)) };
+        let mut m = Vec::new();
+        for link in 0..10 {
+            for k in 0..10 {
+                m.push(pair(60.0 + link as f64 + k as f64 * 0.01, TT, link));
+            }
+        }
+        m.push(pair(51.0, TD, 50));
+        for (i, score) in [50.0, 49.0, 48.0].into_iter().enumerate() {
+            m.push(pair(score, TT, 60 + i as u32));
+        }
+        let (csms, links) = assign_q_values(&mut m);
+        assert_eq!((csms, links), (103, 10));
+        let singles = &m[101..];
+        assert!(singles.iter().all(|x| x.spectrum_q <= 0.01), "at 1% as matches: {:?}", singles.iter().map(|x| x.spectrum_q).collect::<Vec<_>>());
+        assert!(singles.iter().all(|x| x.crosslink_q > 0.07), "not as crosslinks: {:?}", singles.iter().map(|x| x.crosslink_q).collect::<Vec<_>>());
+        assert!(singles.iter().all(|x| !x.accepted(0.01) && x.accepted(0.1)));
+        assert_eq!(m.iter().filter(|x| x.accepted(0.01)).count(), 100, "the ten crosslinks' matches");
+        // decoys never
+        let mut decoy = m[0].clone();
+        decoy.class = TD;
+        assert!(!decoy.accepted(1.0));
     }
 
     /// A pair with one strong and one barely matched peptide ranks below a
