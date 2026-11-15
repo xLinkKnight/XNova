@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.1] - 2026-11-14
 
 ### Changed
 - mzML files are read about twice as fast: their binary data arrays (base64, zlib) are decoded in parallel, in batches of 32 MB of base64 kept in file order, with one reused inflater per thread rather than a decoder per array. Two 730 MB mzML files of PXD028735 (136,000 spectra each) read in 8.6-9.9 s instead of 16.9-18.2 s on 16 threads, with the same results. Suggested by Patrick Garrett from Sage Plus (issue #1).

@@ -5308,7 +5308,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cli"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5335,7 +5335,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cloudpath"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "async-compression",
  "base64 0.13.1",
@@ -5363,7 +5363,7 @@ dependencies = [
 
 [[package]]
 name = "sage-core"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "dashmap",
  "fnv",
@@ -5381,7 +5381,7 @@ dependencies = [
 
 [[package]]
 name = "sage-gui"
-version = "1.9.0"
+version = "1.9.1"
 dependencies = [
  "eframe",
  "egui_kittest",
