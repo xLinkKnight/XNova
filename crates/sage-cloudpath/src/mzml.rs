@@ -1,9 +1,10 @@
-use async_compression::tokio::bufread::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use rayon::prelude::*;
 use sage_core::spectrum::{Precursor, Representation};
 use sage_core::{mass::Tolerance, spectrum::RawSpectrum};
-use tokio::io::{AsyncBufRead, AsyncReadExt};
+use tokio::io::AsyncBufRead;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 /// Which tag are we inside?
@@ -29,9 +30,142 @@ enum Dtype {
     F64,
 }
 
+/// Base64 held before the queued spectra are decoded in parallel. A 1.2 GB
+/// Thermo mzML is about 600 MB of base64, so a batch is a small part of a file.
+/// It bounds the queue: each worker thread also keeps a base64 and an inflate
+/// buffer as large as the largest array it has seen.
+const DECODE_BATCH_BYTES: usize = 32 * 1024 * 1024;
+
+/// One binary data array, still base64-encoded
+struct PendingArray {
+    kind: BinaryKind,
+    dtype: Dtype,
+    compression: bool,
+    base64: Vec<u8>,
+}
+
+/// A parsed spectrum whose arrays are not decoded yet
+struct PendingSpectrum {
+    spectrum: RawSpectrum,
+    arrays: Vec<PendingArray>,
+}
+
+/// Little-endian floats as `f32`
+fn decode_float_array(bytes: &[u8], dtype: Dtype) -> Vec<f32> {
+    match dtype {
+        Dtype::F32 => bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+        Dtype::F64 => bytes
+            .chunks_exact(8)
+            .map(|chunk| {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(chunk);
+                f64::from_le_bytes(buf) as f32
+            })
+            .collect(),
+    }
+}
+
+/// Inflate one zlib-compressed binary array into `output`, reusing the
+/// decompressor and the buffer across arrays (rather than a decoder, a future
+/// and an allocation per array, of which a large mzML holds ~300,000)
+fn inflate_into(inflater: &mut Decompress, input: &[u8], output: &mut Vec<u8>) -> Result<(), MzMLError> {
+    fn invalid(error: impl std::fmt::Display) -> MzMLError {
+        MzMLError::IOError(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))
+    }
+    inflater.reset(true);
+    output.clear();
+    // arrays inflate to about 1.7x; ask for twice that, grow when a stream beats it
+    output.reserve(input.len().saturating_mul(2).max(64));
+    loop {
+        let consumed = inflater.total_in() as usize;
+        let before = inflater.total_out();
+        let status = inflater
+            .decompress_vec(&input[consumed..], output, FlushDecompress::Finish)
+            .map_err(invalid)?;
+        match status {
+            Status::StreamEnd => return Ok(()),
+            // `decompress_vec` writes only into spare capacity: no progress
+            // with room left means the stream is cut short
+            Status::Ok | Status::BufError => {
+                if inflater.total_out() == before && inflater.total_in() as usize == consumed {
+                    if output.len() < output.capacity() {
+                        return Err(invalid("truncated zlib stream in a binary array"));
+                    }
+                    output.reserve(output.capacity().max(64));
+                }
+            }
+        }
+    }
+}
+
+/// Decode a batch of spectra in parallel (base64, inflate, floats) and append
+/// them in file order. The XML has to be read in order; decoding, most of the
+/// cost of reading an mzML, need not. With S/N on, intensities at that MS
+/// level are divided by the spectrum's noise array. The first bad array in
+/// file order is the error reported, as when decoding in order.
+fn decode_batch(batch: Vec<PendingSpectrum>, signal_to_noise: Option<u8>, spectra: &mut Vec<RawSpectrum>) -> Result<(), MzMLError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let decoded: Vec<Result<RawSpectrum, MzMLError>> = batch
+        .into_par_iter()
+        .map_init(
+            || (Vec::<u8>::new(), Vec::<u8>::new(), Decompress::new(true)),
+            |(base64_buffer, inflate_buffer, inflater), pending| {
+                let PendingSpectrum { mut spectrum, arrays } = pending;
+                let mut noise = Vec::new();
+                for array in &arrays {
+                    base64_buffer.clear();
+                    base64::decode_config_buf(&array.base64, base64::STANDARD, base64_buffer)?;
+                    let bytes = match array.compression {
+                        false => &base64_buffer[..],
+                        true => {
+                            inflate_into(inflater, base64_buffer, inflate_buffer)?;
+                            &inflate_buffer[..]
+                        }
+                    };
+                    let values = decode_float_array(bytes, array.dtype);
+                    match array.kind {
+                        BinaryKind::Intensity => spectrum.intensity = values,
+                        BinaryKind::Mz => spectrum.mz = values,
+                        BinaryKind::Noise => noise = values,
+                    }
+                }
+                if signal_to_noise == Some(spectrum.ms_level) && !noise.is_empty() {
+                    spectrum
+                        .intensity
+                        .iter_mut()
+                        .zip(noise.iter())
+                        .for_each(|(int, noise)| *int /= noise);
+                }
+                Ok(spectrum)
+            },
+        )
+        .collect();
+    for spectrum in decoded {
+        spectra.push(spectrum?);
+    }
+    Ok(())
+}
+
 // MUST supply only one of the following
 const ZLIB_COMPRESSION: &[u8] = b"MS:1000574";
 const NO_COMPRESSION: &[u8] = b"MS:1000576";
+
+// Numpress encodings, alone or followed by zlib. There is no numpress decoder:
+// such an array is refused by name, as its bytes are not IEEE floats and read
+// as floats would give wrong numbers without a word.
+const NUMPRESS: [(&[u8], &str); 6] = [
+    (b"MS:1002312", "MS-Numpress linear prediction compression"),
+    (b"MS:1002313", "MS-Numpress positive integer compression"),
+    (b"MS:1002314", "MS-Numpress short logged float compression"),
+    (b"MS:1002746", "MS-Numpress linear prediction compression followed by zlib"),
+    (b"MS:1002747", "MS-Numpress positive integer compression followed by zlib"),
+    (b"MS:1002748", "MS-Numpress short logged float compression followed by zlib"),
+];
 
 // MUST supply only one of the following
 const INTENSITY_ARRAY: &[u8] = b"MS:1000515";
@@ -69,6 +203,8 @@ pub struct MzMLReader {
     signal_to_noise: Option<u8>,
 
     file_id: usize,
+    /// Base64 per decode batch: [`DECODE_BATCH_BYTES`], lowered only by tests
+    decode_batch_bytes: usize,
 }
 
 impl MzMLReader {
@@ -82,6 +218,7 @@ impl MzMLReader {
             ms_level: Some(ms_level),
             file_id,
             signal_to_noise: None,
+            decode_batch_bytes: DECODE_BATCH_BYTES,
         }
     }
 
@@ -90,7 +227,16 @@ impl MzMLReader {
             ms_level: None,
             signal_to_noise: None,
             file_id,
+            decode_batch_bytes: DECODE_BATCH_BYTES,
         }
+    }
+
+    /// Decode a batch once it holds this much base64 (tests: to cross batches
+    /// without a 32 MB file)
+    #[cfg(test)]
+    fn set_decode_batch_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.decode_batch_bytes = bytes.max(1);
+        self
     }
 
     pub fn set_file_id(&mut self, file_id: usize) -> &mut Self {
@@ -115,17 +261,19 @@ impl MzMLReader {
 
         let mut state = None;
         let mut compression = false;
-        let mut output_buffer = Vec::with_capacity(4096);
         let mut binary_dtype = Dtype::F64;
         let mut binary_array = None;
+        // the arrays of the spectrum being read, and the spectra read, still
+        // encoded: decoded in parallel every `decode_batch_bytes` of base64
+        let mut pending_arrays: Vec<PendingArray> = Vec::new();
+        let mut pending: Vec<PendingSpectrum> = Vec::new();
+        let mut pending_bytes = 0usize;
 
         let mut spectrum = RawSpectrum::default_with_file_id(self.file_id);
         let mut precursor = Precursor::default();
         let mut iso_window_lo: Option<f32> = None;
         let mut iso_window_hi: Option<f32> = None;
         let mut spectra = Vec::new();
-
-        let mut noise_array = Vec::new();
 
         macro_rules! extract {
             ($ev:expr, $key:expr) => {
@@ -185,6 +333,13 @@ impl MzMLReader {
                             INTENSITY_ARRAY => binary_array = Some(BinaryKind::Intensity),
                             MZ_ARRAY => binary_array = Some(BinaryKind::Mz),
                             NOISE_ARRAY => binary_array = Some(BinaryKind::Noise),
+                            accession if NUMPRESS.iter().any(|(a, _)| *a == accession) => {
+                                let name = NUMPRESS.iter().find(|(a, _)| *a == accession).map_or("", |(_, n)| n);
+                                return Err(MzMLError::UnsupportedCV(format!(
+                                    "{} ({name}): zlib-compressed or uncompressed binary arrays only",
+                                    String::from_utf8_lossy(accession)
+                                )));
+                            }
                             _ => {
                                 // Unknown CV - perhaps noise
                                 binary_array = None;
@@ -293,55 +448,16 @@ impl MzMLReader {
                         if raw.is_empty() || binary_array.is_none() {
                             continue;
                         }
-                        let decoded = base64::decode(raw.as_bytes())?;
-                        let bytes = match compression {
-                            false => &decoded,
-                            true => {
-                                let mut r = ZlibDecoder::new(decoded.as_slice());
-                                let n = r.read_to_end(&mut output_buffer).await?;
-                                &output_buffer[..n]
-                            }
-                        };
-
-                        let array = match binary_dtype {
-                            Dtype::F32 => {
-                                let mut buf: [u8; 4] = [0; 4];
-                                bytes
-                                    .chunks(4)
-                                    .filter(|chunk| chunk.len() == 4)
-                                    .map(|chunk| {
-                                        buf.copy_from_slice(chunk);
-                                        f32::from_le_bytes(buf)
-                                    })
-                                    .collect::<Vec<f32>>()
-                            }
-                            Dtype::F64 => {
-                                let mut buf: [u8; 8] = [0; 8];
-                                bytes
-                                    .chunks(8)
-                                    .map(|chunk| {
-                                        buf.copy_from_slice(chunk);
-                                        f64::from_le_bytes(buf) as f32
-                                    })
-                                    .collect::<Vec<f32>>()
-                            }
-                        };
-                        output_buffer.clear();
-
-                        match binary_array {
-                            Some(BinaryKind::Intensity) => {
-                                spectrum.intensity = array;
-                            }
-                            Some(BinaryKind::Mz) => {
-                                spectrum.mz = array;
-                            }
-                            Some(BinaryKind::Noise) => {
-                                noise_array = array;
-                            }
-                            None => {}
+                        // kept encoded, decoded with the batch (`decode_batch`)
+                        if let Some(kind) = binary_array.take() {
+                            pending_bytes += raw.len();
+                            pending_arrays.push(PendingArray {
+                                kind,
+                                dtype: binary_dtype,
+                                compression,
+                                base64: raw.into_owned().into_bytes(),
+                            });
                         }
-
-                        binary_array = None;
                     }
                 }
                 Ok(Event::End(ev)) => {
@@ -368,22 +484,14 @@ impl MzMLReader {
                                 .map(|&level| level == spectrum.ms_level)
                                 .unwrap_or(true);
 
-                            match (allow, self.signal_to_noise) {
-                                (true, Some(level))
-                                    if level == spectrum.ms_level && !noise_array.is_empty() =>
-                                {
-                                    spectrum
-                                        .intensity
-                                        .iter_mut()
-                                        .zip(noise_array.iter())
-                                        .for_each(|(int, noise)| *int /= noise);
-                                    noise_array.clear();
-                                    spectra.push(spectrum);
-                                }
-                                (true, _) => {
-                                    spectra.push(spectrum);
-                                }
-                                (false, _) => {}
+                            if allow {
+                                pending.push(PendingSpectrum { spectrum, arrays: std::mem::take(&mut pending_arrays) });
+                            } else {
+                                pending_arrays.clear();
+                            }
+                            if pending_bytes >= self.decode_batch_bytes {
+                                decode_batch(std::mem::take(&mut pending), self.signal_to_noise, &mut spectra)?;
+                                pending_bytes = 0;
                             }
                             spectrum = RawSpectrum::default_with_file_id(self.file_id);
                             None
@@ -399,6 +507,7 @@ impl MzMLReader {
             }
             buf.clear();
         }
+        decode_batch(pending, self.signal_to_noise, &mut spectra)?;
         Ok(spectra)
     }
 }
@@ -705,5 +814,152 @@ mod test {
             Some(Tolerance::Da(-1.5, 0.75))
         );
         Ok(())
+    }
+
+    /// Little-endian bytes of `values`, as 64-bit or 32-bit floats
+    fn floats(values: &[f64], f64s: bool) -> Vec<u8> {
+        match f64s {
+            true => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            false => values.iter().flat_map(|v| (*v as f32).to_le_bytes()).collect(),
+        }
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// One binary data array: its kind, float size and compression terms, and
+    /// its payload (base64 of the bytes, zlib-compressed first with `zlib`)
+    fn array(kind: &str, f64s: bool, zlib_bytes: bool, bytes: &[u8]) -> String {
+        let (dtype, compression) = (if f64s { "MS:1000523" } else { "MS:1000521" }, if zlib_bytes { "MS:1000574" } else { "MS:1000576" });
+        let payload = if zlib_bytes { zlib(bytes) } else { bytes.to_vec() };
+        array_with(kind, &format!(r#"<cvParam accession="{dtype}"/><cvParam accession="{compression}"/>"#), &base64::encode(payload))
+    }
+
+    fn array_with(kind: &str, params: &str, blob: &str) -> String {
+        format!(r#"<binaryDataArray>{params}<cvParam accession="{kind}"/><binary>{blob}</binary></binaryDataArray>"#)
+    }
+
+    /// An MS2 spectrum holding `arrays`
+    fn spectrum(id: &str, arrays: &[String]) -> String {
+        format!(
+            r#"<spectrum id="{id}"><cvParam accession="MS:1000511" value="2"/><cvParam accession="MS:1000127"/>
+               <scanList><scan><cvParam accession="MS:1000016" value="90" unitAccession="UO:0000010"/></scan></scanList>
+               <binaryDataArrayList>{}</binaryDataArrayList></spectrum>"#,
+            arrays.concat()
+        )
+    }
+
+    fn mzml(spectra: &[String]) -> String {
+        format!("<mzML><run><spectrumList>{}</spectrumList></run></mzML>", spectra.concat())
+    }
+
+    const MZ: &str = "MS:1000514";
+    const INTENSITY: &str = "MS:1000515";
+    const NOISE: &str = "MS:1002744";
+
+    /// Arrays decoded in parallel batches come out exact and in file order,
+    /// whatever the batch size: zlib and plain, 64- and 32-bit
+    #[tokio::test]
+    async fn arrays_decode_the_same_in_any_batch() -> Result<(), MzMLError> {
+        let expected: Vec<(Vec<f64>, Vec<f64>)> = (0..7)
+            .map(|n| {
+                let mz = (0..20 + n).map(|i| 150.0 + i as f64 * 13.000_1 + n as f64 * 0.25).collect();
+                let intensity = (0..20 + n).map(|i| 1000.0 + (i * 37 + n) as f64).collect();
+                (mz, intensity)
+            })
+            .collect();
+        let input = mzml(
+            &expected
+                .iter()
+                .enumerate()
+                .map(|(n, (mz, intensity))| {
+                    let (zlib_bytes, f64s) = (n % 2 == 0, n % 3 != 0);
+                    spectrum(
+                        &format!("scan={n}"),
+                        &[array(MZ, f64s, zlib_bytes, &floats(mz, f64s)), array(INTENSITY, false, zlib_bytes, &floats(intensity, false))],
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        for batch in [usize::MAX, 1, 200] {
+            let mut reader = MzMLReader::with_file_id(0);
+            if batch != usize::MAX {
+                reader.set_decode_batch_bytes(batch);
+            }
+            let spectra = reader.parse(input.as_bytes()).await?;
+            assert_eq!(spectra.len(), expected.len(), "batch {batch}");
+            for (n, (s, (mz, intensity))) in spectra.iter().zip(&expected).enumerate() {
+                assert_eq!(s.id, format!("scan={n}"), "batch {batch}: file order");
+                assert_eq!(s.mz, mz.iter().map(|&v| v as f32).collect::<Vec<_>>(), "batch {batch}, scan {n}");
+                assert_eq!(s.intensity, intensity.iter().map(|&v| v as f32).collect::<Vec<_>>());
+            }
+        }
+        Ok(())
+    }
+
+    /// With S/N on, intensities at that MS level are divided by the spectrum's
+    /// own noise array
+    #[tokio::test]
+    async fn signal_to_noise_divides_by_the_noise_array() -> Result<(), MzMLError> {
+        let input = mzml(&[spectrum(
+            "scan=1",
+            &[
+                array(MZ, true, true, &floats(&[400.0, 500.0], true)),
+                array(INTENSITY, false, true, &floats(&[100.0, 300.0], false)),
+                array(NOISE, false, true, &floats(&[10.0, 20.0], false)),
+            ],
+        )]);
+        let mut reader = MzMLReader::with_file_id(0);
+        reader.set_signal_to_noise(Some(2));
+        let spectra = reader.parse(input.as_bytes()).await?;
+        assert_eq!(spectra[0].intensity, [10.0, 15.0]);
+        Ok(())
+    }
+
+    /// Numpress arrays are refused by name: their bytes are not floats, and
+    /// read as floats they would give wrong m/z values without a word
+    #[tokio::test]
+    async fn numpress_arrays_are_refused_by_name() {
+        for accession in ["MS:1002312", "MS:1002313", "MS:1002314", "MS:1002746", "MS:1002747", "MS:1002748"] {
+            let blob = base64::encode(floats(&[400.0, 500.0], true));
+            let input = mzml(&[spectrum("scan=1", &[array_with(MZ, &format!(r#"<cvParam accession="{accession}"/>"#), &blob)])]);
+            match MzMLReader::with_file_id(0).parse(input.as_bytes()).await {
+                Err(MzMLError::UnsupportedCV(message)) => assert!(message.contains(accession) && message.contains("Numpress"), "{message}"),
+                other => panic!("{accession} was accepted: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_or_not_zlib_arrays_are_invalid_data() {
+        let complete = zlib(&floats(&[400.0, 500.0, 600.0], true));
+        for payload in [complete[..complete.len() - 4].to_vec(), b"these bytes are not a zlib stream".to_vec()] {
+            let params = r#"<cvParam accession="MS:1000523"/><cvParam accession="MS:1000574"/>"#;
+            let input = mzml(&[spectrum("scan=1", &[array_with(MZ, params, &base64::encode(payload))])]);
+            let result = MzMLReader::with_file_id(0).parse(input.as_bytes()).await;
+            assert!(
+                matches!(&result, Err(MzMLError::IOError(e)) if e.kind() == std::io::ErrorKind::InvalidData),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// Two bad arrays in one batch, failing in different ways: the error is
+    /// the earlier spectrum's, not whichever thread finished first
+    #[tokio::test]
+    async fn the_first_bad_array_in_file_order_is_reported() {
+        let input = mzml(&[
+            spectrum("scan=1", &[array_with(MZ, r#"<cvParam accession="MS:1000576"/>"#, "@@@@not base64")]),
+            spectrum(
+                "scan=2",
+                &[array_with(MZ, r#"<cvParam accession="MS:1000574"/>"#, &base64::encode(b"these bytes are not a zlib stream"))],
+            ),
+        ]);
+        let result = MzMLReader::with_file_id(0).parse(input.as_bytes()).await;
+        assert!(matches!(result, Err(MzMLError::Base64Error(_))), "{result:?}");
     }
 }

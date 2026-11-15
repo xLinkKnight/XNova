@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- mzML files are read about twice as fast: their binary data arrays (base64, zlib) are decoded in parallel, in batches of 32 MB of base64 kept in file order, with one reused inflater per thread rather than a decoder per array. Two 730 MB mzML files of PXD028735 (136,000 spectra each) read in 8.6-9.9 s instead of 16.9-18.2 s on 16 threads, with the same results. Suggested by Patrick Garrett from Sage Plus (issue #1).
+- The Thermo RAW reader, sage-plus-raw, is at 0.2.0: it no longer keeps the scan records in memory after opening a file. None of the calls XNova makes changed; its spectra still match ProteoWizard's.
+
+### Fixed
+- An MS2 scan with no precursor (neither a selected ion nor an isolation window target) no longer stops the search with a panic: it is skipped, and the log says how many such scans each file had (as in lazear/sage#248).
+- mzML arrays in an MS-Numpress encoding are refused with an error naming the encoding. They used to be read as plain floats (wrong m/z values) or dropped, depending on the order of their parameters.
+
 ## [v1.9.0] - 2026-11-14
 
 ### Added

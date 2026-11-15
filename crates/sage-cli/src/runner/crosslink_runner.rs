@@ -159,6 +159,11 @@ impl Runner {
                 .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
                 .flat_map(|spec| xl.score(spec))
                 .collect();
+            // scans without a precursor are skipped (the linear search, when it
+            // ran first, has said so already)
+            if !settings.linear_search {
+                self.warn_no_precursor(&msn);
+            }
             info!(
                 "- crosslink search: {:8} ms ({} spectra, {} candidate matches)",
                 start.elapsed().as_millis(),

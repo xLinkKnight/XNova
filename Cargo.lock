@@ -5340,6 +5340,7 @@ dependencies = [
  "async-compression",
  "base64 0.13.1",
  "bytes",
+ "flate2",
  "futures",
  "log",
  "object_store 0.13.1",
@@ -5407,9 +5408,9 @@ dependencies = [
 
 [[package]]
 name = "sage-plus-raw"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af00c7a3d2fee2670f2a3afe8d63391ced195d392af2413d2b941d14b8f01cf2"
+checksum = "56e105c205c7bdec660427f2f984a15d54e84b521dfc912453bca768e9f6b84f"
 dependencies = [
  "roxmltree 0.21.2",
  "thiserror 2.0.18",

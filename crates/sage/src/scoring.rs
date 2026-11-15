@@ -286,9 +286,10 @@ impl<'db> Scorer<'db> {
             query.level, 2,
             "internal bug, trying to score a non-MS2 scan!"
         );
-        let precursor = query.precursors.first().unwrap_or_else(|| {
-            panic!("missing MS1 precursor for {}", query.id);
-        });
+        // No precursor, no mass to query the index with: mark no candidate.
+        let Some(precursor) = query.precursors.first() else {
+            return;
+        };
         let hits = self.initial_hits(query, precursor);
 
         if prefilter_low_memory {
@@ -535,11 +536,12 @@ impl<'db> Scorer<'db> {
         hits
     }
 
-    /// Score a single [`ProcessedSpectrum`] against the database
+    /// Score a single [`ProcessedSpectrum`] against the database. A scan with
+    /// no selected precursor is skipped and returns no features.
     pub fn score_standard(&self, query: &ProcessedSpectrum) -> Vec<Feature> {
-        let precursor = query.precursors.first().unwrap_or_else(|| {
-            panic!("missing MS1 precursor for {}", query.id);
-        });
+        let Some(precursor) = query.precursors.first() else {
+            return Vec::new();
+        };
 
         let hits = self.initial_hits(query, precursor);
         let mut features = Vec::with_capacity(self.report_psms);
@@ -734,10 +736,11 @@ impl<'db> Scorer<'db> {
 
     /// Return multiple PSMs for each spectra - first is the best match, second PSM is the best match
     /// after all theoretical peaks assigned to the best match are removed, etc
+    /// A scan with no selected precursor is skipped and returns no features.
     pub fn score_chimera_fast(&self, query: &ProcessedSpectrum) -> Vec<Feature> {
-        let precursor = query.precursors.first().unwrap_or_else(|| {
-            panic!("missing MS1 precursor for {}", query.id);
-        });
+        let Some(precursor) = query.precursors.first() else {
+            return Vec::new();
+        };
 
         let mut query = query.clone();
         let hits = self.initial_hits(&query, precursor);
@@ -1070,6 +1073,28 @@ mod mass_offset_tests {
             annotate_matches: false,
             score_type: ScoreType::SageHyperScore,
         }
+    }
+
+    /// An mzML or a Bruker .d can hold an MS2 scan with neither a selected ion
+    /// nor an isolation window target m/z. There is no precursor mass to search
+    /// with, so the scan gets no features instead of aborting the run (as in
+    /// lazear/sage#248)
+    #[test]
+    fn ms2_without_a_precursor_reports_no_match() {
+        let db = IndexedDatabase::default();
+        let query = ProcessedSpectrum {
+            level: 2,
+            id: "controllerType=0 controllerNumber=1 scan=1".into(),
+            masses: vec![100.0, 200.0],
+            intensities: vec![1.0, 1.0],
+            ..Default::default()
+        };
+        assert!(scorer(&db).score(&query).is_empty());
+        assert!(Scorer { chimera: true, ..scorer(&db) }.score(&query).is_empty());
+        // the prefilter pass skips it too
+        let keep: Vec<std::sync::atomic::AtomicBool> = Vec::new();
+        scorer(&db).quick_score(&query, true, &keep);
+        scorer(&db).quick_score(&query, false, &keep);
     }
 
     /// A doubly charged spectrum of `peptide`'s b and y ions, with noise

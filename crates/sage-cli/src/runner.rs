@@ -465,7 +465,30 @@ impl Runner {
         let rate = prev * 1000 / (duration + 1);
         log::info!("- search:  {:8} ms ({} spectra/s)", duration, rate);
         self.spectra_searched.fetch_add(prev, Ordering::Relaxed);
+        self.warn_no_precursor(msn_spectra);
         features
+    }
+
+    /// An MS2 scan with no precursor (neither a selected ion nor an isolation
+    /// window target) has no mass to search the index with, so it is skipped.
+    /// Say how many, per file: a file whose MS2 scans carry no precursor
+    /// information otherwise searches to completion and reports nothing. Scans
+    /// below `min_peaks` are not counted; the peak filter drops them first.
+    pub(crate) fn warn_no_precursor(&self, msn_spectra: &[ProcessedSpectrum]) {
+        let mut skipped: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        for spectrum in msn_spectra
+            .iter()
+            .filter(|s| s.masses.len() >= self.parameters.min_peaks && s.level == 2 && s.precursors.is_empty())
+        {
+            *skipped.entry(spectrum.file_id).or_default() += 1;
+        }
+        for (file_id, count) in skipped {
+            let scans = if count == 1 { "scan" } else { "scans" };
+            match self.parameters.mzml_paths.get(file_id) {
+                Some(path) => log::warn!("skipped {count} MS2 {scans} in {path} with no precursor information"),
+                None => log::warn!("skipped {count} MS2 {scans} with no precursor information"),
+            }
+        }
     }
 
     fn complete_features(
