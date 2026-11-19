@@ -2242,8 +2242,18 @@ pub fn rank_score(m: &CrosslinkMatch) -> f64 {
 /// (overlapping, or one twice) match by chance together, and are both targets
 /// or both decoys. `TD - DD` is then a lower bound and `TD + DD` an upper
 /// one; against the precursor mass errors of real data `TD - DD` let through
-/// about three times the nominal rate, `TD` the nominal rate. Loop-links are
-/// single peptides, so they use the ordinary `decoys / targets`.
+/// about three times the nominal rate, `TD` the nominal rate.
+///
+/// Loop-links are single peptides: `(decoys + 1) / targets`. Their group is
+/// small, and with `decoys / targets` the targets ranked above every decoy get
+/// a q-value of 0 however few they are. The `+ 1` (as in the knockoff+ of
+/// Barber & Candès, Ann. Stat. 2015, which it makes a bound on the FDR) asks
+/// for at least 100 targets above the first decoy before a loop-link passes at
+/// 1%. On two synthetic DSSO libraries, whose peptides have one linkable
+/// lysine each so that every loop-link is false, `decoys / targets` let 10 and
+/// 5 loop-links through at 1% with q 0. Pairs keep their estimate: their
+/// groups are large, the estimate held there, and a `+ 1` cost one library a
+/// sixth of its unique crosslinks for three fewer false ones.
 fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
     let (mut tt, mut td, mut dd) = (0f64, 0f64, 0f64);
     let mut q = Vec::with_capacity(classes.len());
@@ -2253,7 +2263,7 @@ fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
             PairClass::TD => td += 1.0,
             PairClass::DD => dd += 1.0,
         }
-        let false_hits = if loops { td + dd } else { td.max(dd) };
+        let false_hits = if loops { td + dd + 1.0 } else { td.max(dd) };
         q.push((false_hits / tt.max(1.0)).clamp(0.0, 1.0) as f32);
     }
     // q-values are monotone: the best FDR at which a hit would be accepted
@@ -2351,7 +2361,9 @@ pub fn link_key(m: &CrosslinkMatch) -> (u32, u16, u32, u16, u64) {
 /// sites, scored by its best CSM), separately within each FDR group, ranked
 /// by [`rank_score`].
 ///
-/// Returns `(target CSMs, unique target crosslinks)` at 1% FDR.
+/// Returns `(target CSMs, unique target crosslinks)` at 1% FDR. A crosslink
+/// with matches in two groups (a recorded and a guessed charge) counts once,
+/// as in `crosslinks_FDRfiltered.sage.tsv`.
 pub fn assign_q_values(matches: &mut [CrosslinkMatch]) -> (usize, usize) {
     let all = vec![true; matches.len()];
     assign_q(matches, &all)
@@ -2419,7 +2431,9 @@ pub fn assign_q_values_in_window(matches: &mut [CrosslinkMatch]) -> ((usize, usi
 
 /// The q-values of the matches marked in `include`; the others get 1
 fn assign_q(matches: &mut [CrosslinkMatch], include: &[bool]) -> (usize, usize) {
-    let (mut csm_count, mut link_count) = (0, 0);
+    let mut csm_count = 0;
+    // passing crosslinks of every group, each once
+    let mut passing = HashSet::new();
     for (m, &inside) in matches.iter_mut().zip(include) {
         if !inside {
             m.spectrum_q = 1.0;
@@ -2484,14 +2498,14 @@ fn assign_q(matches: &mut [CrosslinkMatch], include: &[bool]) -> (usize, usize) 
         for (&i, q) in reps.iter().zip(q_of(&reps, matches)) {
             link_q.insert(link_key(&matches[i]), q);
             if q <= 0.01 && matches[i].class == PairClass::TT {
-                link_count += 1;
+                passing.insert(link_key(&matches[i]));
             }
         }
         for &i in &idx {
             matches[i].crosslink_q = link_q[&link_key(&matches[i])];
         }
     }
-    (csm_count, link_count)
+    (csm_count, passing.len())
 }
 
 #[cfg(test)]
@@ -4577,6 +4591,23 @@ mod test {
         assert!(m[20..].iter().all(|x| x.spectrum_q > 0.5));
     }
 
+    /// A crosslink matched at a recorded and at a guessed charge passes in
+    /// both groups, and is still one crosslink
+    #[test]
+    fn crosslinks_in_two_groups_count_once() {
+        use PairClass::*;
+        let pair = |score: f64, alpha, guessed| CrosslinkMatch { alpha_score: score, beta_score: score, charge_guessed: guessed, ..csm(2.0 * score, TT, LinkKind::Inter, alpha, Some(alpha + 100)) };
+        let mut m: Vec<CrosslinkMatch> = (0..5).map(|i| pair(40.0 + i as f64, i, false)).collect();
+        // links 0 and 1 again, at guessed charges; link 7 only there
+        m.push(pair(45.0, 0, true));
+        m.push(pair(44.0, 1, true));
+        m.push(pair(43.0, 7, true));
+        let (csms, links) = assign_q_values(&mut m);
+        assert!(m.iter().all(|x| x.spectrum_q == 0.0 && x.crosslink_q == 0.0));
+        assert_eq!(csms, 8);
+        assert_eq!(links, 6, "links 0-4 and 7, each once (it was 8)");
+    }
+
     /// The precursor mass error of each run is learned from a first pass, and
     /// matches outside it are left out
     #[test]
@@ -4614,14 +4645,42 @@ mod test {
     }
 
     #[test]
-    fn q_values_loops_use_decoys_over_targets() {
+    fn q_values_loops_use_decoys_plus_one_over_targets() {
         use PairClass::*;
         let q = q_from_sorted(&[TT, TT, TT, TT, DD, TT], true);
-        // raw FDR is 1/4 after the decoy and 1/5 after the next target; a
-        // q-value is the minimum FDR at or beyond a rank, so both become 0.2
-        assert!((q[4] - 0.2).abs() < 1e-6);
-        assert!((q[5] - 0.2).abs() < 1e-6);
-        assert_eq!(q[3], 0.0);
+        // (decoys + 1) / targets: 1/4 after four targets, 2/4 after the decoy
+        // and 2/5 after the next target; a q-value is the minimum FDR at or
+        // beyond a rank, so the decoy and the target after it become 0.4
+        assert!((q[3] - 0.25).abs() < 1e-6);
+        assert!((q[4] - 0.4).abs() < 1e-6);
+        assert!((q[5] - 0.4).abs() < 1e-6);
+        // ten targets above every decoy are not at 1% (they were at 0)
+        let q = q_from_sorted(&[[TT; 10].as_slice(), &[DD]].concat(), true);
+        assert!((q[9] - 0.1).abs() < 1e-6);
+        // a hundred are
+        let q = q_from_sorted(&[TT; 100], true);
+        assert!((q[99] - 0.01).abs() < 1e-6);
+        // pairs keep max(TD, DD) / TT
+        assert_eq!(q_from_sorted(&[TT; 10], false)[9], 0.0);
+    }
+
+    /// The loop-link group of the libraries: a few false loop-links above all
+    /// decoys pass no longer, while the pairs' group is unchanged
+    #[test]
+    fn small_loop_groups_pass_nothing_by_luck() {
+        use PairClass::*;
+        let pair = |score: f64, class, alpha| CrosslinkMatch { alpha_score: score, beta_score: score, ..csm(2.0 * score, class, LinkKind::Inter, alpha, Some(alpha + 1000)) };
+        let mut m: Vec<CrosslinkMatch> = (0..200).map(|i| pair(40.0 + i as f64 * 0.1, TT, i)).collect();
+        m.push(pair(30.0, TD, 300));
+        // ten target loop-links above the first decoy loop-link
+        for i in 0..10 {
+            m.push(csm(70.0 - i as f64, TT, LinkKind::Loop, 400 + i, None));
+        }
+        m.push(csm(50.0, DD, LinkKind::Loop, 420, None));
+        let (csms, links) = assign_q_values(&mut m);
+        assert_eq!((csms, links), (200, 200), "the pairs only");
+        assert!(m[..200].iter().all(|x| x.spectrum_q == 0.0));
+        assert!(m[201..211].iter().all(|x| x.spectrum_q >= 0.1 && x.crosslink_q >= 0.1));
     }
 
     #[test]

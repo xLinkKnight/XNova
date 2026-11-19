@@ -258,8 +258,9 @@ Peptides whose mass plus the linker matches the precursor are scored with
 these ions for every pair of reactive residues (both arm orientations for
 cliXlink), and at least `min_linked_peaks` ring ions must match: without them a
 linear peptide with any modification of about the linker's mass would pass.
-Loop-links get their own FDR group (`decoys / targets`), as in non-cleavable
-mode; `linked_a` reports the matched ring ions.
+Loop-links get their own FDR group (`(decoys + 1) / targets`, see
+[FDR](#fdr-of-crosslink-searches)), as in non-cleavable mode; `linked_a`
+reports the matched ring ions.
 
 ## Multivalent crosslinks
 
@@ -475,7 +476,19 @@ crosslinks at the level) go by `crosslink_q`. The CSM report
   are both targets or both decoys. `TD - DD` is then a lower bound and
   `TD + DD` an upper one. Measured against the precursor mass errors of a DSSO
   dataset, `TD - DD` let through about three times the nominal 1%, `TD` about
-  1%. Loop-links: `decoys / targets`.
+  1%.
+* **Loop-links: `(decoys + 1) / targets`.** A loop-link is one peptide, so one
+  decoy loop-link stands for one false target. The group is small, and with
+  `decoys / targets` the targets ranked above every decoy got a q-value of 0
+  however few they were. With the `+ 1` (the knockoff+ estimate of Barber &
+  Candès 2015, which bounds the FDR) a loop-link passes at 1% only when at
+  least 100 target loop-links rank above the first decoy, and at 5% when 20
+  do. On two synthetic DSSO libraries, Cas9 (Beveridge 2020, PXD014337) and
+  ribosomal (Matzinger 2022, PXD029252), each library peptide has a single
+  linkable lysine, so every loop-link is false; `decoys / targets` let 10 and 5
+  of them through at 1%, all with q 0, which made up half and a seventh of the
+  false matches there. Pairs keep `TD / TT`: their groups are large and that
+  estimate held on both libraries.
 * **Guessed charges apart.** A precursor without a recorded charge is searched
   at every charge of `precursor_charge` and keeps its best match. Higher charges
   mean larger masses, longer peptides and higher scores by chance, so these
