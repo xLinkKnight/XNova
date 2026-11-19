@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/xnova-logo.png" alt="XNova" width="300">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/xnova-logo-wave-dark.gif">
+    <img src="assets/xnova-logo-wave-light.gif" alt="XNova" width="300">
+  </picture>
 </p>
 
 # XNova: Ultra-Fast Crosslinking Search Engine, Powered by Sage
