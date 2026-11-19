@@ -25,7 +25,7 @@ impl Stage {
             Stage::Convert => "Convert Thermo .raw files to mzML",
             Stage::Start => "Start sage.exe and check settings",
             Stage::Database => "Digest proteins and build the fragment index",
-            Stage::Linear => "Linear peptide search (results.sage.tsv)",
+            Stage::Linear => "Linear peptide results (results.sage.tsv)",
             Stage::Search => "Search spectrum files",
             Stage::Rescore => "Align retention times and rescore matches",
             Stage::Proteins => "Infer proteins",
@@ -40,7 +40,7 @@ impl Stage {
             Stage::Convert => 3.0,
             Stage::Start => 0.2,
             Stage::Database => 0.8,
-            Stage::Linear => 4.0,
+            Stage::Linear => 1.0,
             Stage::Search => 6.0,
             Stage::Rescore => 0.8,
             Stage::Proteins => 0.3,
@@ -96,10 +96,9 @@ pub struct Tracker {
     converting: bool,
     pub files_done: usize,
     pub files_started: usize,
-    /// In the linear search that precedes a crosslink search
-    in_linear: bool,
-    /// The linear search reported its results; the crosslink search is next
-    linear_done: bool,
+    /// A crosslink search with the linear search: the crosslink search's
+    /// own results have begun (the linear search's come first)
+    crosslink_results: bool,
     /// Metrics in the order Sage reports them: (label, value)
     pub metrics: Vec<(String, String)>,
     search_ms: u64,
@@ -188,11 +187,11 @@ impl Tracker {
         if plan.raw_files > 0 {
             stages.push(Stage::Convert);
         }
-        stages.extend([Stage::Start, Stage::Database]);
+        stages.extend([Stage::Start, Stage::Database, Stage::Search]);
         if plan.crosslink && plan.linear {
+            // both searches run on each batch of files; the linear results come first
             stages.push(Stage::Linear);
         }
-        stages.push(Stage::Search);
         if plan.crosslink {
             // crosslinks: FDR right after the search, then quantification
             stages.push(Stage::Results);
@@ -218,8 +217,7 @@ impl Tracker {
             converting: false,
             files_done: 0,
             files_started: 0,
-            in_linear: false,
-            linear_done: false,
+            crosslink_results: false,
             metrics: Vec::new(),
             search_ms: 0,
             io_ms: 0,
@@ -401,33 +399,30 @@ impl Tracker {
         }
 
         if msg.starts_with("linear peptide search (results.sage.tsv)") {
-            self.reach(Stage::Linear);
-            self.in_linear = true;
+            // "... and crosslink search, reading each spectrum file once": the
+            // plan has the stages already
             return;
         }
-        if self.in_linear {
-            // the linear search's own stages (rescoring, proteins, quantification)
-            // all belong to this one step; its first new batch of files after
-            // the results starts the crosslink search
-            if let Some(rest) = msg.strip_prefix("processing files ") {
-                if self.linear_done {
-                    self.in_linear = false;
-                    self.files_done = 0;
-                    self.files_started = 0;
-                } else {
-                    if let Some(n) = rest.split_once("..").and_then(|(_, end)| number(end)) {
-                        self.files_started = n as usize;
-                    }
-                    return;
-                }
-            } else {
-                if let Some(rest) = msg.strip_prefix("- file IO:") {
-                    self.io_ms += number(rest).unwrap_or(0);
-                } else if let Some(rest) = msg.strip_prefix("- search:") {
-                    self.search_ms += number(rest).unwrap_or(0);
-                    self.files_done = self.files_started;
-                } else if let Some(rest) = msg.strip_prefix("discovered ") {
-                    self.linear_done = true;
+        if self.plan.crosslink && self.plan.linear && !self.crosslink_results {
+            // Both searches run on each batch of files (the search stage); then
+            // the linear search's results, its rescoring, proteins and
+            // quantification included, until the crosslink search's begin
+            let crosslinks = msg.starts_with("precursor mass window")
+                || (msg.starts_with("discovered ") && msg.contains("crosslink"));
+            let linear = msg.starts_with("aligning file")
+                || msg.starts_with("aligned retention times")
+                || msg.contains("model")
+                || msg.contains("discriminant")
+                || msg.starts_with("Protein grouping")
+                || msg.starts_with("Grouped and inferred")
+                || msg.starts_with("tracing MS1")
+                || msg.starts_with("integrating MS1")
+                || msg.starts_with("discovered ");
+            if crosslinks {
+                self.crosslink_results = true;
+            } else if linear {
+                self.reach(Stage::Linear);
+                if let Some(rest) = msg.strip_prefix("discovered ") {
                     if let Some((count, what)) = rest.split_once(' ') {
                         if let Some((what, fdr)) = what.rsplit_once(" at ") {
                             self.set_metric(&format!("{} at {}", result_label(what), fdr), count.to_string());
@@ -516,7 +511,7 @@ impl Tracker {
         let total: f32 = self.stages.iter().map(|s| s.weight()).sum();
         let done: f32 = self.stages[..self.current].iter().map(|s| s.weight()).sum();
         let within = match self.stage() {
-            Stage::Search | Stage::Linear if self.plan.files > 0 => {
+            Stage::Search if self.plan.files > 0 => {
                 // half credit for the batch in progress
                 (self.files_done as f32 + 0.5 * (self.files_started - self.files_done) as f32) / self.plan.files as f32
             }
@@ -544,12 +539,7 @@ impl Tracker {
                 self.plan.files
             ),
             Stage::Search => format!("Searched {} of {} files", self.files_done, self.plan.files),
-            Stage::Linear if self.linear_done => "Linear peptide search: FDR and results".into(),
-            Stage::Linear => format!(
-                "Linear peptide search: file {} of {}",
-                self.files_started.max(1).min(self.plan.files),
-                self.plan.files
-            ),
+            Stage::Linear => "Linear peptide search: FDR and results".into(),
             s => s.label().to_string(),
         }
     }
@@ -871,30 +861,35 @@ mod test {
         assert_eq!(m("Peak memory").as_deref(), Some("6.21 GB"));
     }
 
+    /// The linear and the crosslink search run on each batch of files as it
+    /// is read; the linear results come next, then the crosslinks'
     #[test]
-    fn follows_a_linear_search_before_the_crosslinks() {
+    fn follows_a_linear_search_with_the_crosslinks() {
         let mut t = Tracker::new(Plan { linear: true, ..plan(true, false) });
-        assert_eq!(t.stages, [Stage::Start, Stage::Database, Stage::Linear, Stage::Search, Stage::Results]);
+        assert_eq!(t.stages, [Stage::Start, Stage::Database, Stage::Search, Stage::Linear, Stage::Results]);
         let mut log: Vec<String> = Vec::new();
         let mut step = |t: &mut Tracker, msgs: &[&str]| {
             log.extend(msgs.iter().map(|m| format!("[2026-11-02T22:00:07Z INFO  sage_cli::runner] {m}")));
             t.update(&log, log.len());
         };
         step(&mut t, &["using 16 CPU thread(s)",
-            "linear peptide search (results.sage.tsv), then the crosslink search",
+            "linear peptide search (results.sage.tsv) and crosslink search, reading each spectrum file once",
             "processing files 0 .. 2 "]);
-        assert_eq!(t.stage(), Stage::Linear);
-        assert_eq!(t.activity(), "Linear peptide search: file 2 of 4");
+        assert_eq!(t.stage(), Stage::Search);
+        assert_eq!(t.activity(), "Searching files 1\u{2013}2 of 4");
         step(&mut t, &["- file IO:        4 ms", "- search:         1 ms (500 spectra/s)",
+            "- crosslink search:        1 ms (1 spectra, 0 candidate matches)", "processing files 2 .. 4 "]);
+        assert_eq!(t.stage(), Stage::Search);
+        assert_eq!((t.files_started, t.files_done), (4, 2));
+        step(&mut t, &["- file IO:        4 ms", "- search:         1 ms (500 spectra/s)",
+            "- crosslink search:        1 ms (2 spectra, 1 candidate matches)",
             "aligning file #0: y = 1.0000x + 0.0000", "Protein grouping: 0 unique peptides (threshold=0.01) in 0ms",
             "discovered 12 target peptide-spectrum matches at 1% FDR",
             "discovered 10 target peptides at 1% FDR"]);
-        // rescoring and protein inference stay inside the linear step
+        // rescoring and protein inference belong to the linear results
         assert_eq!(t.stage(), Stage::Linear);
-        step(&mut t, &["processing files 0 .. 4 "]);
-        assert_eq!(t.stage(), Stage::Search);
-        assert_eq!((t.files_started, t.files_done), (4, 0));
-        step(&mut t, &["- crosslink search:        1 ms (1 spectra, 0 candidate matches)",
+        assert_eq!((t.files_started, t.files_done, t.spectra, t.candidates), (4, 4, 3, 1));
+        step(&mut t, &["precursor mass window of a.raw: -3.0 to +4.0 ppm (5 matches outside, left out)",
             "discovered 3 target crosslink-spectrum matches at 1% FDR"]);
         assert_eq!(t.stage(), Stage::Results);
         let m = |k: &str| t.metrics.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());

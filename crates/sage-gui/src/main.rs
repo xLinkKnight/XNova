@@ -206,6 +206,8 @@ struct SageGui {
     threads: usize,
     /// RAM cap for sage.exe in GB, 0 = no cap
     max_ram_gb: f64,
+    /// sage.exe's memory allocator (`--allocator`): mimalloc, else the system's
+    mimalloc: bool,
     gpus: Vec<system::Gpu>,
     gpu_support: Option<system::GpuSupport>,
     gpu_probe: Option<std::sync::mpsc::Receiver<system::GpuSupport>>,
@@ -261,6 +263,7 @@ impl SageGui {
             overflow: egui::Vec2::ZERO,
             threads: system::cpu_threads(),
             max_ram_gb: 0.0,
+            mimalloc: true,
             gpus: system::gpus(),
             gpu_support: None,
             gpu_probe: None,
@@ -290,6 +293,7 @@ impl SageGui {
                 app.threads = (n as usize).clamp(1, system::cpu_threads());
             }
             app.max_ram_gb = state.get("max_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
+            app.mimalloc = state.get("allocator").and_then(|v| v.as_str()) != Some("system");
             if let Some(Ok(s)) = state.get("config").map(Settings::from_json) {
                 app.s = s;
             }
@@ -322,6 +326,7 @@ impl SageGui {
             "dark": self.dark,
             "threads": self.threads,
             "max_ram_gb": self.max_ram_gb,
+            "allocator": if self.mimalloc { "mimalloc" } else { "system" },
             "config": self.s.to_json(&self.s.spectra),
         });
         if let Some(dir) = path.parent() {
@@ -604,6 +609,8 @@ impl SageGui {
         }
 
         let mut args = vec![config_path.into_os_string(), "--threads".into(), self.threads.to_string().into()];
+        args.push("--allocator".into());
+        args.push(if self.mimalloc { "mimalloc" } else { "system" }.into());
         if self.parquet && !self.s.crosslink.enabled {
             args.push("--parquet".into());
         }
@@ -1483,11 +1490,7 @@ impl SageGui {
                 let label = RichText::new(stage.label());
                 ui.label(if done || current { label } else { label.color(muted) });
                 let detail = match (stage, done) {
-                    (progress::Stage::Search, _) if t.plan.files > 0 && t.stage() != progress::Stage::Linear => {
-                        format!("{} of {} files", t.files_done, t.plan.files)
-                    }
-                    (progress::Stage::Linear, true) => format!("{0} of {0} files", t.plan.files),
-                    (progress::Stage::Linear, false) if t.plan.files > 0 => {
+                    (progress::Stage::Search, _) if t.plan.files > 0 => {
                         format!("{} of {} files", t.files_done, t.plan.files)
                     }
                     (progress::Stage::Convert, _) => format!("{} of {} files", t.converted, t.plan.raw_files),
@@ -1779,6 +1782,19 @@ impl SageGui {
                 ui.label(RichText::new(text).color(theme::muted(ui)));
                 r
             });
+            row(
+                ui,
+                "Memory allocator",
+                "How sage.exe takes and gives back memory (--allocator). mimalloc keeps reading Bruker timsTOF \
+                 files fast all through a search: in Windows' own allocator, reading slows down as the search goes \
+                 on when many CPU threads read at once (a 1.9 GB file read eight times: 3 s the first time, 17 s \
+                 the eighth, against 3 s every time with mimalloc). The results are the same with either.",
+                |ui| {
+                    let a = ui.radio_value(&mut self.mimalloc, true, "mimalloc (recommended)");
+                    let b = ui.radio_value(&mut self.mimalloc, false, "Windows (system)");
+                    a | b
+                },
+            );
             row(ui, "Database size", "Count the peptides and fragments the search would index, and the memory \
                 they take, without searching (sage.exe --estimate on the current settings). Variable modifications, \
                 missed cleavages, semi-enzymatic digestion, SILAC channels and the FASTA size decide it. The spectra \

@@ -5,15 +5,18 @@
 //! spectrum-reading and path helpers.
 
 use super::Runner;
+use crate::output::SageResults;
 use crate::telemetry;
 use log::info;
 use rayon::prelude::*;
 use sage_core::crosslink::{
-    assign_q_values, assign_q_values_in_window, CrosslinkMatch, CrosslinkScorer, LinkKind, PairClass,
+    assign_q_values, assign_q_values_in_window, CrosslinkMatch, CrosslinkScorer, CrosslinkSettings, LinkKind,
+    PairClass,
 };
 use sage_core::crosslink_quant::{quantify_lfq, CrosslinkLfq};
 use sage_core::mass::Tolerance;
 use sage_core::scoring::Scorer;
+use sage_core::spectrum::ProcessedSpectrum;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -78,25 +81,35 @@ fn species_text(db: &sage_core::database::IndexedDatabase, s: &sage_core::crossl
     format!("{} | {}", peptides.join(" "), links.join("; "))
 }
 
+/// What a crosslink search keeps from each chunk of spectrum files
+#[derive(Default)]
+pub(super) struct CrosslinkChunks {
+    /// Candidate crosslink-spectrum matches
+    matches: Vec<CrosslinkMatch>,
+    /// MS1 spectra, for crosslink LFQ and SILAC ratios
+    ms1_spectra: Vec<ProcessedSpectrum>,
+    /// Isobaric reporter intensities of the MS2 spectra
+    reporters: Reporters,
+    /// MS2 spectra searched for crosslinks
+    searched: usize,
+}
+
 impl Runner {
-    pub(super) fn run_crosslink(
-        mut self,
-        parallel: usize,
-        parquet: bool,
-    ) -> anyhow::Result<telemetry::Telemetry> {
+    /// The search's crosslink settings, with its isotope labels
+    fn crosslink_settings(&self) -> CrosslinkSettings {
         let mut settings = self
             .parameters
             .crosslink
             .clone()
-            .expect("run_crosslink requires crosslink settings");
+            .expect("a crosslink search has crosslink settings");
         // isotope labels (SILAC, uniformly labelled proteins) leave a residue free to link
         settings.labels = self.database.isotope_mods();
-        let silac = self.database.silac.is_some();
-        if parquet {
-            log::warn!("parquet output is not available for crosslink searches, writing tsv");
-        }
+        settings
+    }
 
-        let scorer = Scorer {
+    /// The scorer crosslink chains are scored with
+    fn crosslink_base_scorer(&self) -> Scorer<'_> {
+        Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
             fragment_tol: self.parameters.fragment_tol,
@@ -113,66 +126,147 @@ impl Runner {
             // a spectral library needs the matched fragments
             annotate_matches: self.parameters.spectral_library.is_some(),
             score_type: self.parameters.score_type,
-        };
-        let kernel = sage_core::crosslink::make_kernel(&settings, &self.database)
-            .map_err(anyhow::Error::msg)?;
-        let xl = CrosslinkScorer::new(&scorer, &settings).with_kernel(kernel.as_deref());
-        if let Some(kernel) = &kernel {
-            info!("crosslink chain scoring backend: {}", kernel.name());
+        }
+    }
+
+    /// Whether the crosslink search keeps the MS1 spectra (LFQ, SILAC)
+    fn crosslink_needs_ms1(&self) -> bool {
+        self.parameters.quant.lfq || self.database.silac.is_some()
+    }
+
+    /// Search one chunk's MS2 spectra for crosslinks, adding the candidate
+    /// matches and TMT reporters to `found`
+    fn search_crosslink_chunk(
+        &self,
+        xl: &CrosslinkScorer,
+        settings: &CrosslinkSettings,
+        msn: &[ProcessedSpectrum],
+        found: &mut CrosslinkChunks,
+    ) {
+        if let Some(isobaric) = &self.parameters.quant.tmt {
+            // MS3 reporters are keyed by their MS2 precursor scan, like the CSMs
+            let level = self.parameters.quant.tmt_settings.level;
+            let quant = sage_core::tmt::quantify(msn, isobaric, Tolerance::Ppm(-20.0, 20.0), level);
+            found.reporters.extend(
+                quant
+                    .into_iter()
+                    .map(|q| ((q.file_id, q.spec_id), (q.ion_injection_time, q.peaks))),
+            );
         }
 
+        let start = Instant::now();
+        let searched = msn
+            .par_iter()
+            .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
+            .count();
+        let matches: Vec<CrosslinkMatch> = msn
+            .par_iter()
+            .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
+            .flat_map(|spec| xl.score(spec))
+            .collect();
+        // scans without a precursor are skipped (the linear search, when it
+        // runs too, has said so already)
+        if !settings.linear_search {
+            self.warn_no_precursor(msn);
+        }
+        info!(
+            "- crosslink search: {:8} ms ({} spectra, {} candidate matches)",
+            start.elapsed().as_millis(),
+            searched,
+            matches.len()
+        );
+        found.searched += searched;
+        found.matches.extend(matches);
+    }
+
+    pub(super) fn run_crosslink(
+        self,
+        parallel: usize,
+        parquet: bool,
+    ) -> anyhow::Result<telemetry::Telemetry> {
+        if parquet {
+            log::warn!("parquet output is not available for crosslink searches, writing tsv");
+        }
+        let settings = self.crosslink_settings();
+        let batch_size = parallel.max(1);
+        let found = {
+            let scorer = self.crosslink_base_scorer();
+            let kernel = sage_core::crosslink::make_kernel(&settings, &self.database)
+                .map_err(anyhow::Error::msg)?;
+            let xl = CrosslinkScorer::new(&scorer, &settings).with_kernel(kernel.as_deref());
+            if let Some(kernel) = &kernel {
+                info!("crosslink chain scoring backend: {}", kernel.name());
+            }
+            let mut found = CrosslinkChunks::default();
+            for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
+                let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+                if self.crosslink_needs_ms1() {
+                    found.ms1_spectra.extend(ms1);
+                }
+                self.search_crosslink_chunk(&xl, &settings, &msn, &mut found);
+            }
+            found
+        };
+        self.finish_crosslink(settings, found)
+    }
+
+    /// A crosslink search with the linear peptide search: each chunk of files
+    /// is read once and searched both ways. Reading the files is most of a
+    /// timsTOF search, and the two searches used to read every file each.
+    /// The linear results are made first, as before: the crosslink spectral
+    /// library takes the linear library's scales, and the crosslinks'
+    /// entrapment joins the linear search's.
+    pub(super) fn run_linear_and_crosslink(
+        mut self,
+        parallel: usize,
+        parquet: bool,
+    ) -> anyhow::Result<telemetry::Telemetry> {
+        info!("linear peptide search (results.sage.tsv) and crosslink search, reading each spectrum file once");
+        if parquet {
+            log::warn!("parquet output is not available for crosslink searches, writing tsv");
+        }
+        let settings = self.crosslink_settings();
+        let batch_size = parallel.max(1);
+        let (outputs, mut found) = {
+            let linear = self.linear_scorer();
+            let scorer = self.crosslink_base_scorer();
+            let kernel = sage_core::crosslink::make_kernel(&settings, &self.database)
+                .map_err(anyhow::Error::msg)?;
+            let xl = CrosslinkScorer::new(&scorer, &settings).with_kernel(kernel.as_deref());
+            if let Some(kernel) = &kernel {
+                info!("crosslink chain scoring backend: {}", kernel.name());
+            }
+            let mut found = CrosslinkChunks::default();
+            let mut results = Vec::new();
+            for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
+                let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+                let features = self.search_processed_spectra(&linear, &msn);
+                self.search_crosslink_chunk(&xl, &settings, &msn, &mut found);
+                results.push(self.complete_features(msn, ms1, features));
+            }
+            (results.into_iter().collect::<SageResults>(), found)
+        };
+        // the linear search's MS1 spectra are the crosslink search's
+        let ms1 = self.finish_linear(outputs, parquet)?;
+        if self.crosslink_needs_ms1() {
+            found.ms1_spectra = ms1;
+        }
+        self.finish_crosslink(settings, found)
+    }
+
+    /// The crosslink search's results, once every file is searched: FDR,
+    /// quantification and the crosslink outputs
+    fn finish_crosslink(
+        mut self,
+        settings: CrosslinkSettings,
+        found: CrosslinkChunks,
+    ) -> anyhow::Result<telemetry::Telemetry> {
+        let CrosslinkChunks { mut matches, ms1_spectra, reporters, searched } = found;
+        // telemetry counts the spectra searched for crosslinks
+        self.spectra_searched.store(searched, Ordering::Relaxed);
+        let silac = self.database.silac.is_some();
         let lfq = self.parameters.quant.lfq;
         let tmt = self.parameters.quant.tmt.clone();
-        let tmt_level = self.parameters.quant.tmt_settings.level;
-
-        let batch_size = parallel.max(1);
-        let mut matches: Vec<CrosslinkMatch> = Vec::new();
-        let mut ms1_spectra = Vec::new();
-        let mut reporters = Reporters::new();
-        for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
-            let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
-            if lfq || silac {
-                ms1_spectra.extend(ms1);
-            }
-            if let Some(isobaric) = &tmt {
-                // MS3 reporters are keyed by their MS2 precursor scan, like the CSMs
-                let quant = sage_core::tmt::quantify(
-                    &msn,
-                    isobaric,
-                    Tolerance::Ppm(-20.0, 20.0),
-                    tmt_level,
-                );
-                reporters.extend(
-                    quant
-                        .into_iter()
-                        .map(|q| ((q.file_id, q.spec_id), (q.ion_injection_time, q.peaks))),
-                );
-            }
-
-            let start = Instant::now();
-            let searched = msn
-                .par_iter()
-                .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
-                .count();
-            let found: Vec<CrosslinkMatch> = msn
-                .par_iter()
-                .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
-                .flat_map(|spec| xl.score(spec))
-                .collect();
-            // scans without a precursor are skipped (the linear search, when it
-            // ran first, has said so already)
-            if !settings.linear_search {
-                self.warn_no_precursor(&msn);
-            }
-            info!(
-                "- crosslink search: {:8} ms ({} spectra, {} candidate matches)",
-                start.elapsed().as_millis(),
-                searched,
-                found.len()
-            );
-            self.spectra_searched.fetch_add(searched, Ordering::Relaxed);
-            matches.extend(found);
-        }
 
         let (csms, links) = if settings.precursor_window {
             // each run's precursor mass error, learned from a first pass

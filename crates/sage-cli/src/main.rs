@@ -1,8 +1,13 @@
 use clap::{value_parser, Arg, Command, ValueHint};
 use rayon::ThreadPoolBuilder;
+use sage_cli::alloc::{Allocator, Switchable};
 use sage_cli::input::Input;
 use sage_cli::memory::{gib, MemoryGuard};
 use sage_cli::runner::Runner;
+
+/// mimalloc or the system's allocator, chosen with `--allocator` (see `alloc.rs`)
+#[global_allocator]
+static GLOBAL: Switchable = Switchable;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::default()
@@ -126,6 +131,16 @@ fn main() -> anyhow::Result<()> {
                 .help("Print the size of the database the search would build (peptides, fragments, memory) and exit"),
         )
         .arg(
+            Arg::new("allocator")
+                .long("allocator")
+                .value_parser(["mimalloc", "system"])
+                .default_value("mimalloc")
+                .help(
+                    "Memory allocator: mimalloc, or the operating system's. On Windows, reading Bruker \
+                     timsTOF files on many threads slows down in the system's allocator as the search goes on",
+                ),
+        )
+        .arg(
             Arg::new("stack-size")
                 .long("stack-size")
                 .value_parser(value_parser!(u32).range(1..))
@@ -139,6 +154,12 @@ fn main() -> anyhow::Result<()> {
              {all-args}{after-help}",
         )
         .get_matches();
+
+    let allocator = matches
+        .get_one::<String>("allocator")
+        .and_then(|name| Allocator::parse(name))
+        .unwrap_or(Allocator::Mimalloc);
+    sage_cli::alloc::select(allocator);
 
     if matches.get_flag("gpu-info") {
         gpu_info();
@@ -156,6 +177,7 @@ fn main() -> anyhow::Result<()> {
         .map(|&n| n as usize)
         .unwrap_or_else(num_cpus::get);
     log::info!("using {} CPU thread(s)", threads);
+    log::info!("memory allocator: {}", allocator.name());
     ThreadPoolBuilder::new()
         .stack_size(stack_size_bytes)
         .num_threads(threads)

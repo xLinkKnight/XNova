@@ -659,10 +659,7 @@ impl Runner {
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
         if let Some(crosslink) = &self.parameters.crosslink {
             if crosslink.linear_search {
-                info!("linear peptide search (results.sage.tsv), then the crosslink search");
-                self.run_linear(parallel, parquet)?;
-                // the crosslink search counts the same spectra again
-                self.spectra_searched.store(0, std::sync::atomic::Ordering::Relaxed);
+                return self.run_linear_and_crosslink(parallel, parquet);
             }
             return self.run_crosslink(parallel, parquet);
         }
@@ -695,7 +692,14 @@ impl Runner {
     /// Linear peptide search: scores, FDR, quantification and the
     /// `results.sage.*` outputs (everything but `results.json`)
     fn run_linear(&mut self, parallel: usize, parquet: bool) -> anyhow::Result<()> {
-        let scorer = Scorer {
+        let outputs = self.batch_files(&self.linear_scorer(), parallel);
+        self.finish_linear(outputs, parquet)?;
+        Ok(())
+    }
+
+    /// The scorer of the linear peptide search
+    fn linear_scorer(&self) -> Scorer<'_> {
+        Scorer {
             db: &self.database,
             precursor_tol: self.parameters.precursor_tol,
             fragment_tol: self.parameters.fragment_tol,
@@ -712,10 +716,13 @@ impl Runner {
             // a spectral library needs the matched fragments
             annotate_matches: self.parameters.annotate_matches || self.parameters.spectral_library.is_some(),
             score_type: self.parameters.score_type,
-        };
+        }
+    }
 
-        //Collect all results into a single container
-        let mut outputs = self.batch_files(&scorer, parallel);
+    /// The linear search's results, once every file is searched: FDR,
+    /// proteins, quantification and the `results.sage.*` outputs. Returns the
+    /// MS1 spectra, for a crosslink search that quantifies from them too.
+    fn finish_linear(&mut self, mut outputs: SageResults, parquet: bool) -> anyhow::Result<Vec<ProcessedSpectrum>> {
         // PSMs with a mass offset: their placed peptides get indices of their own
         if !self.database.mass_offsets.is_empty() {
             let placed = self.database.materialize_mass_offsets(&mut outputs.features);
@@ -943,7 +950,7 @@ impl Runner {
 
         // digestion summary, polymer check, diagnostic ions
         self.finish_qc(Some(&outputs.features), &filenames)?;
-        Ok(())
+        Ok(outputs.ms1)
     }
     pub fn serialize_feature(&self, feature: &Feature, filenames: &[String]) -> csv::ByteRecord {
         let mut record = csv::ByteRecord::new();

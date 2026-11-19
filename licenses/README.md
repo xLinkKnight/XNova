@@ -4,6 +4,8 @@ Libraries compiled into `sage.exe` and `sage-gui.exe` whose licenses ask for the
 
 * `sage-plus-raw/`: [sage-plus-raw](https://github.com/pgarrett-scripps/sage-plus-raw) 0.1.0, the Thermo RAW reader (Apache-2.0; Sage Plus's fork of [OpenTFRaw](https://github.com/Sigilweaver/OpenTFRaw), Sigilweaver Holdings LLC). `LICENSE` and `NOTICE` are copied unchanged from the crate.
 
+* `mimalloc/`: [mimalloc](https://github.com/microsoft/mimalloc) 3.3.2 (MIT, Microsoft Corporation and Daan Leijen), the memory allocator of `sage.exe` (`--allocator`), built from the [libmimalloc-sys](https://crates.io/crates/libmimalloc-sys) 0.1.49 crate (MIT, Octavian Oncescu), which bundles it. `LICENSE` (mimalloc's) and `LICENSE-libmimalloc-sys` are copied unchanged.
+
 * `sage-plus/`: [Sage Plus](https://github.com/pgarrett-scripps/sage-plus) (MIT, the same license and copyright as Sage), from which XNova adapts its quality control, timsTOF calibration, nonlinear retention-time alignment, picked FDR, long-form LFQ table, named modifications, mass-offset modifications, site localization, site libraries and streamed prefilter. `LICENSE` is copied unchanged.
 
 Methods and formats XNova reimplements without including their code:

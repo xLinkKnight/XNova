@@ -705,3 +705,57 @@ mod tests {
         }
     }
 }
+
+/// Time each step of reading Bruker .d folders, one after another, and of
+/// processing their spectra as a cleavable-crosslinker search does (top 300
+/// peaks, deisotoped), on `XNOVA_READ_THREADS` threads (default 16):
+/// `XNOVA_READ_TIMING=<a.d>;<b.d>;... cargo test --release -p sage-cloudpath read_timing -- --ignored --nocapture`
+///
+/// Listing one file several times shows how reading slows down within a
+/// process: on Windows, a 1.9 GB timsTOF file read in 2.0, 5.6, 9.0 and
+/// 11.3 s on 16 threads, and in 9.2 s every time on one thread.
+#[cfg(test)]
+mod read_timing {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn read_timing() {
+        let list = std::env::var("XNOVA_READ_TIMING").expect("set XNOVA_READ_TIMING");
+        let config = BrukerProcessingConfig::default();
+        let threads: usize = std::env::var("XNOVA_READ_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or(16);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let sp = sage_core::spectrum::SpectrumProcessor::new(300, true, 0.0);
+        println!("file\topen_s\tcalibration_s\tmsn_s\tread_s\tprocess_s\tspectra\tpeaks\tmax_peaks\tover_2000\tGB");
+        for (file_id, path_name) in list.split(';').filter(|p| !p.trim().is_empty()).enumerate() {
+            let size: u64 = std::fs::read_dir(path_name)
+                .map(|d| d.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len()).sum())
+                .unwrap_or(0);
+            let t0 = std::time::Instant::now();
+            let path = timsrust::TimsTofPath::new(path_name).unwrap();
+            let reader = SpectrumReader::build().with_path(path).with_config(config.ms2.into()).finalize().unwrap();
+            let t1 = std::time::Instant::now();
+            let calibration = tims_calibration::for_path(path_name.as_ref(), config.ion_mobility_scale);
+            let t2 = std::time::Instant::now();
+            let spectra = pool.install(|| TdfReader.read_msn_spectra(file_id, &reader, calibration.as_deref())).unwrap();
+            let t3 = std::time::Instant::now();
+            let n = spectra.len();
+            let peaks: usize = spectra.iter().map(|s| s.mz.len()).sum();
+            let max_peaks = spectra.iter().map(|s| s.mz.len()).max().unwrap_or(0);
+            let over_2000 = spectra.iter().filter(|s| s.mz.len() > 2000).count();
+            let processed: Vec<_> = pool.install(|| spectra.into_par_iter().map(|s| sp.process(s)).collect());
+            let t4 = std::time::Instant::now();
+            drop(processed);
+            let name = std::path::Path::new(path_name).file_name().unwrap().to_string_lossy().to_string();
+            println!(
+                "{name}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{:.1}\t{n}\t{peaks}\t{max_peaks}\t{over_2000}\t{:.2}",
+                (t1 - t0).as_secs_f64(),
+                (t2 - t1).as_secs_f64(),
+                (t3 - t2).as_secs_f64(),
+                (t3 - t0).as_secs_f64(),
+                (t4 - t3).as_secs_f64(),
+                size as f64 / 1e9
+            );
+        }
+    }
+}
