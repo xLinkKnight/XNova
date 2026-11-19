@@ -9,7 +9,6 @@
 //! Per-worker scratch is `O(D^2)` (the cov accumulator), independent of `n`.
 
 use super::{gauss::Gauss, matrix::Matrix};
-use rayon::prelude::*;
 
 pub struct LinearRegression {
     pub beta: Vec<f64>,
@@ -75,18 +74,20 @@ impl LinearRegression {
         embed: impl Fn(&T) -> [f64; D] + Sync,
         target: impl Fn(&T) -> f64 + Sync,
     ) -> Option<Self> {
-        let acc = items
-            .par_iter()
-            .filter(|x| filter(x))
-            .fold(
-                || Acc::zero(D),
-                |mut acc, x| {
+        // accumulated in the same order on every run, so the fit repeats
+        // exactly (a parallel fold/reduce adds in an order that varies)
+        let acc = super::ordered_fold(
+            items,
+            || Acc::zero(D),
+            |mut acc, x| {
+                if filter(x) {
                     let row = embed(x);
                     acc.add_row(&row, target(x));
-                    acc
-                },
-            )
-            .reduce(|| Acc::zero(D), Acc::merge);
+                }
+                acc
+            },
+            Acc::merge,
+        );
 
         if acc.n == 0 {
             return None;
@@ -101,16 +102,15 @@ impl LinearRegression {
         let beta = Gauss::solve(cov, b_mat)?.take();
 
         // Streaming pass for SSE = sum((X beta - y)^2). O(N*D), small vs fit.
-        let sse: f64 = items
-            .par_iter()
-            .filter(|x| filter(x))
-            .map(|x| {
-                let row = embed(x);
-                let pred: f64 = row.iter().zip(&beta).map(|(v, w)| v * w).sum();
-                let act = target(x);
-                (pred - act).powi(2)
-            })
-            .sum();
+        let sse: f64 = super::ordered_sum(items, |x| {
+            if !filter(x) {
+                return 0.0;
+            }
+            let row = embed(x);
+            let pred: f64 = row.iter().zip(&beta).map(|(v, w)| v * w).sum();
+            let act = target(x);
+            (pred - act).powi(2)
+        });
 
         let r2 = 1.0 - sse / y_var;
         Some(Self { beta, r2 })

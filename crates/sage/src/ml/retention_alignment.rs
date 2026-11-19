@@ -169,13 +169,17 @@ fn rt_by_file(features: &[Feature]) -> FnvDashMap<PeptideIx, HashMap<usize, f64>
 /// Fractional RTs: one row per peptide, one column per file (NaN where
 /// absent); the nonlinear method uses only peptides seen in two or more runs
 fn rt_matrix(features: &[Feature], max_rt: &[f64], method: AlignmentMethod) -> Matrix {
-    let rts = rt_by_file(features);
+    // one row per peptide, in peptide order: the map's own order depends on
+    // how the threads filled it, and the fits add up their points row by row,
+    // so the alignment changed in its last bits from run to run
+    let mut rts: Vec<(PeptideIx, HashMap<usize, f64>)> = rt_by_file(features).into_iter().collect();
+    rts.sort_unstable_by_key(|(peptide, _)| *peptide);
     let mat: Vec<Vec<f64>> = rts
-        .par_iter()
-        .filter(|entry| method == AlignmentMethod::Linear || entry.value().len() >= 2)
-        .map(|entry| {
+        .into_par_iter()
+        .filter(|(_, by_file)| method == AlignmentMethod::Linear || by_file.len() >= 2)
+        .map(|(_, by_file)| {
             let mut row = vec![f64::NAN; max_rt.len()];
-            for (&file_id, &rt) in entry.value() {
+            for (&file_id, &rt) in &by_file {
                 row[file_id] = rt / max_rt[file_id];
             }
             row

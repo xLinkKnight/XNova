@@ -38,11 +38,8 @@ impl<'a> Kde<'a> {
     pub fn pdf(&self, x: f64) -> f64 {
         let h = self.bandwidth;
 
-        let sum = self
-            .sample
-            .par_iter()
-            .fold(|| 0.0, |acc, xi| acc + self.kernel((x - xi) / h))
-            .sum::<f64>();
+        // in the same order on every run (a parallel sum's last bits vary)
+        let sum = ordered_sum(&self.sample, |xi| self.kernel((x - xi) / h));
 
         sum / self.constant
     }
