@@ -300,6 +300,22 @@ impl Viewer {
         }
     }
 
+    /// Open `folder`, wait for it, and pick its best crosslink (tests)
+    #[cfg(test)]
+    pub(crate) fn open_and_pick(&mut self, folder: &str) {
+        self.open(folder);
+        self.wait_until_open();
+        if let Some(results) = self.results.clone() {
+            self.selected = self.shown.iter().copied().find(|&i| results.matches[i].kind == Kind::Crosslink);
+        }
+    }
+
+    /// Whether the match picked is annotated (tests)
+    #[cfg(test)]
+    pub(crate) fn pick_annotated(&self) -> bool {
+        self.selected.is_some_and(|i| self.annotated == Some((i, self.model)))
+    }
+
     /// Whether matches of `kind` are listed (its check box)
     fn shows(&mut self, kind: Kind) -> &mut bool {
         match kind {
@@ -425,7 +441,7 @@ impl Viewer {
             }
         });
         if let Some((error, text)) = &self.message {
-            let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
+            let color = if *error { crate::theme::status_of(ui).bad } else { ui.visuals().weak_text_color() };
             ui.horizontal(|ui| {
                 if self.opening.is_some() {
                     ui.spinner();
@@ -705,7 +721,7 @@ impl Viewer {
             if self.not_found.contains(&key) {
                 ui.label(
                     RichText::new(format!("Spectrum {} is not in {} (was the file changed after the search?).", m.scan, m.file))
-                        .color(Color32::from_rgb(210, 60, 60)),
+                        .color(crate::theme::status_of(ui).bad),
                 );
             } else {
                 ui.horizontal(|ui| {
@@ -740,7 +756,7 @@ impl Viewer {
             Err(e) => {
                 ui.label(
                     RichText::new(format!("Could not annotate {}: {e}", results.proforma(m)))
-                        .color(Color32::from_rgb(210, 60, 60)),
+                        .color(crate::theme::status_of(ui).bad),
                 );
                 return;
             }
@@ -845,7 +861,7 @@ impl Viewer {
             export = ui.button("Save…").clicked();
         });
         if let Some((error, text)) = &self.export.message {
-            let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
+            let color = if *error { crate::theme::status_of(ui).bad } else { ui.visuals().weak_text_color() };
             ui.label(RichText::new(text).color(color));
         }
         if export {
@@ -1081,7 +1097,7 @@ impl MobiligramView {
             save = ui.button("Save…").clicked();
         });
         if let Some((error, text)) = &self.message {
-            let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
+            let color = if *error { crate::theme::status_of(ui).bad } else { ui.visuals().weak_text_color() };
             ui.label(RichText::new(text).color(color));
         }
         if save {

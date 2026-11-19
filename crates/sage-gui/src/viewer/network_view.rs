@@ -846,7 +846,7 @@ impl NetworkView {
             }
         });
         if let Some((error, text)) = &self.message {
-            let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
+            let color = if *error { crate::theme::status_of(ui).bad } else { ui.visuals().weak_text_color() };
             ui.label(RichText::new(text).color(color));
         }
     }

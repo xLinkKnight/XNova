@@ -272,7 +272,7 @@ fn outcome(result: Result<(), String>, done: String) -> Option<(bool, String)> {
 pub(super) fn show_message(ui: &mut Ui, message: &Option<(bool, String)>) {
     if let Some((error, text)) = message {
         if *error {
-            ui.label(RichText::new(format!("✖ {text}")).color(Color32::from_rgb(210, 60, 60)));
+            ui.label(RichText::new(format!("✖ {text}")).color(crate::theme::status_of(ui).bad));
         } else {
             ui.label(RichText::new(format!("✔ {text}")).weak());
         }
@@ -953,7 +953,7 @@ impl CircosView {
             }
         });
         if let Some((error, text)) = &self.message {
-            let color = if *error { Color32::from_rgb(210, 60, 60) } else { ui.visuals().weak_text_color() };
+            let color = if *error { crate::theme::status_of(ui).bad } else { ui.visuals().weak_text_color() };
             ui.label(RichText::new(text).color(color));
         }
     }

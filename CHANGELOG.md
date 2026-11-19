@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- sage-gui takes its colours from the fuchsia XNova logo. The accent (section titles, links, the selected tab and list row, the Run button) is the logo's fuchsia instead of orange, darkened to #da0078 on the light theme and lightened to #ee57aa on the dark one so that text in it reads at 4.5:1 or more. The toolbar and the action bar are tinted with the logo's gradient, fuchsia to orange, and edged with a ribbon of it at full strength in place of their separator lines. Greys lean rose instead of tan.
+
+### Fixed
+- Text in sage-gui that read below 4.5:1 against its background (the WCAG AA level for body text) meets it now, in both themes: the accent on white (3.3:1, now 4.9:1), the selected tab (2.7:1) and the Run button's label (3.0:1), now 5.3:1 or more; warnings (2.8:1 on white) and success messages such as "Finished" (3.4:1 on white), errors on the dark panel (3.5:1), the Cancel button's label on the light theme (4.0:1), the two-database badge on the dark theme (2.1:1), and hints and notes (egui's weak text: 2.9:1 on white and 4.1:1 on the dark panel, now 5.1:1 on both). The status colours, written out in 35 places, now come from the theme, and a test checks every text colour against what it is drawn on, including every point of the bars' tint. Disabled buttons fade towards grey, so they now show a light grey fill.
+
 ## [v1.9.2] - 2026-11-19
 
 ### Fixed

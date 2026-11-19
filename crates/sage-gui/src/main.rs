@@ -448,7 +448,7 @@ impl SageGui {
     /// The last xiVIEW message and a link to its page (to open it again)
     fn xiview_status(&self, ui: &mut Ui) {
         if let Some((error, text)) = &self.xiview_message {
-            let color = if *error { Color32::from_rgb(210, 60, 60) } else { theme::muted(ui) };
+            let color = if *error { theme::status_of(ui).bad } else { theme::muted(ui) };
             ui.label(RichText::new(text).color(color).small());
         }
         if let (Some(url), None) = (&self.xiview_page, &self.xiview_loading) {
@@ -758,7 +758,9 @@ impl SageGui {
             self.save_state();
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        // the bars' ribbons (theme::bar_end) replace their separator lines
+        egui::TopBottomPanel::top("toolbar").show_separator_line(false).show(ctx, |ui| {
+            let backdrop = theme::bar_start(ui);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
@@ -830,9 +832,11 @@ impl SageGui {
                 }
             });
             ui.add_space(2.0);
+            theme::bar_end(ui, backdrop, true);
         });
 
-        egui::TopBottomPanel::bottom("actions").show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("actions").show_separator_line(false).show(ctx, |ui| {
+            let backdrop = theme::bar_start(ui);
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 let running = self.running();
@@ -886,11 +890,11 @@ impl SageGui {
                 }
                 if let Some(job) = &self.job {
                     let (text, color) = match job.status() {
-                        Status::Running(step) => (format!("Running: {step}"), theme::accent(ui)),
-                        Status::Finished => ("Finished".to_string(), Color32::from_rgb(40, 160, 70)),
+                        Status::Running(step) => (format!("Running: {step}"), theme::accent_text(ui)),
+                        Status::Finished => ("Finished".to_string(), theme::status_of(ui).ok),
                         Status::Failed(_) => (
                             "Failed: see the Progress tab for what went wrong".to_string(),
-                            Color32::from_rgb(210, 60, 60),
+                            theme::status_of(ui).bad,
                         ),
                         Status::Cancelled => ("Cancelled".to_string(), Color32::GRAY),
                     };
@@ -907,6 +911,7 @@ impl SageGui {
                 }
             });
             ui.add_space(4.0);
+            theme::bar_end(ui, backdrop, false);
         });
 
         // Settings problems and load/save messages; the search log is on the Progress tab
@@ -916,9 +921,9 @@ impl SageGui {
                 egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                     for (is_error, msg) in &self.problems {
                         let (icon, color) = if *is_error {
-                            ("✖", Color32::from_rgb(210, 60, 60))
+                            ("✖", theme::status_of(ui).bad)
                         } else {
-                            ("ℹ", Color32::from_rgb(200, 150, 30))
+                            ("ℹ", theme::status_of(ui).info)
                         };
                         ui.label(RichText::new(format!("{icon} {msg}")).color(color));
                     }
@@ -1102,7 +1107,7 @@ fn crosslink_databases(ui: &mut Ui, s: &mut Settings) {
                     RichText::new(" FOR COMPLEX CROSSLINK SEARCHES ")
                         .small()
                         .strong()
-                        .color(Color32::WHITE)
+                        .color(theme::on_accent(ui))
                         .background_color(accent),
                 );
             });
@@ -1337,9 +1342,9 @@ impl SageGui {
                 ui.vertical(|ui| {
                     for (is_error, message) in &checks {
                         let (icon, color) = if *is_error {
-                            ("✖", Color32::from_rgb(210, 60, 60))
+                            ("✖", theme::status_of(ui).bad)
                         } else {
-                            ("ℹ", Color32::from_rgb(200, 150, 30))
+                            ("ℹ", theme::status_of(ui).info)
                         };
                         ui.add(egui::Label::new(RichText::new(format!("{icon} {message}")).color(color)).wrap());
                     }
@@ -1377,9 +1382,9 @@ impl SageGui {
             let raw_files = self.s.spectra.iter().any(|f| Settings::is_thermo_raw(f));
             if raw_files && !self.convert_raw && self.s.tmt != Tmt::None {
                 let (color, text) = if self.s.tmt_sn {
-                    (Color32::from_rgb(210, 60, 60), TMT_SN_RAW)
+                    (theme::status_of(ui).bad, TMT_SN_RAW)
                 } else {
-                    (Color32::from_rgb(220, 135, 30), TMT_RAW)
+                    (theme::status_of(ui).warn, TMT_RAW)
                 };
                 ui.label(RichText::new(format!("⚠ {text}")).color(color));
             }
@@ -1402,7 +1407,7 @@ impl SageGui {
             note(ui, "No search has been run yet. Press ▶ Run search to start one; its progress appears here.");
             return;
         };
-        let (ok, bad, warn) = (Color32::from_rgb(40, 160, 70), Color32::from_rgb(210, 60, 60), Color32::from_rgb(220, 135, 30));
+        let (ok, bad, warn) = (theme::status_of(ui).ok, theme::status_of(ui).bad, theme::status_of(ui).warn);
         let muted = theme::muted(ui);
         // Results folder to open in Annotator, once the tracker is no longer borrowed
         let mut annotate: Option<PathBuf> = None;
@@ -1624,7 +1629,7 @@ impl SageGui {
         let meter = |ui: &mut Ui, name: &str, pct: Option<f32>, tip: String| {
             let value = match pct {
                 Some(p) => RichText::new(format!("{p:.0}%")).strong().color(if p >= 90.0 {
-                    Color32::from_rgb(210, 60, 60)
+                    theme::status_of(ui).bad
                 } else {
                     ui.visuals().text_color()
                 }),
@@ -1676,7 +1681,8 @@ impl SageGui {
     fn progress_log(&self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         let lines = job.log.lock().unwrap().clone();
-        let (bad, warn) = (Color32::from_rgb(210, 60, 60), Color32::from_rgb(220, 135, 30));
+        let st = theme::status(ctx.style().visuals.dark_mode);
+        let (bad, warn) = (st.bad, st.warn);
         let max = ctx.screen_rect().height() * 0.8;
         egui::TopBottomPanel::bottom("progress_log")
             .resizable(true)
@@ -1813,7 +1819,7 @@ impl SageGui {
                 ui.label("");
                 match result {
                     Ok(text) => ui.label(RichText::new(text).monospace().size(12.0)),
-                    Err(e) => ui.label(RichText::new(format!("✖ {e}")).color(Color32::from_rgb(210, 60, 60))),
+                    Err(e) => ui.label(RichText::new(format!("✖ {e}")).color(theme::status_of(ui).bad)),
                 };
                 ui.end_row();
             }
@@ -1841,7 +1847,7 @@ impl SageGui {
                 non-cleavable crosslink searches uses one (Crosslinking tab); everything else runs on the CPU.\n\
                 It needs a sage.exe with GPU support (included by default: cargo build --release -p sage-cli), and a Vulkan or \
                 DirectX 12 graphics driver.", |ui| {
-                let (ok, warn) = (Color32::from_rgb(40, 160, 70), Color32::from_rgb(200, 130, 30));
+                let (ok, warn) = (theme::status_of(ui).ok, theme::status_of(ui).warn);
                 let r = match &self.gpu_support {
                     None => {
                         ui.spinner();
@@ -2303,12 +2309,12 @@ fn unimod_panel(ui: &mut Ui, s: &mut Settings, lk: &mut unimod::Lookup) {
     let entry = match &lk.result {
         None => return,
         Some(unimod::Found::Error(e)) => {
-            ui.label(RichText::new(format!("✖ {e}")).color(Color32::from_rgb(210, 60, 60)));
+            ui.label(RichText::new(format!("✖ {e}")).color(theme::status_of(ui).bad));
             return;
         }
         Some(unimod::Found::Missing { accession, message, may_download }) => {
             let (accession, may_download) = (*accession, *may_download);
-            ui.label(RichText::new(format!("✖ {message}")).color(Color32::from_rgb(210, 60, 60)));
+            ui.label(RichText::new(format!("✖ {message}")).color(theme::status_of(ui).bad));
             if may_download {
                 let check = ui
                     .add_enabled(!busy, egui::Button::new("Check unimod.org"))
@@ -3055,7 +3061,7 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: 
                 });
         });
         if xl.multivalent {
-            let warn = Color32::from_rgb(220, 135, 30);
+            let warn = theme::status_of(ui).warn;
             ui.label(RichText::new(format!("⚠ {}", settings::multivalent_warning(xl.valency))).color(warn));
             ui.add_space(4.0);
         }
@@ -3148,8 +3154,8 @@ fn stub_masses(ui: &mut Ui, xl: &mut settings::Crosslink) {
                 |ui| ui.label(format!("{:.5} Da", xl.stub2_long - xl.stub2_short)));
         }
         let linker = xl.linker_mass();
-        let ok = Color32::from_rgb(40, 160, 70);
-        let bad = Color32::from_rgb(210, 60, 60);
+        let ok = theme::status_of(ui).ok;
+        let bad = theme::status_of(ui).bad;
         let sums = if two {
             vec![
                 ("arm 1 short + arm 2 long", xl.stub_short + xl.stub2_long),
@@ -3200,8 +3206,8 @@ fn progress_tab_colors(ui: &Ui, state: progress::State, selected: bool) -> (Colo
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
             (Color32::from_rgb(235, 140, 30), 0.5 + 0.5 * (t * std::f32::consts::TAU / 1.4).sin())
         }
-        progress::State::Finished => (Color32::from_rgb(40, 160, 70), 1.0),
-        progress::State::Failed => (Color32::from_rgb(210, 60, 60), 1.0),
+        progress::State::Finished => (theme::status_of(ui).ok, 1.0),
+        progress::State::Failed => (theme::status_of(ui).bad, 1.0),
         progress::State::Cancelled => (Color32::GRAY, 1.0),
     };
     let tint = if selected { 0.38 } else { 0.24 };
@@ -3456,6 +3462,95 @@ mod screenshots {
                 harness.run_steps(6);
                 let theme = if dark { "dark" } else { "light" };
                 let path = out.join(format!("window_{name}_{theme}.png"));
+                harness.render().expect("render").save(&path).unwrap();
+                println!("{}", path.display());
+            }
+        }
+    }
+
+    /// Every tab, light and dark, with a real crosslink results folder
+    /// (`SAGE_GUI_RESULTS`): its log (`<folder>.log`, if there is one) fills
+    /// the Progress tab and its best crosslink the Annotated spectra:
+    /// `SAGE_GUI_FIGURES=<out> cargo test -p sage-gui tab_previews -- --ignored`
+    #[test]
+    #[ignore]
+    fn tab_previews() {
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        let results = std::env::var("SAGE_GUI_RESULTS").expect("set SAGE_GUI_RESULTS");
+        std::fs::create_dir_all(&out).unwrap();
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests");
+        let mut s = Settings::default();
+        s.fasta = tests.join("Q99536.fasta").to_string_lossy().into_owned();
+        s.spectra = vec![tests.join("LQSRPAAPPAPGPGQLTLR.mzML").to_string_lossy().into_owned()];
+        s.output_directory = results.clone();
+        s.crosslink.enabled = true;
+        s.crosslink.multivalent = true;
+        s.crosslink.valency = 3;
+        // the search's log, as the runner writes it
+        let mut log = vec!["--- Sage search ---".to_string()];
+        let text = std::fs::read_to_string(format!("{}.log", results.trim_end_matches(['/', '\\']))).unwrap_or_default();
+        log.extend(text.lines().filter(|l| l.starts_with('[')).map(str::to_string));
+        log.push("=== Search finished ===".into());
+        let tabs = [
+            (Tab::Files, "files"),
+            (Tab::Database, "database"),
+            (Tab::Modifications, "modifications"),
+            (Tab::Spectra, "spectra"),
+            (Tab::Scoring, "scoring"),
+            (Tab::Crosslink, "crosslinking"),
+            (Tab::Progress, "progress"),
+            (Tab::Viewer, "annotated"),
+        ];
+        for dark in [false, true] {
+            for (tab, name) in tabs {
+                let settings = s.clone();
+                let (folder, log) = (results.clone(), log.clone());
+                let mut app: Option<SageGui> = None;
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(1100.0, 800.0))
+                    .with_pixels_per_point(1.5)
+                    .build_state(
+                        move |ctx, done: &mut bool| {
+                            let Some(app) = app.as_mut() else {
+                                theme::install(ctx, dark);
+                                let mut new = SageGui::new(ctx);
+                                new.s = settings.clone();
+                                new.dark = dark;
+                                theme::set_dark(ctx, dark);
+                                new.tab = tab;
+                                new.fit_step = FIT_STEPS;
+                                let mut t = progress::Tracker::new(progress::Plan {
+                                    files: 1,
+                                    raw_files: 0,
+                                    crosslink: true,
+                                    linear: true,
+                                    quant: false,
+                                    gpu_backend: false,
+                                    output_dir: PathBuf::from(&folder),
+                                });
+                                t.update(&log, log.len());
+                                t.finish(progress::State::Finished, None, &log);
+                                new.tracker = Some(t);
+                                if tab == Tab::Viewer {
+                                    new.viewer.open_and_pick(&folder);
+                                }
+                                app = Some(new);
+                                return;
+                            };
+                            app.draw(ctx);
+                            *done = tab != Tab::Viewer || app.viewer.pick_annotated();
+                        },
+                        false,
+                    );
+                let t = std::time::Instant::now();
+                harness.run_steps(4);
+                while !*harness.state() && t.elapsed().as_secs() < 90 {
+                    harness.step();
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                harness.run_steps(4);
+                let theme = if dark { "dark" } else { "light" };
+                let path = out.join(format!("tab_{name}_{theme}.png"));
                 harness.render().expect("render").save(&path).unwrap();
                 println!("{}", path.display());
             }

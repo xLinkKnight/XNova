@@ -672,11 +672,11 @@ pub struct Editor {
 
 fn message(ui: &mut Ui, m: &Option<(bool, String)>, lib: &Library) {
     if let Some(e) = &lib.error {
-        ui.label(RichText::new(format!("✖ {e}")).color(Color32::from_rgb(210, 60, 60)));
+        ui.label(RichText::new(format!("✖ {e}")).color(crate::theme::status_of(ui).bad));
     }
     if let Some((error, text)) = m {
         if *error {
-            ui.label(RichText::new(format!("✖ {text}")).color(Color32::from_rgb(210, 60, 60)));
+            ui.label(RichText::new(format!("✖ {text}")).color(crate::theme::status_of(ui).bad));
         } else {
             ui.label(RichText::new(format!("✔ {text}")).weak());
         }

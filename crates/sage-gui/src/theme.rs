@@ -1,7 +1,8 @@
 //! Look of the window: a clean light theme (white panels, thin grey borders,
-//! blue accents) and a matching dark theme, plus the few widgets that carry it
-//! (section headings with a rule, outlined coloured buttons, a light/dark switch,
-//! number fields with + / − buttons, bold titles).
+//! fuchsia accents from the XNova logo, the toolbar and the action bar tinted
+//! with the logo's gradient) and a matching dark theme, plus the few widgets
+//! that carry it (section headings with a rule, outlined coloured buttons, a
+//! light/dark switch, number fields with + / − buttons, bold titles).
 
 use eframe::egui::{
     self, emath::Numeric, pos2, vec2, Button, Color32, CornerRadius, DragValue, FontFamily, FontId, Rect,
@@ -207,6 +208,72 @@ mod test {
             assert_eq!(opened, [("https://github.com/xLinkKnight/XNova".to_string(), true)], "dark {dark}");
         }
     }
+
+    /// WCAG 2 contrast ratio of two opaque colours
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let channel = |c: u8| {
+            let c = c as f32 / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let lum = |c: Color32| 0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b());
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    /// Colour at `t` (0 to 1) along evenly spaced `stops`, as the bars' mesh
+    /// interpolates it
+    fn along(stops: &[Color32], t: f32) -> Color32 {
+        let t = t.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
+        let i = (t.floor() as usize).min(stops.len() - 2);
+        let f = t - i as f32;
+        let (a, b) = (stops[i], stops[i + 1]);
+        let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * f).round() as u8;
+        Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+    }
+
+    /// Every text colour reads at 4.5:1 or more (WCAG AA for body text) on
+    /// what it is drawn on, in both themes: the panel and the faint rows of
+    /// tables, the selection behind selected tabs and rows, button fills, and
+    /// every point of the toolbar's and the action bar's tint
+    #[test]
+    fn text_colours_are_legible() {
+        for dark in [false, true] {
+            let p = palette(dark);
+            let v = visuals(dark);
+            let st = status(dark);
+            let panels = [p.panel, p.faint];
+            let on_panels = |fg: Color32| panels.iter().map(|&b| contrast(fg, b)).fold(f32::MAX, f32::min);
+            let on_bars = |fg: Color32| (0..=200).map(|k| contrast(fg, along(&p.wash, k as f32 / 200.0))).fold(f32::MAX, f32::min);
+            let (_, run_fill, run_label) = tone_colors(Tone::Accent, dark);
+            let (_, cancel_fill, cancel_label) = tone_colors(Tone::Tan, dark);
+            let checks = [
+                ("text", on_panels(p.text)),
+                ("field labels", on_panels(p.muted)),
+                ("hints (weak text)", on_panels(v.weak_text_color())),
+                ("titles and links", on_panels(p.accent)),
+                ("selected tab or row", contrast(p.selected_text, p.selection)),
+                ("Run button", contrast(run_label, run_fill)),
+                ("Cancel button", contrast(cancel_label, cancel_fill)),
+                ("text on an accent background", contrast(on_accent_of(dark), p.accent)),
+                ("success", on_panels(st.ok)),
+                ("errors", on_panels(st.bad)),
+                ("warnings", on_panels(st.warn)),
+                ("notes", on_panels(st.info)),
+                ("text on the bars", on_bars(p.text)),
+                ("grey on the bars", on_bars(p.muted)),
+                ("Running on the bars", on_bars(p.selected_text)),
+                ("Finished on the bars", on_bars(st.ok)),
+                ("Failed on the bars", on_bars(st.bad)),
+            ];
+            for (what, ratio) in checks {
+                assert!(ratio >= 4.5, "{what}: {ratio:.2}:1 in the {} theme", if dark { "dark" } else { "light" });
+            }
+        }
+    }
 }
 
 const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
@@ -219,29 +286,45 @@ struct Palette {
     field: Color32,
     faint: Color32,
     text: Color32,
+    /// Field labels, a step lighter than values
+    muted: Color32,
     border: Color32,
     rule: Color32,
     hover: Color32,
     pressed: Color32,
     accent: Color32,
     selection: Color32,
+    /// Text of selected labels (tabs, list rows) on `selection`, and accent
+    /// text on the bars
+    selected_text: Color32,
+    /// egui's weak text (hints, notes) is the text colour halfway to this
+    /// colour, towards which disabled widgets fade too. The panel colour
+    /// left hints at 2.9:1 on white and 4.1:1 on the dark panel.
+    fade: Color32,
+    /// Faint tint of the logo's gradient behind the toolbar and the action bar
+    wash: [Color32; 3],
 }
 
-// The accents come from the XNova logo, an orange-red (#e0520c) to gold
-// (#f2a900) gradient: orange on light panels (#e8650a, 3.3:1 on white, chosen
-// for the colour over the 4.5:1 of a darker burnt orange) and an orange-gold on
-// dark ones (#f59e1f, 7.7:1 on the dark panel). Greys are warm to match.
+// The accent is the XNova logo's fuchsia (#e6007e), darkened on light panels
+// (#da0078) and lightened on dark ones (#ee57aa) so that text in it reads at
+// 4.5:1 or more, as every text colour here does (see the test below). The
+// toolbar and the action bar are tinted with the logo's gradient, fuchsia to
+// orange, and edged with it at full strength. Greys lean rose.
 const LIGHT: Palette = Palette {
     panel: Color32::WHITE,
     field: Color32::WHITE,
-    faint: rgb(250, 247, 243),
+    faint: rgb(250, 247, 248),
     text: rgb(45, 48, 54),
-    border: rgb(210, 202, 194),
-    rule: rgb(232, 226, 220),
-    hover: rgb(255, 247, 239),
-    pressed: rgb(253, 232, 208),
-    accent: rgb(232, 101, 10),
-    selection: rgb(251, 227, 196),
+    muted: rgb(104, 100, 96),
+    border: rgb(212, 202, 207),
+    rule: rgb(234, 226, 230),
+    hover: rgb(255, 244, 249),
+    pressed: rgb(250, 214, 232),
+    accent: rgb(218, 0, 120),
+    selection: rgb(252, 224, 237),
+    selected_text: rgb(184, 0, 95),
+    fade: rgb(180, 172, 162),
+    wash: [rgb(253, 232, 242), rgb(255, 238, 230), rgb(255, 243, 224)],
 };
 
 const DARK: Palette = Palette {
@@ -249,13 +332,82 @@ const DARK: Palette = Palette {
     field: rgb(24, 25, 27),
     faint: rgb(38, 40, 44),
     text: rgb(220, 222, 226),
-    border: rgb(88, 82, 76),
-    rule: rgb(62, 58, 54),
-    hover: rgb(52, 44, 36),
-    pressed: rgb(84, 56, 26),
-    accent: rgb(245, 158, 31),
-    selection: rgb(92, 58, 22),
+    muted: rgb(168, 164, 160),
+    border: rgb(90, 78, 85),
+    rule: rgb(62, 56, 60),
+    hover: rgb(52, 38, 46),
+    pressed: rgb(78, 34, 58),
+    accent: rgb(238, 87, 170),
+    selection: rgb(70, 32, 53),
+    selected_text: rgb(255, 121, 189),
+    fade: rgb(64, 64, 68),
+    wash: [rgb(59, 29, 45), rgb(58, 33, 33), rgb(54, 39, 26)],
 };
+
+/// The logo's gradient, fuchsia to amber (#e6007e to #f2a900), for the
+/// ribbons on the bars' edges, where it is decoration rather than text
+const LOGO: [Color32; 5] =
+    [rgb(230, 0, 126), rgb(250, 62, 82), rgb(255, 102, 34), rgb(252, 138, 0), rgb(242, 169, 0)];
+
+/// Colours of outcomes and messages
+#[derive(Clone, Copy)]
+pub struct StatusColors {
+    pub ok: Color32,
+    pub bad: Color32,
+    pub warn: Color32,
+    pub info: Color32,
+}
+
+/// Status colours of a theme, at least 4.5:1 on its panels and on the bars
+pub fn status(dark: bool) -> StatusColors {
+    if dark {
+        StatusColors { ok: rgb(50, 175, 85), bad: rgb(240, 100, 100), warn: rgb(220, 135, 30), info: rgb(200, 150, 30) }
+    } else {
+        StatusColors { ok: rgb(25, 120, 55), bad: rgb(190, 40, 40), warn: rgb(166, 90, 10), info: rgb(140, 100, 0) }
+    }
+}
+
+/// Status colours of `ui`'s theme
+pub fn status_of(ui: &Ui) -> StatusColors {
+    status(ui.visuals().dark_mode)
+}
+
+/// A rectangle filled with `stops` from left to right
+fn gradient_rect(rect: Rect, stops: &[Color32]) -> egui::Shape {
+    let mut mesh = egui::Mesh::default();
+    let n = stops.len() - 1;
+    for (i, &c) in stops.iter().enumerate() {
+        let x = egui::lerp(rect.left()..=rect.right(), i as f32 / n as f32);
+        mesh.colored_vertex(pos2(x, rect.top()), c);
+        mesh.colored_vertex(pos2(x, rect.bottom()), c);
+        if i > 0 {
+            let k = 2 * i as u32;
+            mesh.add_triangle(k - 2, k - 1, k);
+            mesh.add_triangle(k - 1, k, k + 1);
+        }
+    }
+    egui::Shape::mesh(mesh)
+}
+
+/// A bar's backdrop: reserve its place before the bar's contents, for
+/// [`bar_end`] to fill
+pub fn bar_start(ui: &Ui) -> egui::layers::ShapeIdx {
+    ui.painter().add(egui::Shape::Noop)
+}
+
+/// Finish a bar (the toolbar, `top`, or the action bar): the gradient tint
+/// behind it, and the logo's gradient as a ribbon on its edge towards the
+/// settings, in place of egui's separator line
+pub fn bar_end(ui: &Ui, backdrop: egui::layers::ShapeIdx, top: bool) {
+    let rect = ui.clip_rect();
+    ui.painter().set(backdrop, gradient_rect(rect, &palette(ui.visuals().dark_mode).wash));
+    let band = if top {
+        Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max)
+    } else {
+        Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 3.0))
+    };
+    ui.painter().add(gradient_rect(band, &LOGO));
+}
 
 /// Thin border / rule of colour `c`
 fn line(c: Color32) -> Stroke {
@@ -281,12 +433,12 @@ fn visuals(dark: bool) -> Visuals {
     v.window_corner_radius = CornerRadius::same(4);
     v.hyperlink_color = p.accent;
     v.selection.bg_fill = p.selection;
-    v.selection.stroke = line(p.accent);
+    v.selection.stroke = line(p.selected_text);
     v.text_cursor.stroke.color = p.accent;
 
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = p.panel;
-    w.noninteractive.weak_bg_fill = p.panel;
+    w.noninteractive.weak_bg_fill = p.fade;
     w.noninteractive.bg_stroke = line(p.rule);
     w.noninteractive.fg_stroke = line(p.text);
     for (state, fill, stroke) in [
@@ -336,13 +488,28 @@ pub fn accent(ui: &Ui) -> Color32 {
     palette(ui.visuals().dark_mode).accent
 }
 
+/// The deeper accent of selected labels, for accent text on a tint or fill
+pub fn accent_text(ui: &Ui) -> Color32 {
+    palette(ui.visuals().dark_mode).selected_text
+}
+
+/// Text on an accent-coloured background: white on the light theme's
+/// fuchsia, near-black on the dark theme's light pink
+pub fn on_accent(ui: &Ui) -> Color32 {
+    on_accent_of(ui.visuals().dark_mode)
+}
+
+fn on_accent_of(dark: bool) -> Color32 {
+    if dark {
+        rgb(24, 25, 27)
+    } else {
+        Color32::WHITE
+    }
+}
+
 /// Grey of field labels, a step lighter than values
 pub fn muted(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        rgb(168, 164, 160)
-    } else {
-        rgb(116, 112, 108)
-    }
+    palette(ui.visuals().dark_mode).muted
 }
 
 /// Section title in the accent colour, followed by a thin rule to the right edge
@@ -368,15 +535,19 @@ pub enum Tone {
     Tan,
 }
 
+/// Border, fill and label colours of a `tone` button
+fn tone_colors(tone: Tone, dark: bool) -> (Color32, Color32, Color32) {
+    let p = palette(dark);
+    match (tone, dark) {
+        (Tone::Accent, _) => (p.accent, p.selection, p.selected_text),
+        (Tone::Tan, false) => (rgb(190, 150, 100), rgb(250, 243, 232), rgb(140, 95, 50)),
+        (Tone::Tan, true) => (rgb(200, 160, 110), rgb(60, 48, 35), rgb(220, 180, 130)),
+    }
+}
+
 /// Outlined button tinted by `tone`
 pub fn tone_button(ui: &Ui, text: &str, tone: Tone) -> Button<'static> {
-    let dark = ui.visuals().dark_mode;
-    let (stroke, fill, label) = match (tone, dark) {
-        (Tone::Accent, false) => (LIGHT.accent, rgb(255, 241, 224), LIGHT.accent),
-        (Tone::Accent, true) => (DARK.accent, rgb(74, 50, 24), DARK.accent),
-        (Tone::Tan, false) => (rgb(190, 150, 100), rgb(250, 243, 232), rgb(160, 110, 60)),
-        (Tone::Tan, true) => (rgb(200, 160, 110), rgb(60, 48, 35), rgb(220, 180, 130)),
-    };
+    let (stroke, fill, label) = tone_colors(tone, ui.visuals().dark_mode);
     Button::new(RichText::new(text).color(label))
         .fill(fill)
         .stroke(line(stroke))
