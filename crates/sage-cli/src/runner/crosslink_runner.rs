@@ -30,6 +30,46 @@ const FDR_FILTERED: &str = "crosslinks_FDRfiltered.sage.tsv";
 
 type Reporters = HashMap<(usize, String), (f32, Vec<f32>)>;
 
+/// The matches at 1% FDR in each FDR group (see `sage_core::crosslink`'s
+/// `fdr_group`): targets, target-decoy and decoy-decoy matches, as the FDR
+/// counted them, so the log shows where the decoys fell
+fn log_fdr_groups(matches: &[CrosslinkMatch]) {
+    let kinds = ["inter-protein", "intra-protein", "loop-links", "multivalent"];
+    // [kind][recorded, guessed charge][TT, TD, DD]
+    let mut counts = [[[0usize; 3]; 2]; 4];
+    for m in matches.iter().filter(|m| m.spectrum_q <= FDR_CUTOFF) {
+        let kind = match (m.kind, m.intra_protein) {
+            (LinkKind::Inter, false) => 0,
+            (LinkKind::Inter, true) => 1,
+            (LinkKind::Loop, _) => 2,
+            (LinkKind::Multi, _) => 3,
+        };
+        let class = match m.class {
+            PairClass::TT => 0,
+            PairClass::TD => 1,
+            PairClass::DD => 2,
+        };
+        counts[kind][m.charge_guessed as usize][class] += 1;
+    }
+    let rows: Vec<(String, [usize; 3])> = (0..2)
+        .flat_map(|guessed| {
+            (0..4).map(move |k| {
+                let name = if guessed == 1 { format!("{}, guessed charge", kinds[k]) } else { kinds[k].to_string() };
+                (name, counts[k][guessed])
+            })
+        })
+        .filter(|(_, c)| c.iter().sum::<usize>() > 0)
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    info!("crosslink FDR, matches at 1% by group: targets / target-decoy / decoy-decoy");
+    let t = crate::progress::thousands;
+    for (name, [tt, td, dd]) in rows {
+        info!("  {name:<32} {:>7} / {:>5} / {:>5}", t(tt), t(td), t(dd));
+    }
+}
+
 /// `link_type` column: `crosslink`, `loop` or `multivalent`
 fn link_type(kind: LinkKind) -> &'static str {
     match kind {
@@ -159,11 +199,19 @@ impl Runner {
             .par_iter()
             .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
             .count();
+        let searching = crate::progress::step(format!("crosslink search, {}", self.files_of(msn)), searched, "spectra");
         let matches: Vec<CrosslinkMatch> = msn
             .par_iter()
             .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
-            .flat_map(|spec| xl.score(spec))
+            .flat_map(|spec| {
+                let found = xl.score(spec);
+                searching.add(1);
+                found
+            })
             .collect();
+        if let Ok(mut t) = self.timing.lock() {
+            t.crosslink += start.elapsed();
+        }
         // scans without a precursor are skipped (the linear search, when it
         // runs too, has said so already)
         if !settings.linear_search {
@@ -189,6 +237,7 @@ impl Runner {
         }
         let settings = self.crosslink_settings();
         let batch_size = parallel.max(1);
+        info!("=== searching the spectrum files ===");
         let found = {
             let scorer = self.crosslink_base_scorer();
             let kernel = sage_core::crosslink::make_kernel(&settings, &self.database)
@@ -227,6 +276,7 @@ impl Runner {
         }
         let settings = self.crosslink_settings();
         let batch_size = parallel.max(1);
+        info!("=== searching the spectrum files: linear and crosslink search ===");
         let (outputs, mut found) = {
             let linear = self.linear_scorer();
             let scorer = self.crosslink_base_scorer();
@@ -261,6 +311,8 @@ impl Runner {
         settings: CrosslinkSettings,
         found: CrosslinkChunks,
     ) -> anyhow::Result<telemetry::Telemetry> {
+        info!("=== crosslink results ===");
+        let _step = crate::progress::step("crosslink FDR and reports", 0, "");
         let CrosslinkChunks { mut matches, ms1_spectra, reporters, searched } = found;
         // telemetry counts the spectra searched for crosslinks
         self.spectra_searched.store(searched, Ordering::Relaxed);
@@ -286,6 +338,7 @@ impl Runner {
             assign_q_values(&mut matches)
         };
         matches.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
+        log_fdr_groups(&matches);
 
         info!(
             "discovered {} target crosslink-spectrum matches at 1% FDR",
@@ -382,6 +435,7 @@ impl Runner {
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         self.parameters.output_paths.push(path);
 
+        self.log_time_summary();
         let run_time = (Instant::now() - self.start).as_secs();
         info!("finished in {}s", run_time);
 

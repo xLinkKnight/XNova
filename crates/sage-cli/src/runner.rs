@@ -41,10 +41,19 @@ mod silac_tables;
 mod summary_tables;
 mod xlink_proteins;
 
+/// Time spent on the parts of a search, for the summary at its end
+#[derive(Default)]
+struct Timing {
+    read: std::time::Duration,
+    linear: std::time::Duration,
+    crosslink: std::time::Duration,
+}
+
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
     start: Instant,
+    timing: std::sync::Mutex<Timing>,
     /// Total MS2 spectra searched (summed over all chunks), reported in telemetry
     spectra_searched: AtomicUsize,
     /// Quality control gathered while the spectra are read
@@ -107,6 +116,21 @@ impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
 }
 
 /// One FASTA file of the search
+/// Size on disk of a local spectrum file, or of a folder (Bruker .d), in bytes
+fn local_size(url: &Url) -> Option<u64> {
+    fn size(path: &std::path::Path) -> u64 {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_dir() => std::fs::read_dir(path)
+                .map(|d| d.filter_map(Result::ok).map(|e| size(&e.path())).sum())
+                .unwrap_or(0),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
+    let path = url.to_file_path().ok()?;
+    Some(size(&path))
+}
+
 fn read_fasta_file(path: &str, decoy_tag: &str, generate_decoys: bool) -> anyhow::Result<Fasta> {
     let url = sage_cloudpath::to_url(path)?;
     sage_cloudpath::util::read_fasta(&url, decoy_tag, generate_decoys)
@@ -138,6 +162,21 @@ impl Runner {
         let mut parameters = parameters.clone();
         let start = Instant::now();
         let fasta = read_protein_databases(&mut parameters.database)?;
+        let fasta_name = std::path::Path::new(&parameters.database.fasta)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| parameters.database.fasta.clone());
+        info!(
+            "database: {} protein sequences in {}, {}",
+            crate::progress::thousands(fasta.targets.len()),
+            fasta_name,
+            if parameters.database.generate_decoys {
+                format!("reversed decoys made with the tag {}", parameters.database.decoy_tag)
+            } else {
+                format!("decoys from the FASTA (tag {})", parameters.database.decoy_tag)
+            }
+        );
+        let _step = crate::progress::step("digesting the proteins and building the fragment index", 0, "");
 
         let database = match parameters.database.prefilter {
             false => parameters.database.clone().build(fasta),
@@ -158,6 +197,7 @@ impl Runner {
                         database: IndexedDatabase::default(),
                         parameters: parameters.clone(),
                         start,
+                        timing: Default::default(),
                         spectra_searched: AtomicUsize::new(0),
                         qc: Default::default(),
                         library: None,
@@ -178,6 +218,7 @@ impl Runner {
             database,
             parameters,
             start,
+            timing: Default::default(),
             spectra_searched: AtomicUsize::new(0),
             qc: Default::default(),
             library: None,
@@ -432,6 +473,15 @@ impl Runner {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counter = AtomicUsize::new(0);
         let start = Instant::now();
+        let to_search = msn_spectra
+            .iter()
+            .filter(|spec| spec.masses.len() >= self.parameters.min_peaks && spec.level == 2)
+            .count();
+        let searching = crate::progress::step(
+            format!("linear search, {}", self.files_of(msn_spectra)),
+            to_search,
+            "spectra",
+        );
         let localizer = self
             .parameters
             .localization
@@ -443,6 +493,7 @@ impl Runner {
             .filter(|spec| spec.masses.len() >= self.parameters.min_peaks && spec.level == 2)
             .map(|x| {
                 let prev = counter.fetch_add(1, Ordering::Relaxed);
+                searching.add(1);
                 if prev > 0 && prev % 10_000 == 0 {
                     let duration = Instant::now().duration_since(start).as_millis() as usize;
 
@@ -464,9 +515,124 @@ impl Runner {
         let prev = counter.load(Ordering::Relaxed);
         let rate = prev * 1000 / (duration + 1);
         log::info!("- search:  {:8} ms ({} spectra/s)", duration, rate);
+        if let Ok(mut t) = self.timing.lock() {
+            t.linear += start.elapsed();
+        }
         self.spectra_searched.fetch_add(prev, Ordering::Relaxed);
         self.warn_no_precursor(msn_spectra);
         features
+    }
+
+    /// `files 1-8 of 21`: the files these spectra come from
+    pub(crate) fn files_of(&self, spectra: &[ProcessedSpectrum]) -> String {
+        let lo = spectra.iter().map(|s| s.file_id).min().unwrap_or(0);
+        let hi = spectra.iter().map(|s| s.file_id).max().unwrap_or(0);
+        let n = self.parameters.mzml_paths.len();
+        if lo == hi {
+            format!("file {} of {}", lo + 1, n)
+        } else {
+            format!("files {}-{} of {}", lo + 1, hi + 1, n)
+        }
+    }
+
+    /// What the search will do, at its start: the spectrum files, the
+    /// settings that decide what it finds, and the order of the work
+    pub(crate) fn log_plan(&self) {
+        let p = &self.parameters;
+        let n = p.mzml_paths.len();
+        let mut formats: Vec<(&str, usize)> = Vec::new();
+        let mut bytes = 0u64;
+        for (i, url) in p.mzml_paths.iter().enumerate() {
+            let kind = match FileFormat::from(url.as_ref()) {
+                FileFormat::TDF => "Bruker .d",
+                FileFormat::ThermoRaw => "Thermo .raw",
+                FileFormat::MzML => "mzML",
+                FileFormat::MGF => "MGF",
+                FileFormat::Unidentified => "other",
+            };
+            match formats.iter_mut().find(|(k, _)| *k == kind) {
+                Some(slot) => slot.1 += 1,
+                None => formats.push((kind, 1)),
+            }
+            let size = local_size(url);
+            bytes += size.unwrap_or(0);
+            log::debug!(
+                "  file {} of {}: {} ({})",
+                i + 1,
+                n,
+                sage_cloudpath::filename(url).unwrap_or_else(|| url.as_str()),
+                size.map(|b| format!("{:.2} GB", b as f64 / 1e9)).unwrap_or_else(|| "size unknown".into())
+            );
+        }
+        let formats = formats.iter().map(|(k, c)| format!("{c} {k}")).collect::<Vec<_>>().join(", ");
+        let size = if bytes > 0 { format!(", {:.1} GB", bytes as f64 / 1e9) } else { String::new() };
+        info!("spectrum files: {n} ({formats}{size})");
+
+        let tol = |t: Tolerance| match t {
+            Tolerance::Ppm(lo, hi) => format!("{lo} to {hi} ppm"),
+            Tolerance::Da(lo, hi) => format!("{lo} to {hi} Da"),
+            Tolerance::Pct(lo, hi) => format!("{lo} to {hi}%"),
+        };
+        let e = &p.database.enzyme;
+        info!(
+            "settings: precursor {}, fragment {}, charge {} to {}, isotope errors {} to {}, up to {} missed cleavages, \
+             peptides of {} to {} residues, top {} peaks per spectrum, deisotoping {}",
+            tol(p.precursor_tol),
+            tol(p.fragment_tol),
+            p.precursor_charge.0,
+            p.precursor_charge.1,
+            p.isotope_errors.0,
+            p.isotope_errors.1,
+            e.missed_cleavages.unwrap_or(0),
+            e.min_len.unwrap_or(0),
+            e.max_len.unwrap_or(0),
+            p.max_peaks,
+            if p.deisotope { "on" } else { "off" }
+        );
+        if let Some(xl) = &p.crosslink {
+            let name = xl.reagent.map(|r| format!("{r:?}").to_uppercase()).unwrap_or_else(|| "custom crosslinker".into());
+            info!(
+                "crosslinker: {} ({:.4} Da{}) on {}{}; loop-links {}; multivalent {}",
+                name,
+                xl.linker_mass(),
+                if xl.is_cleavable() { ", MS-cleavable" } else { "" },
+                if xl.residues.is_empty() { "its two sites" } else { xl.residues.as_str() },
+                if xl.protein_nterm { " and protein N-termini" } else { "" },
+                if xl.loop_links { "on" } else { "off" },
+                match xl.multivalent {
+                    Some(v) if v >= 2 => format!("up to {v} linkers"),
+                    _ => "off".into(),
+                }
+            );
+            info!(
+                "plan: {}",
+                if xl.linear_search {
+                    "the linear peptide search and the crosslink search of each batch of files, each file read once; \
+                     then the linear results, then the crosslink FDR and reports"
+                } else {
+                    "the crosslink search of each batch of files, then its FDR and reports"
+                }
+            );
+        } else {
+            info!("plan: search each batch of files, then rescoring, FDR, proteins and reports");
+        }
+    }
+
+    /// Where the time went: reading, searching, the rest
+    pub(crate) fn log_time_summary(&self) {
+        let total = self.start.elapsed();
+        let Ok(t) = self.timing.lock() else { return };
+        let rest = total.saturating_sub(t.read + t.linear + t.crosslink);
+        let d = crate::progress::duration;
+        let mut parts = vec![format!("reading spectra {}", d(t.read))];
+        if !t.linear.is_zero() {
+            parts.push(format!("linear search {}", d(t.linear)));
+        }
+        if !t.crosslink.is_zero() {
+            parts.push(format!("crosslink search {}", d(t.crosslink)));
+        }
+        parts.push(format!("everything else {}", d(rest)));
+        info!("time: {}; total {}", parts.join(", "), d(total));
     }
 
     /// An MS2 scan with no precursor (neither a selected ion nor an isolation
@@ -577,8 +743,18 @@ impl Runner {
             .iter()
             .all(|path| FileFormat::from(path.as_ref()).within_file_parallel());
         log::trace!("file serial read: {}", file_serial_read);
+        let n_files = self.parameters.mzml_paths.len();
+        let first = batch_size * chunk_idx;
+        let reading = crate::progress::step(
+            format!("reading files {}-{} of {}", first + 1, first + chunk.len(), n_files),
+            chunk.len(),
+            "files",
+        );
         let inner_closure = |(idx, path): (usize, &Url)| {
             let file_id = chunk_idx * batch_size + idx;
+            let name = sage_cloudpath::filename(path).unwrap_or_else(|| path.as_str());
+            reading.detail(format!("now file {}: {}", file_id + 1, name));
+            let started = Instant::now();
             // Thermo .raw: MS1 scans too, for the polymer check (mzML gives them anyway)
             let thermo = FileFormat::from(path.as_ref()) == FileFormat::ThermoRaw;
             let res = sage_cloudpath::util::read_spectra(
@@ -589,9 +765,19 @@ impl Runner {
                 self.requires_ms1() || thermo,
             );
 
+            reading.add(1);
             match res {
                 Ok(s) => {
-                    log::trace!("- {}: read {} spectra", path, s.len());
+                    let ms1 = s.iter().filter(|x| x.ms_level == 1).count();
+                    info!(
+                        "- file {} of {}: {} read in {}: {} MS2 spectra{}",
+                        file_id + 1,
+                        n_files,
+                        name,
+                        crate::progress::duration(started.elapsed()),
+                        crate::progress::thousands(s.len() - ms1),
+                        if ms1 > 0 { format!(", {} MS1", crate::progress::thousands(ms1)) } else { String::new() }
+                    );
                     Ok(s)
                 }
                 Err(e) => {
@@ -643,6 +829,9 @@ impl Runner {
 
         let io_time = Instant::now() - start;
         info!("- file IO: {:8} ms", io_time.as_millis());
+        if let Ok(mut t) = self.timing.lock() {
+            t.read += io_time;
+        }
 
         (ms1_spectra, msn_spectra)
     }
@@ -657,6 +846,7 @@ impl Runner {
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        self.log_plan();
         if let Some(crosslink) = &self.parameters.crosslink {
             if crosslink.linear_search {
                 return self.run_linear_and_crosslink(parallel, parquet);
@@ -672,6 +862,7 @@ impl Runner {
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         self.parameters.output_paths.push(path);
 
+        self.log_time_summary();
         let run_time = (Instant::now() - self.start).as_secs();
         info!("finished in {}s", run_time);
         info!("cite: \"Sage: An Open-Source Tool for Fast Proteomics Searching and Quantification at Scale\" https://doi.org/10.1021/acs.jproteome.3c00486");
@@ -692,6 +883,7 @@ impl Runner {
     /// Linear peptide search: scores, FDR, quantification and the
     /// `results.sage.*` outputs (everything but `results.json`)
     fn run_linear(&mut self, parallel: usize, parquet: bool) -> anyhow::Result<()> {
+        info!("=== searching the spectrum files ===");
         let outputs = self.batch_files(&self.linear_scorer(), parallel);
         self.finish_linear(outputs, parquet)?;
         Ok(())
@@ -723,6 +915,8 @@ impl Runner {
     /// proteins, quantification and the `results.sage.*` outputs. Returns the
     /// MS1 spectra, for a crosslink search that quantifies from them too.
     fn finish_linear(&mut self, mut outputs: SageResults, parquet: bool) -> anyhow::Result<Vec<ProcessedSpectrum>> {
+        info!("=== linear peptide results (results.sage.tsv) ===");
+        let _step = crate::progress::step("linear search: rescoring, FDR, proteins and reports", 0, "");
         // PSMs with a mass offset: their placed peptides get indices of their own
         if !self.database.mass_offsets.is_empty() {
             let placed = self.database.materialize_mass_offsets(&mut outputs.features);

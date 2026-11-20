@@ -42,6 +42,8 @@ webbrowser = "1"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # the user's date and time formats, for the log (GetDateFormatEx, GetTimeFormatEx)
+    "Win32_Globalization",
     "Win32_Graphics_Dxgi",
     "Win32_Security",
     "Win32_System_IO",

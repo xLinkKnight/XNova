@@ -417,7 +417,7 @@ pub fn global_alignment_with_method(features: &mut [Feature], n_files: usize, me
                 .count();
             if n_files > 1 && (points.len() < MIN_NONLINEAR_LANDMARKS || 2 * consistent < points.len()) {
                 log::warn!(
-                    "aligning file #{file_id}: {consistent} of {} landmark peptides agree with its alignment;                      with this few, its aligned retention times (and MS1 quantification in it) may be unreliable",
+                    "aligning file #{file_id}: {consistent} of {} landmark peptides agree with its alignment; with this few, its aligned retention times (and MS1 quantification in it) may be unreliable",
                     points.len()
                 );
             }

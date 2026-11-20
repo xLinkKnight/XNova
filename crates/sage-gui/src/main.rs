@@ -3,7 +3,9 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod clock;
 mod library;
+mod logview;
 mod progress;
 mod runner;
 mod settings;
@@ -208,6 +210,12 @@ struct SageGui {
     max_ram_gb: f64,
     /// sage.exe's memory allocator (`--allocator`): mimalloc, else the system's
     mimalloc: bool,
+    /// sage.exe's detail messages in the log too (`SAGE_LOG`)
+    verbose_log: bool,
+    /// What stands before each log line
+    log_time: logview::TimeShown,
+    /// The running search, watched for the log's notes
+    watch: Watch,
     gpus: Vec<system::Gpu>,
     gpu_support: Option<system::GpuSupport>,
     gpu_probe: Option<std::sync::mpsc::Receiver<system::GpuSupport>>,
@@ -264,6 +272,9 @@ impl SageGui {
             threads: system::cpu_threads(),
             max_ram_gb: 0.0,
             mimalloc: true,
+            verbose_log: false,
+            log_time: Default::default(),
+            watch: Default::default(),
             gpus: system::gpus(),
             gpu_support: None,
             gpu_probe: None,
@@ -294,6 +305,8 @@ impl SageGui {
             }
             app.max_ram_gb = state.get("max_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
             app.mimalloc = state.get("allocator").and_then(|v| v.as_str()) != Some("system");
+            app.verbose_log = state.get("log_detail").and_then(|v| v.as_str()) == Some("verbose");
+            app.log_time = logview::TimeShown::from_key(state.get("log_time").and_then(|v| v.as_str()).unwrap_or(""));
             if let Some(Ok(s)) = state.get("config").map(Settings::from_json) {
                 app.s = s;
             }
@@ -327,6 +340,8 @@ impl SageGui {
             "threads": self.threads,
             "max_ram_gb": self.max_ram_gb,
             "allocator": if self.mimalloc { "mimalloc" } else { "system" },
+            "log_detail": if self.verbose_log { "verbose" } else { "normal" },
+            "log_time": self.log_time.key(),
             "config": self.s.to_json(&self.s.spectra),
         });
         if let Some(dir) = path.parent() {
@@ -628,6 +643,12 @@ impl SageGui {
             args,
             skip_if_exists: None,
             memory_limit: (self.max_ram_gb > 0.0).then(|| (self.max_ram_gb * system::GB) as u64),
+            // Verbose: sage.exe's detail messages too
+            env: if self.verbose_log {
+                vec![("SAGE_LOG".to_string(), "error,sage=debug".to_string())]
+            } else {
+                Vec::new()
+            },
         });
         self.save_state();
         let xl = &self.s.crosslink;
@@ -640,6 +661,7 @@ impl SageGui {
             gpu_backend: xl.enabled && matches!(xl.backend, Backend::Gpu | Backend::Auto),
             output_dir: out.clone(),
         }));
+        self.watch = Watch::default();
         self.job = Some(Job::start(steps, ctx.clone()));
         self.figures = None;
         self.tab = Tab::Progress;
@@ -663,8 +685,55 @@ impl SageGui {
             }
         }
         let (Some(job), Some(tracker)) = (&self.job, &mut self.tracker) else { return };
-        let log = job.log.lock().unwrap().clone();
-        tracker.update(&log, job.total.load(std::sync::atomic::Ordering::Relaxed));
+        let total = job.total.load(std::sync::atomic::Ordering::Relaxed);
+        let log = job.log.lock().unwrap().lines.clone();
+        tracker.update(&log, total);
+        if job.is_running() {
+            // notes on the running search: the computer's CPU and memory every
+            // minute, and a word when sage.exe has written nothing for 2 minutes
+            let now = std::time::Instant::now();
+            if total != self.watch.lines {
+                self.watch.lines = total;
+                self.watch.quiet_since = now;
+                self.watch.quiet_noted = false;
+            }
+            let usage = self.usage.latest(ctx).map(|u| {
+                format!(
+                    "computer: CPU {:.0}%, RAM {:.1} of {:.1} GB in use",
+                    u.cpu,
+                    u.ram_used as f64 / system::GB,
+                    u.ram_total as f64 / system::GB
+                )
+            });
+            if now - self.watch.usage_noted >= std::time::Duration::from_secs(60) {
+                if let Some(usage) = &usage {
+                    job.note(usage);
+                }
+                self.watch.usage_noted = now;
+            }
+            if !self.watch.quiet_noted && now - self.watch.quiet_since >= std::time::Duration::from_secs(120) {
+                let usage = usage.map(|u| format!("; {u}")).unwrap_or_default();
+                job.note(&format!("sage.exe has written nothing for 2 minutes and is still running{usage}"));
+                self.watch.quiet_noted = true;
+            }
+            // our own notes do not count as sage.exe's output
+            self.watch.lines = job.total.load(std::sync::atomic::Ordering::Relaxed);
+        } else if !self.watch.saved {
+            // the whole log next to the results, once the search has ended
+            self.watch.saved = true;
+            let out = tracker.plan.output_dir.clone();
+            let text = {
+                let log = job.log.lock().unwrap();
+                log.stamps.first().map(|first| (first.file_stamp(), logview::text(&log, self.log_time.with_clock())))
+            };
+            if let Some((stamp, text)) = text {
+                let path = out.join(format!("xnova_log_{stamp}.txt"));
+                match std::fs::write(&path, text) {
+                    Ok(()) => job.note(&format!("log saved to {}", path.display())),
+                    Err(e) => job.note(&format!("log not saved to {}: {e}", path.display())),
+                }
+            }
+        }
         match job.status() {
             Status::Running(_) => {}
             Status::Finished if tracker.state != progress::State::Finished => {
@@ -1681,11 +1750,18 @@ impl SageGui {
 
     /// The search log, in a panel along the bottom of the Progress tab whose
     /// top edge can be dragged to show more or fewer lines
-    fn progress_log(&self, ctx: &egui::Context) {
+    fn progress_log(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
-        let lines = job.log.lock().unwrap().clone();
+        let log = job.log.lock().unwrap().clone();
+        let (warnings, errors) = logview::problems(&log);
+        let rows = logview::rows(&log);
+        let time = self.log_time;
+        let width = logview::time_width(&log, time);
+        let out_dir = self.tracker.as_ref().map(|t| t.plan.output_dir.clone());
+        let mut chosen = time;
+        let mut save = false;
         let st = theme::status(ctx.style().visuals.dark_mode);
-        let (bad, warn) = (st.bad, st.warn);
+        let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
         let max = ctx.screen_rect().height() * 0.8;
         egui::TopBottomPanel::bottom("progress_log")
             .resizable(true)
@@ -1702,9 +1778,38 @@ impl SageGui {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Log").size(17.0).color(theme::accent(ui)));
-                    ui.label(RichText::new(format!("{} lines", lines.len())).color(theme::muted(ui)));
+                    ui.label(RichText::new(plural(log.lines.len(), "line")).color(theme::muted(ui)));
+                    if errors > 0 {
+                        ui.label(RichText::new(format!("\u{2716} {}", plural(errors, "error"))).color(st.bad));
+                    }
+                    if warnings > 0 {
+                        ui.label(RichText::new(format!("\u{26A0} {}", plural(warnings, "warning"))).color(st.warn));
+                    }
+                    egui::ComboBox::from_id_salt("log_time")
+                        .selected_text(time.label())
+                        .show_ui(ui, |ui| {
+                            for t in logview::TimeShown::ALL {
+                                ui.selectable_value(&mut chosen, t, t.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "What stands before each line: the time of day, or the date and time, as your \
+                             Windows writes them (Settings > Time & language > Language & region), the time \
+                             since the search began, or nothing. A line with the date begins each day.",
+                        );
                     if ui.small_button("Copy log").on_hover_text("Copy the whole log, e.g. to report a problem.").clicked() {
-                        ui.ctx().copy_text(lines.join("\n"));
+                        ui.ctx().copy_text(logview::text(&log, time));
+                    }
+                    if ui
+                        .small_button("Save log\u{2026}")
+                        .on_hover_text(
+                            "Save the log as a text file. It is also saved next to the results when the search \
+                             ends (xnova_log_<date>_<time>.txt).",
+                        )
+                        .clicked()
+                    {
+                        save = true;
                     }
                     ui.label(RichText::new("drag the top edge to resize").color(theme::muted(ui)).size(12.0));
                 });
@@ -1714,23 +1819,55 @@ impl SageGui {
                         .id_salt("progress_log")
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
-                        .show_rows(ui, row_height, lines.len(), |ui, rows| {
-                            for line in &lines[rows] {
-                                let color = if line.contains(" ERROR ") || line.starts_with("Error") || line.starts_with("=== Failed") {
-                                    bad
-                                } else if line.contains(" WARN ") {
-                                    warn
-                                } else if line.starts_with("---") || line.starts_with("===") {
-                                    theme::accent(ui)
-                                } else {
-                                    ui.visuals().text_color()
+                        .show_rows(ui, row_height, rows.len(), |ui, range| {
+                            for row in &rows[range] {
+                                let (text, color) = match *row {
+                                    logview::Row::Day(i) => (logview::day_text(&log.stamps[i], false), theme::accent(ui)),
+                                    logview::Row::Line(i) => {
+                                        let (kind, message) = logview::parse(&log.lines[i]);
+                                        let color = match kind {
+                                            logview::Kind::Error => st.bad,
+                                            logview::Kind::Warn => st.warn,
+                                            logview::Kind::Banner => theme::accent(ui),
+                                            logview::Kind::Progress | logview::Kind::Note | logview::Kind::Debug => {
+                                                theme::muted(ui)
+                                            }
+                                            logview::Kind::Info | logview::Kind::Plain => ui.visuals().text_color(),
+                                        };
+                                        let stamp = if time == logview::TimeShown::None {
+                                            String::new()
+                                        } else {
+                                            format!("{:>width$}  ", time.text(&log.stamps[i]))
+                                        };
+                                        (format!("{stamp}{}{message}", logview::marker(kind)), color)
+                                    }
                                 };
                                 // one row per line (show_rows needs equal heights): scroll, don't wrap
-                                ui.add(egui::Label::new(RichText::new(line).monospace().size(12.0).color(color)).extend());
+                                ui.add(egui::Label::new(RichText::new(text).monospace().size(12.0).color(color)).extend());
                             }
                         });
                 });
             });
+        self.log_time = chosen;
+        if save {
+            let name = log
+                .stamps
+                .first()
+                .map(|s| format!("xnova_log_{}.txt", s.file_stamp()))
+                .unwrap_or_else(|| "xnova_log.txt".into());
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("Save the log")
+                .set_file_name(name)
+                .add_filter("Text", &["txt"]);
+            if let Some(dir) = out_dir.filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            if let Some(path) = dialog.save_file() {
+                if let Err(e) = std::fs::write(&path, logview::text(&log, self.log_time.with_clock())) {
+                    self.problems.push((true, format!("Could not save the log to {}: {e}", path.display())));
+                }
+            }
+        }
     }
 
     /// CPU threads, RAM cap and GPUs available to sage.exe
@@ -1792,6 +1929,18 @@ impl SageGui {
                 |ui| {
                     let a = ui.radio_value(&mut self.mimalloc, true, "mimalloc (recommended)");
                     let b = ui.radio_value(&mut self.mimalloc, false, "Windows (system)");
+                    a | b
+                },
+            );
+            row(
+                ui,
+                "Log detail",
+                "How much sage.exe writes to the log (Progress tab). Normal: what it is doing and what it has \
+                 found, with a progress line every 15 s on a long step. Verbose: its detail messages too, e.g. \
+                 each spectrum file with its size (SAGE_LOG=error,sage=debug). Takes effect at the next search.",
+                |ui| {
+                    let a = ui.radio_value(&mut self.verbose_log, false, "Normal");
+                    let b = ui.radio_value(&mut self.verbose_log, true, "Verbose");
                     a | b
                 },
             );
@@ -3242,6 +3391,23 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// The running search, watched for the log's notes: how many lines it had
+/// and since when nothing came, the notes made, the log saved at its end
+struct Watch {
+    lines: usize,
+    quiet_since: std::time::Instant,
+    quiet_noted: bool,
+    usage_noted: std::time::Instant,
+    saved: bool,
+}
+
+impl Default for Watch {
+    fn default() -> Self {
+        let now = std::time::Instant::now();
+        Watch { lines: 0, quiet_since: now, quiet_noted: false, usage_noted: now, saved: false }
+    }
+}
+
 /// Screenshots of settings tabs, rendered off-screen:
 /// `SAGE_GUI_FIGURES=<folder> cargo test -p sage-gui screenshots -- --ignored`
 #[cfg(test)]
@@ -3571,6 +3737,92 @@ mod screenshots {
                 println!("{}", path.display());
             }
         }
+    }
+
+    /// A real search run by sage-gui's job runner, the way Run search runs it,
+    /// with the Progress tab drawn while it runs: the log page early on, half
+    /// way and at the end (`log_<n>_<theme>.png` in `SAGE_GUI_FIGURES`), and
+    /// the log saved next to the results. `SAGE_GUI_SAGE` = sage.exe,
+    /// `SAGE_GUI_CONFIG` = its configuration, `SAGE_GUI_DARK=1` for the dark theme:
+    /// `cargo test -p sage-gui log_end_to_end -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn log_end_to_end() {
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        let sage = std::env::var("SAGE_GUI_SAGE").expect("set SAGE_GUI_SAGE");
+        let config = std::env::var("SAGE_GUI_CONFIG").expect("set SAGE_GUI_CONFIG");
+        let dark = std::env::var("SAGE_GUI_DARK").is_ok_and(|v| v == "1");
+        std::fs::create_dir_all(&out).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        let results = PathBuf::from(json["output_directory"].as_str().unwrap());
+        let files = json["mzml_paths"].as_array().map_or(0, |a| a.len());
+        let crosslink = json.get("crosslink").is_some_and(|c| !c.is_null());
+        let saved_in = results.clone();
+        let mut app: Option<SageGui> = None;
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .with_pixels_per_point(1.25)
+            .build_state(
+                move |ctx, finished: &mut bool| {
+                    let Some(app) = app.as_mut() else {
+                        theme::install(ctx, dark);
+                        let mut new = SageGui::new(ctx);
+                        new.dark = dark;
+                        theme::set_dark(ctx, dark);
+                        new.fit_step = FIT_STEPS;
+                        new.tab = Tab::Progress;
+                        new.tracker = Some(progress::Tracker::new(progress::Plan {
+                            files,
+                            raw_files: 0,
+                            crosslink,
+                            linear: crosslink,
+                            quant: false,
+                            gpu_backend: false,
+                            output_dir: results.clone(),
+                        }));
+                        let step = Step {
+                            title: "Sage search".into(),
+                            program: PathBuf::from(&sage),
+                            args: vec![config.clone().into(), "--threads".into(), "16".into()],
+                            skip_if_exists: None,
+                            memory_limit: None,
+                            env: Vec::new(),
+                        };
+                        new.watch = Watch::default();
+                        new.job = Some(Job::start(vec![step], ctx.clone()));
+                        app = Some(new);
+                        return;
+                    };
+                    app.draw(ctx);
+                    *finished = app.watch.saved;
+                },
+                false,
+            );
+        let theme = if dark { "dark" } else { "light" };
+        let started = std::time::Instant::now();
+        let mut shots = vec![25u64, 150];
+        while !*harness.state() && started.elapsed().as_secs() < 3600 {
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if shots.first().is_some_and(|&s| started.elapsed().as_secs() >= s) {
+                let s = shots.remove(0);
+                let path = out.join(format!("log_{s}s_{theme}.png"));
+                harness.render().expect("render").save(&path).unwrap();
+                println!("{}", path.display());
+            }
+        }
+        harness.run_steps(4);
+        let path = out.join(format!("log_end_{theme}.png"));
+        harness.render().expect("render").save(&path).unwrap();
+        println!("{} after {:.0} s", path.display(), started.elapsed().as_secs_f64());
+        let saved: Vec<_> = std::fs::read_dir(&saved_in)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("xnova_log_"))
+            .collect();
+        println!("saved: {saved:?}");
+        assert!(!saved.is_empty(), "the log is saved next to the results");
     }
 
     /// The list of every FASTA protein starts hidden; the chosen ones are

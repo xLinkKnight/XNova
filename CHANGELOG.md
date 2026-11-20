@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- A log that says what a search is doing, at every moment. sage.exe begins with the computer (operating system, processor, memory), the database, the spectrum files (how many of each kind, their size), the settings that decide the matches, the crosslinker and the order of the work; writes a line for each spectrum file it reads (how long it took, how many spectra); writes a `progress:` line every 15 s on any step that runs longer (the files read or spectra searched of the total, the rate, the time left, the file being read); gives the crosslink FDR's matches at 1% by group (targets, target-decoy and decoy-decoy matches; inter- and intra-protein, loop-links, multivalent; recorded and guessed charges); and ends with where the time went (reading the spectra, the linear search, the crosslink search, everything else). On our DSSO search of RNA polymerase II with PRP40 (21 timsTOF runs) the log is never quiet for more than about 15 s; in v1.9.2 it went quiet for up to 16 minutes.
+- sage-gui's log (Progress tab) shows each line with the local time it arrived, written the way Windows is set to write times and dates (Settings > Time & language > Language & region: 1:32:22 PM in the US, 13:32:22 in the UK, a 24-hour clock if chosen there), a line with the date where a day begins, and sage.exe's messages without its own UTC timestamp and module name. Before each line: the time of day, the date and time, the time since the start, or nothing. It counts the warnings and errors, saves the log (Save log...) and saves it next to the results when a search ends (`xnova_log_<date>_<time>.txt`). While a search runs, sage-gui notes the computer's CPU and memory use every minute, and says so when sage.exe has written nothing for 2 minutes. Files > Resources > Log detail > Verbose adds sage.exe's detail messages, such as each spectrum file with its size.
+
+### Changed
+- The program icon (both exe files, sage-gui's window and taskbar) is the XNova icon in fuchsia to orange.
+
+### Fixed
+- A warning of the retention-time alignment (few landmark peptides) had a run of spaces in the middle.
+
 ## [v1.9.3] - 2026-11-19
 
 ### Changed

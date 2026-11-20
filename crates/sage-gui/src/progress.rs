@@ -371,7 +371,7 @@ impl Tracker {
             self.set_metric("RAM limit", line["RAM limit: ".len()..].to_string());
             return;
         }
-        if line.starts_with("=== ") {
+        if line.starts_with("=== ") || line.starts_with(crate::runner::NOTE) {
             return;
         }
 
@@ -389,6 +389,10 @@ impl Tracker {
             }
             return;
         };
+        // sage.exe's word on a long step (every 15 s): not a stage of its own
+        if msg.starts_with("progress:") {
+            return;
+        }
         match level {
             "WARN" => self.warnings.push(msg.to_string()),
             "ERROR" => self.errors.push(msg.to_string()),

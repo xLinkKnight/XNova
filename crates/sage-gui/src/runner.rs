@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::clock::Stamp;
 
 const MAX_LOG_LINES: usize = 20_000;
 
@@ -20,6 +22,19 @@ pub struct Step {
     pub skip_if_exists: Option<PathBuf>,
     /// Cap on the program's memory in bytes (see [`crate::system::MemoryCap`])
     pub memory_limit: Option<u64>,
+    /// Environment variables of the program (e.g. `SAGE_LOG` for more detail)
+    pub env: Vec<(String, String)>,
+}
+
+/// Lines starting with this are sage-gui's own notes in the log (the CPU and
+/// memory in use, the log saved), not the programs' output
+pub const NOTE: &str = "# ";
+
+/// The job's output: each line, and when it arrived
+#[derive(Clone, Default)]
+pub struct Log {
+    pub lines: Vec<String>,
+    pub stamps: Vec<Stamp>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -32,7 +47,10 @@ pub enum Status {
 
 pub struct Job {
     /// The latest output lines (older ones are dropped beyond `MAX_LOG_LINES`)
-    pub log: Arc<Mutex<Vec<String>>>,
+    pub log: Arc<Mutex<Log>>,
+    /// When the job began
+    pub start: Instant,
+    ctx: eframe::egui::Context,
     /// Lines ever written to `log`, so readers can tell which ones are new
     pub total: Arc<AtomicUsize>,
     pub status: Arc<Mutex<Status>>,
@@ -42,7 +60,9 @@ pub struct Job {
 impl Job {
     pub fn start(steps: Vec<Step>, ctx: eframe::egui::Context) -> Job {
         let job = Job {
-            log: Arc::new(Mutex::new(Vec::new())),
+            log: Arc::new(Mutex::new(Log::default())),
+            start: Instant::now(),
+            ctx: ctx.clone(),
             total: Arc::new(AtomicUsize::new(0)),
             status: Arc::new(Mutex::new(Status::Running("starting".into()))),
             cancel: Arc::new(AtomicBool::new(false)),
@@ -51,9 +71,10 @@ impl Job {
         let total = job.total.clone();
         let status = job.status.clone();
         let cancel = job.cancel.clone();
+        let start = job.start;
 
         std::thread::spawn(move || {
-            let push = |line: String| push_line(&log, &total, &ctx, line);
+            let push = |line: String| push_line(&log, &total, &ctx, start, line);
             let result = run_steps(&steps, &push, &status, &cancel);
             let end = match result {
                 Ok(()) => Status::Finished,
@@ -83,17 +104,25 @@ impl Job {
     pub fn is_running(&self) -> bool {
         matches!(self.status(), Status::Running(_))
     }
+
+    /// Add sage-gui's own note to the log
+    pub fn note(&self, text: &str) {
+        push_line(&self.log, &self.total, &self.ctx, self.start, format!("{NOTE}{text}"));
+    }
 }
 
-fn push_line(log: &Mutex<Vec<String>>, total: &AtomicUsize, ctx: &eframe::egui::Context, line: String) {
+fn push_line(log: &Mutex<Log>, total: &AtomicUsize, ctx: &eframe::egui::Context, start: Instant, line: String) {
     let mut log = log.lock().unwrap();
-    log.push(line);
+    log.lines.push(line);
+    log.stamps.push(Stamp::now(start.elapsed()));
     total.fetch_add(1, Ordering::Relaxed);
-    if log.len() > MAX_LOG_LINES {
-        let excess = log.len() - MAX_LOG_LINES;
-        log.drain(..excess);
+    if log.lines.len() > MAX_LOG_LINES {
+        let excess = log.lines.len() - MAX_LOG_LINES;
+        log.lines.drain(..excess);
+        log.stamps.drain(..excess);
     }
-    ctx.request_repaint();
+    // at most 10 redraws a second, however fast lines come
+    ctx.request_repaint_after(Duration::from_millis(100));
 }
 
 fn run_steps(
@@ -132,6 +161,7 @@ fn command_line(program: &Path, args: &[OsString]) -> String {
 fn run_one(step: &Step, push: &(dyn Fn(String) + Sync), cancel: &AtomicBool) -> Result<(), String> {
     let mut cmd = Command::new(&step.program);
     cmd.args(&step.args)
+        .envs(step.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -378,6 +408,7 @@ pub fn conversion_step(converter: &Path, raw: &Path, out_dir: &Path, noise: bool
         args,
         skip_if_exists: Some(output),
         memory_limit: None,
+        env: Vec::new(),
     }
 }
 
