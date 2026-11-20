@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.4] - 2026-11-19
 
 ### Added
 - A log that says what a search is doing, at every moment. sage.exe begins with the computer (operating system, processor, memory), the database, the spectrum files (how many of each kind, their size), the settings that decide the matches, the crosslinker and the order of the work; writes a line for each spectrum file it reads (how long it took, how many spectra); writes a `progress:` line every 15 s on any step that runs longer (the files read or spectra searched of the total, the rate, the time left, the file being read); gives the crosslink FDR's matches at 1% by group (targets, target-decoy and decoy-decoy matches; inter- and intra-protein, loop-links, multivalent; recorded and guessed charges); and ends with where the time went (reading the spectra, the linear search, the crosslink search, everything else). On our DSSO search of RNA polymerase II with PRP40 (21 timsTOF runs) the log is never quiet for more than about 15 s; in v1.9.2 it went quiet for up to 16 minutes.
