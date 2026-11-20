@@ -167,6 +167,12 @@ pub enum Reagent {
     Bs2g,
     Dsso,
     Dsbu,
+    /// Disuccinimidyl diacetic urea (ureido-2,2'-diacetic acid bis-NHS ester):
+    /// DSBU's MS-cleavable urea with C2 arms
+    Dsau,
+    /// Disuccinimidyl dipropionic urea (ureido-3,3'-dipropionic acid bis-NHS
+    /// ester): DSBU's MS-cleavable urea with C3 arms
+    Dspu,
     /// Zero-length carbodiimide: amide bond between an amine and a carboxyl
     Edc,
     /// Zero-length triazine coupling reagent, same chemistry as EDC
@@ -174,10 +180,31 @@ pub enum Reagent {
     /// Asymmetric MS-cleavable sulfoxide with an alkyne handle for click
     /// enrichment (XLMOD:02253; PMID 31593346)
     Clixlink,
+    /// Disuccinimidyl phenyl phosphonic acid (DSPP): non-cleavable, its
+    /// phosphonic acid enriches crosslinked peptides by IMAC (XLMOD:02258,
+    /// UNIMOD:2058; Steigenberger et al. 2019, PMC6764163)
+    Phox,
+    /// tert-Butyl disuccinimidyl phenyl phosphonate (tBu-PhoX): PhoX with its
+    /// phosphonate masked by two tert-butyl groups, so it enters cells. The
+    /// TFA step before IMAC removes them, which leaves PhoX's crosslink
+    /// (UNIMOD:2058 "DSPP/TBDSPP"; Jiang et al. 2022, doi:10.1002/anie.202113937)
+    Tbdspp,
+    /// Succinimidyl 4,4'-azipentanoate (and sulfo-SDA): an NHS ester on one
+    /// end, a diazirine on the other that UV light turns into a carbene,
+    /// which reacts with any residue (XLMOD:02134)
+    Sda,
 }
 
 /// Zero-length amide bond formation releases one water
 const ZERO_LENGTH: f32 = -18.010565;
+
+/// What a diazirine's carbene reacts with: every amino acid
+pub const SDA_CARBENE: &str = "ACDEFGHIKLMNPQRSTVWY";
+
+/// Does a linker end with these residues take any amino acid (SDA's carbene)?
+pub fn takes_any_residue(residues: &str) -> bool {
+    SDA_CARBENE.chars().all(|c| residues.contains(c))
+}
 
 /// Link-site role: can react with the linker's first end ([`CrosslinkSettings::site1`])
 pub const SITE1: u8 = 1;
@@ -197,9 +224,36 @@ impl Reagent {
             Reagent::Dsg | Reagent::Bs2g => 96.02113,
             Reagent::Dsso => 158.00376,
             Reagent::Dsbu => 196.08479,
+            // C5H4N2O3 and C7H8N2O3: DSBU's C9H12N2O3 with shorter arms
+            Reagent::Dsau => 140.02219,
+            Reagent::Dspu => 168.05349,
             Reagent::Edc | Reagent::Dmtmm => ZERO_LENGTH,
             // C12H13NO4S
             Reagent::Clixlink => 267.05653,
+            // C8H3O5P
+            Reagent::Phox | Reagent::Tbdspp => 209.97181,
+            // C5H6O: the carbene keeps the hydrogen of the bond it inserts into
+            Reagent::Sda => 82.04186,
+        }
+    }
+
+    /// The reagent's usual name
+    pub fn name(self) -> &'static str {
+        match self {
+            Reagent::Dss => "DSS",
+            Reagent::Bs3 => "BS3",
+            Reagent::Dsg => "DSG",
+            Reagent::Bs2g => "BS2G",
+            Reagent::Dsso => "DSSO",
+            Reagent::Dsbu => "DSBU",
+            Reagent::Dsau => "DSAU",
+            Reagent::Dspu => "DSPU",
+            Reagent::Edc => "EDC",
+            Reagent::Dmtmm => "DMTMM",
+            Reagent::Clixlink => "cliXlink",
+            Reagent::Phox => "PhoX",
+            Reagent::Tbdspp => "TBDSPP",
+            Reagent::Sda => "SDA",
         }
     }
 
@@ -208,6 +262,9 @@ impl Reagent {
         match self {
             // amine (Lys, protein N-terminus) to carboxyl (Asp, Glu, protein C-terminus)
             Reagent::Edc | Reagent::Dmtmm => Some(("K[", "DE]")),
+            // NHS ester (amines and the weaker S, T, Y) to the diazirine's
+            // carbene, which takes any residue
+            Reagent::Sda => Some(("KSTY[", SDA_CARBENE)),
             _ => None,
         }
     }
@@ -223,6 +280,21 @@ impl Reagent {
             Reagent::Dsbu => Some(CleavableStubs {
                 short: 85.05276,
                 long: 111.03203,
+                alt: vec![],
+                other: None,
+            }),
+            // The urea breaks on either side, as DSBU's: one arm keeps an amine
+            // (-CO-(CH2)n-NH2), the other an isocyanate (-CO-(CH2)n-NCO), 25.979
+            // Da apart. DSAU (n = 1): C2H3NO / C3HNO2. DSPU (n = 2): C3H5NO / C4H3NO2.
+            Reagent::Dsau => Some(CleavableStubs {
+                short: 57.02146,
+                long: 83.00073,
+                alt: vec![],
+                other: None,
+            }),
+            Reagent::Dspu => Some(CleavableStubs {
+                short: 71.03711,
+                long: 97.01638,
                 alt: vec![],
                 other: None,
             }),
@@ -272,7 +344,8 @@ pub enum Backend {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct CrosslinkSettings {
-    /// Reagent preset (`dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`). Sets the
+    /// Reagent preset (`dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `dsau`,
+    /// `dspu`, `edc`, `dmtmm`, `clixlink`, `phox`, `tbdspp`, `sda`). Sets the
     /// linker mass and, for cleavable reagents, the stub masses. Default DSS/BS3.
     #[serde(default)]
     pub reagent: Option<Reagent>,
@@ -512,8 +585,12 @@ impl CrosslinkSettings {
             Reagent::Dsg | Reagent::Bs2g => (5, 0),  // C5H4O2
             Reagent::Dsso => (6, 1),                 // C6H6O3S
             Reagent::Dsbu => (9, 0),                 // C9H14N2O3
+            Reagent::Dsau => (5, 0),                 // C5H4N2O3
+            Reagent::Dspu => (7, 0),                 // C7H8N2O3
             Reagent::Edc | Reagent::Dmtmm => (0, 0), // -H2O
             Reagent::Clixlink => (12, 1),            // C12H13NO4S
+            Reagent::Phox | Reagent::Tbdspp => (8, 0), // C8H3O5P
+            Reagent::Sda => (5, 0),                  // C5H6O
         }
     }
 
@@ -535,6 +612,11 @@ impl CrosslinkSettings {
             // XLMOD:02253 carries no mass in Annotator's copy of XLMOD; the
             // exact mass, as f32 would print +267.05652
             (Some(Reagent::Clixlink), _) => "+267.05653".into(),
+            // as formulas: Annotator's copy of XLMOD may not have the terms
+            (Some(Reagent::Phox | Reagent::Tbdspp), _) => "Formula:C8H3O5P".into(),
+            (Some(Reagent::Dsau), _) => "Formula:C5H4N2O3".into(),
+            (Some(Reagent::Dspu), _) => "Formula:C7H8N2O3".into(),
+            (Some(Reagent::Sda), _) => "Formula:C5H6O".into(),
             (None, Some(mass)) => format!("{mass:+}"),
         }
     }
@@ -3087,6 +3169,61 @@ mod test {
         )
         .unwrap();
         assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn urea_phosphonate_and_diazirine_presets() {
+        // DSAU and DSPU: DSBU's urea with C2 and C3 arms, so its stubs (an
+        // amine and an isocyanate, 25.979 Da apart) shorter by CH2 and C2H4
+        for (key, mass, short) in [("dsau", 140.02219, 57.02146), ("dspu", 168.05349, 71.03711)] {
+            let cfg: CrosslinkSettings = serde_json::from_str(&format!(r#"{{"reagent": "{key}"}}"#)).unwrap();
+            assert!(cfg.validate().is_ok(), "{key}");
+            assert!((cfg.linker_mass() - mass).abs() < 1e-4, "{key}");
+            let stubs = cfg.stubs().unwrap();
+            assert!((stubs.short - short).abs() < 1e-4, "{key}");
+            assert!((stubs.long - stubs.short - 25.97927).abs() < 1e-3, "{key}");
+            assert!((stubs.short + stubs.long - cfg.linker_mass()).abs() < 1e-3, "{key}");
+        }
+        let dsbu = Reagent::Dsbu.stubs().unwrap();
+        assert!((dsbu.short - Reagent::Dspu.stubs().unwrap().short - 14.01565).abs() < 1e-3);
+        assert!((dsbu.short - Reagent::Dsau.stubs().unwrap().short - 28.0313).abs() < 1e-3);
+        // PhoX, and TBDSPP once TFA has removed its tert-butyl groups: C8H3O5P
+        for key in ["phox", "tbdspp"] {
+            let cfg: CrosslinkSettings = serde_json::from_str(&format!(r#"{{"reagent": "{key}"}}"#)).unwrap();
+            assert!(cfg.validate().is_ok() && !cfg.is_cleavable() && !cfg.is_heterobifunctional(), "{key}");
+            assert!((cfg.linker_mass() - 209.97181).abs() < 1e-4, "{key}");
+        }
+        // SDA: C5H6O, from an amine (or S, T, Y) to any residue
+        let sda: CrosslinkSettings = serde_json::from_str(r#"{"reagent": "sda"}"#).unwrap();
+        assert!(sda.validate().is_ok() && !sda.is_cleavable() && sda.is_heterobifunctional());
+        assert!((sda.linker_mass() - 82.04186).abs() < 1e-4);
+        // every residue but the C-terminal K takes the carbene; K the NHS ester too
+        let p = peptide("AKGDKEFK", "P", Position::Internal);
+        assert_eq!(
+            sda.link_site_roles(&p),
+            vec![(0, SITE2), (1, SITE1 | SITE2), (2, SITE2), (3, SITE2), (4, SITE1 | SITE2), (5, SITE2), (6, SITE2)]
+        );
+        let names = [Reagent::Phox, Reagent::Tbdspp, Reagent::Sda, Reagent::Dsau, Reagent::Dspu].map(Reagent::name);
+        assert_eq!(names, ["PhoX", "TBDSPP", "SDA", "DSAU", "DSPU"]);
+    }
+
+    #[test]
+    fn finds_a_photo_link_from_lys_to_any_residue() {
+        let (db, a, b) = pair_fixture();
+        let sc = scorer(&db);
+        let cfg = CrosslinkSettings { reagent: Some(Reagent::Sda), ..Default::default() };
+        // GLE[K]VSTAAMQR (K, the NHS ester) to TDYH[F]PNEWKLIR (F, the carbene)
+        let query = linked_spectrum(&db, &a, &b, 3, 4, cfg.linker_mass());
+        for kernel in [None, Some(kernel_for(&db, &cfg))] {
+            let xl = CrosslinkScorer::new(&sc, &cfg).with_kernel(kernel.as_ref().map(|k| k as &dyn ChainKernel));
+            let hits = xl.score(&query);
+            assert!(!hits.is_empty());
+            assert!(hits[0].precursor_ppm.abs() < 1.0);
+            assert_eq!(
+                pair_set(&db, &hits[0]),
+                vec![("GLEKVSTAAMQR".to_string(), 3), ("TDYHFPNEWKLIR".to_string(), 4)]
+            );
+        }
     }
 
     /// A confident target crosslink match of `a` and `b`, as `assign_q_values` leaves it

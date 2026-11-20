@@ -430,10 +430,11 @@ impl Runner {
         }
 
         let path = self.make_path("results.json");
-        println!("{}", serde_json::to_string_pretty(&self.parameters)?);
         let bytes = serde_json::to_vec_pretty(&self.parameters)?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         self.parameters.output_paths.push(path);
+        // the settings, files and checks for people; results.json has them as JSON
+        crate::summary::to_log(&self.parameters);
 
         self.log_time_summary();
         let run_time = (Instant::now() - self.start).as_secs();

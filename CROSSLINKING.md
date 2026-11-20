@@ -4,12 +4,12 @@ Sage can search for chemically crosslinked peptides. Add a `crosslink` block to
 the usual JSON configuration to enable it; omit it and Sage behaves exactly as
 before. Two strategies are used, chosen by the reagent:
 
-* **MS-cleavable** reagents (**DSSO**, **DSBU**, **cliXlink**): `"crosslink": {"reagent": "dsso"}`.
-  Recommended for proteome-scale work - see [Cleavable linkers](#ms-cleavable-linkers-dsso-dsbu-clixlink).
-* **Non-cleavable** reagents (DSS, BS3, DSG, BS2G, custom): the default.
-* **Zero-length / heterobifunctional** reagents (**EDC**, **DMTMM**, custom
+* **MS-cleavable** reagents (**DSSO**, **DSBU**, **DSAU**, **DSPU**, **cliXlink**): `"crosslink": {"reagent": "dsso"}`.
+  Recommended for proteome-scale work - see [Cleavable linkers](#ms-cleavable-linkers-dsso-dsbu-dsau-dspu-clixlink).
+* **Non-cleavable** reagents (DSS, BS3, DSG, BS2G, PhoX, TBDSPP, custom): the default.
+* **Zero-length / heterobifunctional** reagents (**EDC**, **DMTMM**, **SDA**, custom
   `site1`/`site2`): ends that react with different groups - see
-  [Heterobifunctional and zero-length reagents](#heterobifunctional-and-zero-length-reagents-edc-dmtmm).
+  [Heterobifunctional and zero-length reagents](#heterobifunctional-and-zero-length-reagents-edc-dmtmm-sda).
 
 ```json
 {
@@ -30,7 +30,7 @@ before. Two strategies are used, chosen by the reagent:
 
 | key | default | meaning |
 |---|---|---|
-| `reagent` | none | preset: `dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `clixlink`, `edc`, `dmtmm`. Sets the linker mass (and stub masses for cleavable reagents, sites for EDC/DMTMM) |
+| `reagent` | none | preset: `dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `dsau`, `dspu`, `clixlink`, `phox`, `tbdspp`, `edc`, `dmtmm`, `sda`. Sets the linker mass (and stub masses for cleavable reagents, sites for EDC/DMTMM/SDA) |
 | `mass` | `138.06808` | custom reagents only (not with `reagent`): mass added to the *pair* of peptides; may be negative down to -20 for zero-length couplings (-18.010565) |
 | `cleavable` | none | MS-cleavable stub masses: `{"short": .., "long": .., "alt": [..]}`; `short + long` must equal the linker mass. An asymmetric linker adds its second arm as `"other": {"short": .., "long": .., "alt": [..]}`; then each arm's short stub + the other arm's long stub must equal the linker mass. Required for custom cleavable reagents; with a cleavable preset it replaces the preset stubs |
 | `backend` | `"cpu"` | non-cleavable search algorithm / hardware: `cpu`, `reflect`, `gpu`, `auto` - see [Choosing a backend](#choosing-a-backend) |
@@ -149,7 +149,7 @@ bait and its candidate partners, give two FASTA files instead of `fasta`:
   both are given). In `sage-gui`: Files tab → Two-database crosslink search;
   setting either file greys out the FASTA field.
 
-## Heterobifunctional and zero-length reagents (EDC, DMTMM)
+## Heterobifunctional and zero-length reagents (EDC, DMTMM, SDA)
 
 ```json
 "crosslink": { "reagent": "edc" }
@@ -179,7 +179,38 @@ hypothetical amine-to-sulfhydryl linker:
 Explicit `site1`/`site2` may also be combined with `"reagent": "edc"` to narrow
 or extend its chemistry (e.g. `"site1": "KST["`).
 
-## MS-cleavable linkers (DSSO, DSBU, cliXlink)
+**SDA** (succinimidyl 4,4'-azipentanoate, and sulfo-SDA) is a photo-crosslinker:
+its NHS ester takes an amine first, then UV light turns its diazirine into a
+carbene that reacts with any residue nearby. The linker mass is **82.04186 Da**
+(C5H6O; XLMOD:02134), not MS-cleavable, and its two ends are
+
+| | reacts with | spec |
+|---|---|---|
+| `site1` | Lys, Ser, Thr, Tyr, protein N-terminus (NHS ester) | `"KSTY["` |
+| `site2` | any residue (carbene) | `"ACDEFGHIKLMNPQRSTVWY"` |
+
+Every residue of a peptide is then a candidate link site, so an SDA search tries
+far more placements than an NHS-ester one and takes longer. A residue with a
+static modification (carbamidomethyl C) is not linked; there is no warning for
+it on the carbene end.
+
+## Non-cleavable phosphonate linkers (PhoX, TBDSPP)
+
+```json
+"crosslink": { "reagent": "phox" }
+```
+
+**PhoX** (DSPP, disuccinimidyl phenyl phosphonic acid; XLMOD:02258) is an NHS
+ester at each end of a phenyl ring that carries a phosphonic acid, so
+crosslinked peptides can be enriched by IMAC (Steigenberger et al., ACS Central
+Science 2019). **TBDSPP** (tert-butyl disuccinimidyl phenyl phosphonate,
+tBu-PhoX) is PhoX with its phosphonate masked by tert-butyl groups so that it
+enters cells (Jiang et al., Angew. Chem. 2022, doi:10.1002/anie.202113937). The
+TFA step before IMAC removes them and leaves PhoX's crosslink, so both presets add
+**209.97181 Da** (C8H3O5P; Unimod's "Xlink:DSPP[210]", UNIMOD:2058). Neither is
+MS-cleavable.
+
+## MS-cleavable linkers (DSSO, DSBU, DSAU, DSPU, cliXlink)
 
 ```json
 "crosslink": { "reagent": "dsso" }
@@ -192,8 +223,16 @@ reagent differ by a fixed mass, so every peptide shows up as a **doublet**:
 | reagent | linker | stubs | doublet spacing |
 |---|---|---|---|
 | DSSO | 158.00376 | 54.01056 (alkene), 103.99320 (sulfenic acid); also 85.98264 (thiol) | 49.98264 |
-| DSBU | 196.08479 | 85.05276, 111.03203 | 25.97927 |
+| DSBU | 196.08479 | 85.05276 (Bu, amine), 111.03203 (BuUr, isocyanate) | 25.97927 |
+| DSAU | 140.02219 | 57.02146 (Ac, amine), 83.00073 (AcUr, isocyanate) | 25.97927 |
+| DSPU | 168.05349 | 71.03711 (Pr, amine), 97.01638 (PrUr, isocyanate) | 25.97927 |
 | cliXlink | 267.05653 | arm 1: 54.01056, 103.99320; also 85.98264 / arm 2 (alkyne tag): 163.06333, 213.04596; also 195.03540 | 49.98264 (both arms) |
+
+DSAU (disuccinimidyl diacetic urea) and DSPU (disuccinimidyl dipropionic urea)
+are DSBU with shorter arms (C2 and C3 instead of C4): the urea breaks on either
+side, leaving an amine on one peptide and an isocyanate on the other. Their
+stubs are DSBU's less one CH2 (DSPU) or two (DSAU), and their doublets are
+25.97927 Da apart, as DSBU's.
 
 cliXlink is **asymmetric**: its two arms are different, so a cleavage leaves one
 arm's short stub on one peptide and the *other* arm's long stub on its partner.
@@ -624,7 +663,8 @@ to `crosslinks.sage.tsv`:
   ends), static and variable modifications, and the matched protein sequences.
   Upload it with the same FASTA and mzML files. It is not written when there are
   no target matches (ProXL rejects an empty file). The linker is named after the
-  reagent (`dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `clixlink`, `edc`, `dmtmm`; a custom
+  reagent (`dss`, `bs3`, `dsg`, `bs2g`, `dsso`, `dsbu`, `dsau`, `dspu`, `clixlink`, `phox`,
+  `tbdspp`, `edc`, `dmtmm`, `sda`; a custom
   mass is `custom`) and always carries its mass and reactive ends.
 
 Peptide positions in proteins come from the FASTA; a decoy peptide is placed
@@ -765,7 +805,8 @@ generates and matches its fragments. Nothing else needs to be installed.
 * MS-cleavable linkers: ions carrying a **stub** are found for each peptide
   (the peptide alone with the stub on its linked residue, fragmented by
   Annotator's engine) and shown in the stub's colour (DSSO: A alkene teal, T
-  thiol amber, S sulfenic acid magenta; DSBU: Bu, BuUr; cliXlink's alkyne arm
+  thiol amber, S sulfenic acid magenta; DSBU: Bu, BuUr; DSAU: Ac, AcUr; DSPU:
+  Pr, PrUr; cliXlink's alkyne arm
   A', T', S'):
   * the whole peptide + stub (the doublet peaks, at every charge below the
     precursor's) as a triangle on the bridge pointing at that peptide;
@@ -1287,7 +1328,9 @@ crosslink as one peptide.
   found through the ring ions of the opened linker (see "Loop-links of
   MS-cleavable linkers"), so the two linked residues need sequence between them.
 * **Mono-links** (hydrolyzed/amidated dead-ends) are not part of this search;
-  search for them as an ordinary variable modification (`K: 156.0786`).
+  search for them as an ordinary variable modification (`K: 156.0786`). sage-gui's
+  Modifications tab adds every reagent's water-, ammonia- and Tris-quenched
+  monolink on K (Add crosslinker monolink...: a row per reagent, +H2O, +NH3, +Tris).
 * Loop-links are found through unshifted ions *outside* the ring, so the linked
   residues need flanking sequence.
 * Link positions are reported within peptides, not protein coordinates.

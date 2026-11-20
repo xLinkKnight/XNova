@@ -369,8 +369,14 @@ impl Input {
         // as a static mod, no lysine could carry a crosslink. Labelling after
         // crosslinking leaves linked lysines unlabelled, which a *variable* label
         // on K models (Sage then only links the unlabelled form).
+        // An end that takes any residue (SDA's carbene) is left out: it would
+        // flag every static modification, carbamidomethyl C included, and
+        // those residues are simply not linked
         let reactive = match crosslink.hetero_sites() {
-            Some((site1, site2)) => site1 + &site2,
+            Some((site1, site2)) => [site1, site2]
+                .into_iter()
+                .filter(|s| !sage_core::crosslink::takes_any_residue(s))
+                .collect::<String>(),
             None => crosslink.residues.clone(),
         };
         let blocked = self

@@ -246,6 +246,27 @@ fn state_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("sage-gui").join("state.json"))
 }
 
+/// Log detail from the saved state: verbose unless chosen otherwise. v1.9.4
+/// saved "log_detail" whether it was chosen or not, so its "normal" is not
+/// read as a choice.
+fn verbose_log(state: &serde_json::Value) -> bool {
+    state.get("log_level").and_then(|v| v.as_str()) != Some("normal")
+}
+
+#[cfg(test)]
+mod state_test {
+    use super::verbose_log;
+    use serde_json::json;
+
+    #[test]
+    fn the_log_is_verbose_unless_normal_was_chosen() {
+        assert!(verbose_log(&json!({})));
+        assert!(verbose_log(&json!({"log_detail": "normal"})), "v1.9.4's saved default");
+        assert!(verbose_log(&json!({"log_level": "verbose"})));
+        assert!(!verbose_log(&json!({"log_level": "normal"})));
+    }
+}
+
 impl SageGui {
     fn new(ctx: &egui::Context) -> Self {
         let mut app = SageGui {
@@ -272,7 +293,7 @@ impl SageGui {
             threads: system::cpu_threads(),
             max_ram_gb: 0.0,
             mimalloc: true,
-            verbose_log: false,
+            verbose_log: true,
             log_time: Default::default(),
             watch: Default::default(),
             gpus: system::gpus(),
@@ -305,7 +326,7 @@ impl SageGui {
             }
             app.max_ram_gb = state.get("max_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
             app.mimalloc = state.get("allocator").and_then(|v| v.as_str()) != Some("system");
-            app.verbose_log = state.get("log_detail").and_then(|v| v.as_str()) == Some("verbose");
+            app.verbose_log = verbose_log(&state);
             app.log_time = logview::TimeShown::from_key(state.get("log_time").and_then(|v| v.as_str()).unwrap_or(""));
             if let Some(Ok(s)) = state.get("config").map(Settings::from_json) {
                 app.s = s;
@@ -340,7 +361,7 @@ impl SageGui {
             "threads": self.threads,
             "max_ram_gb": self.max_ram_gb,
             "allocator": if self.mimalloc { "mimalloc" } else { "system" },
-            "log_detail": if self.verbose_log { "verbose" } else { "normal" },
+            "log_level": if self.verbose_log { "verbose" } else { "normal" },
             "log_time": self.log_time.key(),
             "config": self.s.to_json(&self.s.spectra),
         });
@@ -1936,8 +1957,9 @@ impl SageGui {
                 ui,
                 "Log detail",
                 "How much sage.exe writes to the log (Progress tab). Normal: what it is doing and what it has \
-                 found, with a progress line every 15 s on a long step. Verbose: its detail messages too, e.g. \
-                 each spectrum file with its size (SAGE_LOG=error,sage=debug). Takes effect at the next search.",
+                 found, with a progress line every 15 s on a long step. Verbose (the default): its detail messages \
+                 too, e.g. each spectrum file with its size (SAGE_LOG=error,sage=debug). Takes effect at the next \
+                 search.",
                 |ui| {
                     let a = ui.radio_value(&mut self.verbose_log, false, "Normal");
                     let b = ui.radio_value(&mut self.verbose_log, true, "Verbose");
@@ -2642,6 +2664,57 @@ pub fn neutral_loss_ui(ui: &mut Ui, losses: &mut String) -> egui::Response {
         .on_hover_text(NEUTRAL_LOSS_TIP)
 }
 
+/// "Add crosslinker monolink...": a row per crosslinker, a button per
+/// quencher (water, ammonia, Tris); the crosslinker chosen on the
+/// Crosslinking tab first
+fn monolink_menu(ui: &mut Ui, s: &mut Settings) {
+    let chosen = s.crosslink.enabled.then(|| s.crosslink.reagent.monolink_group()).flatten();
+    let mut groups: Vec<&str> = Vec::new();
+    for m in settings::MONOLINKS {
+        let group = settings::monolink_group_of(m);
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    if let Some(c) = chosen {
+        groups.sort_by_key(|g| *g != c);
+    }
+    ComboBox::from_id_salt("add_monolink")
+        .selected_text("Add crosslinker monolink\u{2026}")
+        .width(220.0)
+        .height(400.0)
+        .show_ui(ui, |ui| {
+            ui.label(RichText::new("On K: change the target for S, T, Y or the protein N-terminus.").weak());
+            egui::Grid::new("monolinks").num_columns(4).spacing([10.0, 4.0]).show(ui, |ui| {
+                for group in groups {
+                    if Some(group) == chosen {
+                        ui.label(theme::bold(group)).on_hover_text("The crosslinker chosen on the Crosslinking tab");
+                    } else {
+                        ui.label(group);
+                    }
+                    for m in settings::MONOLINKS.iter().filter(|m| settings::monolink_group_of(m) == group) {
+                        let name = if m.name.is_empty() { "reported by its mass" } else { m.name };
+                        if ui
+                            .button(settings::monolink_quencher(m))
+                            .on_hover_text(format!("{}: {:+.6} Da on K, variable ({name})", m.label, m.mass))
+                            .clicked()
+                        {
+                            s.mods.push(m.into());
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        })
+        .response
+        .on_hover_text(
+            "Add a crosslinker's monolink: one end of the linker on the protein, the other quenched by water \
+             (hydrolyzed), ammonia (amidated) or Tris. A residue carrying a monolink is not counted as a link \
+             site. In a linear search, 'mass offset' (Search column) keeps these large modifications out of the \
+             index.",
+        );
+}
+
 fn modifications_tab(
     ui: &mut Ui,
     s: &mut Settings,
@@ -2657,20 +2730,27 @@ fn modifications_tab(
         ComboBox::from_id_salt("add_preset")
             .selected_text("Add common modification…")
             .width(280.0)
+            // the common modifications and every crosslinker's monolinks
+            .height(640.0)
             .show_ui(ui, |ui| {
-                for p in settings::PRESETS {
+                let mut offer = |ui: &mut Ui, p: &settings::Preset| {
                     let kind = if p.kind == ModKind::Fixed { "fixed" } else { "variable" };
+                    let name = if p.name.is_empty() { "reported by its mass" } else { p.name };
                     if ui
                         .selectable_label(false, p.label)
-                        .on_hover_text(format!("{:+.6} Da on {}, {} by default ({})", p.mass, p.target, kind, p.name))
+                        .on_hover_text(format!("{:+.6} Da on {}, {} by default ({})", p.mass, p.target, kind, name))
                         .clicked()
                     {
                         s.mods.push(p.into());
                     }
+                };
+                for p in settings::PRESETS {
+                    offer(ui, p);
                 }
             })
             .response
             .on_hover_text("Pick a frequently used modification; mass and Unimod name are filled in.");
+        monolink_menu(ui, s);
         if ui
             .button("Add custom modification")
             .on_hover_text("Add an empty row and enter the target and mass yourself.")
@@ -3108,15 +3188,23 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: 
                 • DSS / BS3: 138.06808 Da, non-cleavable\n• DSG / BS2G: 96.02113 Da, non-cleavable\n\
                 • DSSO: 158.00376 Da, MS-cleavable (stubs 54.011 / 103.993 / 85.983)\n\
                 • DSBU: 196.08479 Da, MS-cleavable (stubs 85.053 / 111.032)\n\
+                • DSAU and DSPU: DSBU's urea with shorter arms (C2, C3): 140.02219 Da (stubs 57.021 / 83.001) and \
+                168.05349 Da (stubs 71.037 / 97.016), MS-cleavable\n\
                 • cliXlink: 267.05653 Da, MS-cleavable and asymmetric: the plain arm leaves DSSO-like stubs \
                 (54.011 / 103.993 / 85.983), the alkyne-tagged arm 163.063 / 213.046 / 195.035\n\
                 • EDC / DMTMM: zero-length (-18.01056 Da, the water released when the amide forms); \
                 link an amine (K, protein N-term) to a carboxyl (D, E, protein C-term)\n\
+                • PhoX (DSPP): 209.97181 Da, non-cleavable; its phosphonic acid enriches crosslinked peptides by IMAC\n\
+                • TBDSPP (tBu-PhoX): PhoX with tert-butyl groups that let it into cells; the TFA step before IMAC \
+                removes them and leaves PhoX's 209.97181 Da\n\
+                • SDA / sulfo-SDA: 82.04186 Da, non-cleavable; the NHS ester takes K, S, T, Y and protein N-termini \
+                (Site 1), the diazirine, once UV light makes it a carbene, any residue (Site 2)\n\
                 MS-cleavable reagents use a fast doublet search that scales to whole proteomes.",
                 |ui| {
                     let before = xl.reagent;
                     let r = ComboBox::from_id_salt("reagent")
                         .width(260.0)
+                        .height(480.0)
                         .selected_text(library::reagent_text(xl, lib))
                         .show_ui(ui, |ui| {
                             for r in Reagent::ALL {
@@ -3934,6 +4022,60 @@ mod screenshots {
         let path = out.join("library_crosslinking_edit.png");
         harness.render().expect("render").save(&path).unwrap();
         println!("{}", path.display());
+    }
+
+    /// The crosslinker menus: SDA brings its two ends, and a monolink is added
+    /// as a variable modification on K. With `SAGE_GUI_FIGURES` set, the open
+    /// menus are saved as pictures (`menu_reagents.png`, `menu_monolinks.png`)
+    #[test]
+    fn crosslinker_menus() {
+        use egui_kittest::kittest::Queryable;
+        let out = std::env::var_os("SAGE_GUI_FIGURES").map(std::path::PathBuf::from);
+        let save = |harness: &mut Harness<'static>, name: &str| {
+            if let Some(dir) = &out {
+                // let the menu grow to its full height
+                harness.run_steps(30);
+                std::fs::create_dir_all(dir).unwrap();
+                let path = dir.join(name);
+                harness.render().expect("render").save(&path).unwrap();
+                println!("{}", path.display());
+            }
+        };
+        let state: std::rc::Rc<std::cell::RefCell<(Settings, library::Library, library::Editor)>> = Default::default();
+        state.borrow_mut().0.crosslink.enabled = true;
+
+        let mut harness = library_harness(state.clone(), true);
+        harness.run();
+        // egui's menu buttons have no text for accessibility: the Reagent
+        // menu is the tab's first
+        let first_menu = |harness: &Harness<'static>| {
+            harness.get_all_by_role(egui::accesskit::Role::ComboBox).next().expect("a menu").click()
+        };
+        first_menu(&harness);
+        harness.run();
+        save(&mut harness, "menu_reagents.png");
+        harness.get_by_label(Reagent::Sda.label()).click();
+        harness.run();
+        {
+            let xl = &state.borrow().0.crosslink;
+            assert_eq!(xl.reagent, Reagent::Sda);
+            assert!(xl.two_sites, "SDA's ends react with different groups");
+            assert_eq!(xl.site1.to_spec(), "KSTY[");
+            assert_eq!(xl.site2.to_spec(), sage_core::crosslink::SDA_CARBENE);
+        }
+
+        let mut harness = library_harness(state.clone(), false);
+        harness.run();
+        // the Add crosslinker monolink menu is the tab's second
+        harness.get_all_by_role(egui::accesskit::Role::ComboBox).nth(1).expect("the monolink menu").click();
+        harness.run();
+        save(&mut harness, "menu_monolinks.png");
+        // DSS/BS3, DSG/BS2G, DSSO: the third row's Tris
+        harness.get_all_by_label("+Tris").nth(2).expect("DSSO's row").click();
+        harness.run();
+        let (s, _, _) = &*state.borrow();
+        let m = s.mods.last().unwrap();
+        assert_eq!((m.target.as_str(), m.mass, m.name.as_str(), m.kind), ("K", 279.077658, "UNIMOD:1880", ModKind::Variable));
     }
 
     /// Saved crosslinkers: save the one set up, use it, edit it (cancel, then

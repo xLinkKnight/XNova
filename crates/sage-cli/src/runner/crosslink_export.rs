@@ -329,9 +329,15 @@ fn proxl_linker(settings: &CrosslinkSettings) -> (&'static str, Option<&'static 
         Some(Reagent::Bs2g) => ("bs2g", Some("C5H4O2"), Some(7.7)),
         Some(Reagent::Dsso) => ("dsso", Some("C6H6O3S"), Some(10.1)),
         Some(Reagent::Dsbu) => ("dsbu", Some("C9H14N2O3"), Some(12.5)),
+        Some(Reagent::Dsau) => ("dsau", Some("C5H4N2O3"), Some(7.7)),
+        Some(Reagent::Dspu) => ("dspu", Some("C7H8N2O3"), Some(10.1)),
         Some(Reagent::Edc) => ("edc", None, Some(0.0)),
         Some(Reagent::Dmtmm) => ("dmtmm", None, Some(0.0)),
         Some(Reagent::Clixlink) => ("clixlink", Some("C12H13NO4S"), Some(9.2)),
+        Some(Reagent::Phox) => ("phox", Some("C8H3O5P"), None),
+        // the crosslink left once TFA has removed the tert-butyl groups
+        Some(Reagent::Tbdspp) => ("tbdspp", Some("C8H3O5P"), None),
+        Some(Reagent::Sda) => ("sda", Some("C5H6O"), Some(3.9)),
         None if settings.mass.is_some() => ("custom", None, None),
         None => ("dss", Some("C8H10O2"), Some(11.4)),
     }

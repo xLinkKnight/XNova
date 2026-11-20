@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Five crosslinkers to choose from. PhoX (DSPP, 209.97181 Da) and TBDSPP (tBu-PhoX, the same crosslink once TFA has removed its tert-butyl groups): non-cleavable, IMAC-enrichable. DSAU (140.02219 Da) and DSPU (168.05349 Da): DSBU's MS-cleavable urea with C2 and C3 arms, stubs 57.02146 / 83.00073 and 71.03711 / 97.01638 Da (an amine and an isocyanate, 25.979 Da apart, as DSBU's). SDA and sulfo-SDA (82.04186 Da): a photo-crosslinker whose NHS ester takes K, S, T, Y and protein N-termini and whose diazirine any residue. The exports name them (mzIdentML: XLMOD:02258 PhoX, XLMOD:02134 SDA, UNIMOD:2058 for TBDSPP; DSAU and DSPU have no term), and the spectrum viewer names the urea stubs Ac/AcUr and Pr/PrUr.
+- sage-gui's Modifications tab has Add crosslinker monolink...: a row per crosslinker (DSS/BS3, DSG/BS2G, DSSO, DSBU, DSAU, DSPU, cliXlink, PhoX/TBDSPP; the one chosen on the Crosslinking tab first) with +H2O, +NH3 and +Tris, which add its monolink quenched by water (hydrolyzed), ammonia (amidated) or Tris as a variable modification on K, with Unimod's name where Unimod has it. Unimod's ammonia-quenched DSPP (UNIMOD:2061, 225.9905 Da) is one hydrogen short of PhoX + NH3 (226.9984 Da); the preset uses 226.9984 Da and reports it by its mass. Zero-length reagents and SDA have none.
+- sage.exe ends a search with a summary for people instead of the settings as JSON: the settings as a list under headings (database, spectra and matching, proteins, quantification, crosslinker, Bruker timsTOF, spectral libraries, and any other setting under its own name), the spectrum and output files by name under their folder, and the quality-control tables (digestion per file, MS1 polymers, diagnostic ions, entrapment) with aligned columns. results.json still has everything as JSON.
+
+### Changed
+- sage-gui's log detail is Verbose by default, also for those who used v1.9.4 (which saved Normal whether or not it was chosen); choosing Normal is remembered.
+- The run header names both ends of a two-site reagent (EDC: "K and protein N-termini to DE and protein C-termini").
+- Two messages of the timsTOF MS1 reader, written once per frame, are now trace messages, so a verbose log of a timsTOF search is not flooded by them.
+- The fixed-modification warning leaves out an end that takes any residue (SDA's carbene), which would flag carbamidomethyl C in every search.
+- sage-gui's menus may open taller (up to 760 px instead of egui's 400 px), so the Reagent menu shows all 15 reagents without scrolling.
+
 ## [v1.9.4] - 2026-11-19
 
 ### Added

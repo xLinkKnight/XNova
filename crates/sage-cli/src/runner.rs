@@ -590,14 +590,17 @@ impl Runner {
             if p.deisotope { "on" } else { "off" }
         );
         if let Some(xl) = &p.crosslink {
-            let name = xl.reagent.map(|r| format!("{r:?}").to_uppercase()).unwrap_or_else(|| "custom crosslinker".into());
+            let name = xl.reagent.map(|r| r.name().to_string()).unwrap_or_else(|| "custom crosslinker".into());
+            let sites = match xl.hetero_sites() {
+                Some((s1, s2)) => format!("{} to {}", crate::summary::site_text(&s1), crate::summary::site_text(&s2)),
+                None => format!("{}{}", xl.residues, if xl.protein_nterm { " and protein N-termini" } else { "" }),
+            };
             info!(
-                "crosslinker: {} ({:.4} Da{}) on {}{}; loop-links {}; multivalent {}",
+                "crosslinker: {} ({:.4} Da{}) on {}; loop-links {}; multivalent {}",
                 name,
                 xl.linker_mass(),
                 if xl.is_cleavable() { ", MS-cleavable" } else { "" },
-                if xl.residues.is_empty() { "its two sites" } else { xl.residues.as_str() },
-                if xl.protein_nterm { " and protein N-termini" } else { "" },
+                sites,
                 if xl.loop_links { "on" } else { "off" },
                 match xl.multivalent {
                     Some(v) if v >= 2 => format!("up to {v} linkers"),
@@ -856,11 +859,11 @@ impl Runner {
         self.run_linear(parallel, parquet)?;
 
         let path = self.make_path("results.json");
-        println!("{}", serde_json::to_string_pretty(&self.parameters)?);
-
         let bytes = serde_json::to_vec_pretty(&self.parameters)?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         self.parameters.output_paths.push(path);
+        // the settings, files and checks for people; results.json has them as JSON
+        crate::summary::to_log(&self.parameters);
 
         self.log_time_summary();
         let run_time = (Instant::now() - self.start).as_secs();

@@ -546,8 +546,9 @@ impl PeakBuffer {
             }
             if self.agg_buff.len() > MAX_PEAKS {
                 let curr_loc_int = self.peaks[idx].intensity;
+                // once per MS1 frame: trace, or a verbose log drowns in it
                 if curr_loc_int > 200.0 {
-                    log::debug!(
+                    log::trace!(
                         "Reached limit of the agg buffer at index {}/{} curr int={}",
                         idx,
                         self.len(),
@@ -592,7 +593,7 @@ impl PeakBuffer {
             global_num_included += num_includable;
 
             if global_num_included == self.len() {
-                log::debug!("All peaks were included in the centroiding");
+                log::trace!("All peaks were included in the centroiding");
                 break;
             }
         }

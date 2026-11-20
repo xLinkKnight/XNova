@@ -200,8 +200,58 @@ pub const PRESETS: &[Preset] = &[
     Preset { label: "TMT 6/10/11-plex (peptide N-term)", target: "^", mass: 229.162932, name: "UNIMOD:737", kind: ModKind::Fixed },
     Preset { label: "TMTpro 16/18-plex (K)", target: "K", mass: 304.207146, name: "UNIMOD:2016", kind: ModKind::Fixed },
     Preset { label: "TMTpro 16/18-plex (peptide N-term)", target: "^", mass: 304.207146, name: "UNIMOD:2016", kind: ModKind::Fixed },
-    Preset { label: "DSS/BS3 mono-link, hydrolyzed (K)", target: "K", mass: 156.078644, name: "", kind: ModKind::Variable },
 ];
+
+/// Crosslinker monolinks: one end of the linker on the protein, the other
+/// quenched by water (hydrolyzed), ammonia (amidated) or Tris, i.e. the
+/// linker mass plus H2O, NH3 or C4H11NO3. Offered on K; change the target for
+/// S, T, Y or the protein N-terminus. Unimod's names where it has the
+/// monolink; its ammonia-quenched DSPP/TBDSPP (UNIMOD:2061, 225.990534) is one
+/// hydrogen short of PhoX + NH3, so that one goes by its mass. Zero-length
+/// reagents (EDC, DMTMM) leave nothing behind, and SDA's diazirine end has no
+/// such quenched forms.
+pub const MONOLINKS: &[Preset] = &[
+    Preset { label: "DSS/BS3 monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 156.078644, name: "UNIMOD:1020", kind: ModKind::Variable },
+    Preset { label: "DSS/BS3 monolink, NH3-quenched (amidated) (K)", target: "K", mass: 155.094629, name: "UNIMOD:1789", kind: ModKind::Variable },
+    Preset { label: "DSS/BS3 monolink, Tris-quenched (K)", target: "K", mass: 259.141973, name: "UNIMOD:1877", kind: ModKind::Variable },
+    Preset { label: "DSG/BS2G monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 114.031694, name: "UNIMOD:1907", kind: ModKind::Variable },
+    Preset { label: "DSG/BS2G monolink, NH3-quenched (amidated) (K)", target: "K", mass: 113.047679, name: "UNIMOD:1906", kind: ModKind::Variable },
+    Preset { label: "DSG/BS2G monolink, Tris-quenched (K)", target: "K", mass: 217.095023, name: "UNIMOD:1908", kind: ModKind::Variable },
+    Preset { label: "DSSO monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 176.01433, name: "UNIMOD:1878", kind: ModKind::Variable },
+    Preset { label: "DSSO monolink, NH3-quenched (amidated) (K)", target: "K", mass: 175.030314, name: "UNIMOD:1879", kind: ModKind::Variable },
+    Preset { label: "DSSO monolink, Tris-quenched (K)", target: "K", mass: 279.077658, name: "UNIMOD:1880", kind: ModKind::Variable },
+    Preset { label: "DSBU monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 214.095357, name: "UNIMOD:1888", kind: ModKind::Variable },
+    Preset { label: "DSBU monolink, NH3-quenched (amidated) (K)", target: "K", mass: 213.111341, name: "UNIMOD:1887", kind: ModKind::Variable },
+    Preset { label: "DSBU monolink, Tris-quenched (K)", target: "K", mass: 317.158686, name: "UNIMOD:1889", kind: ModKind::Variable },
+    Preset { label: "DSAU monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 158.032757, name: "", kind: ModKind::Variable },
+    Preset { label: "DSAU monolink, NH3-quenched (amidated) (K)", target: "K", mass: 157.048741, name: "", kind: ModKind::Variable },
+    Preset { label: "DSAU monolink, Tris-quenched (K)", target: "K", mass: 261.096085, name: "", kind: ModKind::Variable },
+    Preset { label: "DSPU monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 186.064057, name: "", kind: ModKind::Variable },
+    Preset { label: "DSPU monolink, NH3-quenched (amidated) (K)", target: "K", mass: 185.080041, name: "", kind: ModKind::Variable },
+    Preset { label: "DSPU monolink, Tris-quenched (K)", target: "K", mass: 289.127385, name: "", kind: ModKind::Variable },
+    Preset { label: "cliXlink monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 285.067094, name: "", kind: ModKind::Variable },
+    Preset { label: "cliXlink monolink, NH3-quenched (amidated) (K)", target: "K", mass: 284.083078, name: "", kind: ModKind::Variable },
+    Preset { label: "cliXlink monolink, Tris-quenched (K)", target: "K", mass: 388.130422, name: "", kind: ModKind::Variable },
+    Preset { label: "PhoX/TBDSPP monolink, H2O-quenched (hydrolyzed) (K)", target: "K", mass: 227.982375, name: "UNIMOD:2059", kind: ModKind::Variable },
+    Preset { label: "PhoX/TBDSPP monolink, NH3-quenched (amidated) (K)", target: "K", mass: 226.998359, name: "", kind: ModKind::Variable },
+    Preset { label: "PhoX/TBDSPP monolink, Tris-quenched (K)", target: "K", mass: 331.045704, name: "UNIMOD:2060", kind: ModKind::Variable },
+];
+
+/// The crosslinker(s) a monolink preset belongs to: `DSSO`, `PhoX/TBDSPP`
+pub fn monolink_group_of(m: &Preset) -> &'static str {
+    m.label.split(" monolink").next().unwrap_or(m.label)
+}
+
+/// What quenched a monolink preset: `+H2O`, `+NH3` or `+Tris`
+pub fn monolink_quencher(m: &Preset) -> &'static str {
+    if m.label.contains("H2O") {
+        "+H2O"
+    } else if m.label.contains("NH3") {
+        "+NH3"
+    } else {
+        "+Tris"
+    }
+}
 
 impl From<&Preset> for Modification {
     fn from(p: &Preset) -> Self {
@@ -245,23 +295,33 @@ pub enum Reagent {
     Bs2g,
     Dsso,
     Dsbu,
+    Dsau,
+    Dspu,
     Edc,
     Dmtmm,
     Clixlink,
+    Phox,
+    Tbdspp,
+    Sda,
     Custom,
 }
 
 impl Reagent {
-    pub const ALL: [Reagent; 10] = [
+    pub const ALL: [Reagent; 15] = [
         Reagent::Dss,
         Reagent::Bs3,
         Reagent::Dsg,
         Reagent::Bs2g,
         Reagent::Dsso,
         Reagent::Dsbu,
+        Reagent::Dsau,
+        Reagent::Dspu,
         Reagent::Edc,
         Reagent::Dmtmm,
         Reagent::Clixlink,
+        Reagent::Phox,
+        Reagent::Tbdspp,
+        Reagent::Sda,
         Reagent::Custom,
     ];
 
@@ -273,9 +333,14 @@ impl Reagent {
             Reagent::Bs2g => "bs2g",
             Reagent::Dsso => "dsso",
             Reagent::Dsbu => "dsbu",
+            Reagent::Dsau => "dsau",
+            Reagent::Dspu => "dspu",
             Reagent::Edc => "edc",
             Reagent::Dmtmm => "dmtmm",
             Reagent::Clixlink => "clixlink",
+            Reagent::Phox => "phox",
+            Reagent::Tbdspp => "tbdspp",
+            Reagent::Sda => "sda",
             Reagent::Custom => "custom",
         }
     }
@@ -288,9 +353,14 @@ impl Reagent {
             Reagent::Bs2g => "BS2G (96.021 Da, non-cleavable)",
             Reagent::Dsso => "DSSO (158.004 Da, MS-cleavable)",
             Reagent::Dsbu => "DSBU (196.085 Da, MS-cleavable)",
+            Reagent::Dsau => "DSAU (140.022 Da, MS-cleavable)",
+            Reagent::Dspu => "DSPU (168.053 Da, MS-cleavable)",
             Reagent::Edc => "EDC (zero-length, -18.011 Da)",
             Reagent::Dmtmm => "DMTMM (zero-length, -18.011 Da)",
             Reagent::Clixlink => "cliXlink (267.057 Da, MS-cleavable, asymmetric)",
+            Reagent::Phox => "PhoX / DSPP (209.972 Da, non-cleavable, IMAC-enrichable)",
+            Reagent::Tbdspp => "TBDSPP / tBu-PhoX (209.972 Da once TFA has removed the tBu groups)",
+            Reagent::Sda => "SDA / sulfo-SDA (82.042 Da, photo-crosslinker: amine to any residue)",
             Reagent::Custom => "Custom mass",
         }
     }
@@ -306,8 +376,12 @@ impl Reagent {
             Reagent::Dsg | Reagent::Bs2g => Some(96.02113),
             Reagent::Dsso => Some(158.00376),
             Reagent::Dsbu => Some(196.08479),
+            Reagent::Dsau => Some(140.02219),
+            Reagent::Dspu => Some(168.05349),
             Reagent::Edc | Reagent::Dmtmm => Some(-18.010565),
             Reagent::Clixlink => Some(267.05653),
+            Reagent::Phox | Reagent::Tbdspp => Some(209.97181),
+            Reagent::Sda => Some(82.04186),
             Reagent::Custom => None,
         }
     }
@@ -318,7 +392,25 @@ impl Reagent {
         match self {
             Reagent::Dsso | Reagent::Clixlink => Some((54.01056, 103.9932, &[85.98264])),
             Reagent::Dsbu => Some((85.05276, 111.03203, &[])),
+            Reagent::Dsau => Some((57.02146, 83.00073, &[])),
+            Reagent::Dspu => Some((71.03711, 97.01638, &[])),
             _ => None,
+        }
+    }
+
+    /// The row of its monolinks in [`MONOLINKS`] (none for zero-length
+    /// reagents, SDA and a custom mass)
+    pub fn monolink_group(self) -> Option<&'static str> {
+        match self {
+            Reagent::Dss | Reagent::Bs3 => Some("DSS/BS3"),
+            Reagent::Dsg | Reagent::Bs2g => Some("DSG/BS2G"),
+            Reagent::Dsso => Some("DSSO"),
+            Reagent::Dsbu => Some("DSBU"),
+            Reagent::Dsau => Some("DSAU"),
+            Reagent::Dspu => Some("DSPU"),
+            Reagent::Clixlink => Some("cliXlink"),
+            Reagent::Phox | Reagent::Tbdspp => Some("PhoX/TBDSPP"),
+            Reagent::Edc | Reagent::Dmtmm | Reagent::Sda | Reagent::Custom => None,
         }
     }
 
@@ -337,6 +429,11 @@ impl Reagent {
             Reagent::Edc | Reagent::Dmtmm => Some((
                 Site { residues: "K".into(), protein_nterm: true, protein_cterm: false },
                 Site { residues: "DE".into(), protein_nterm: false, protein_cterm: true },
+            )),
+            // the NHS ester takes amines (and S, T, Y); the diazirine's carbene any residue
+            Reagent::Sda => Some((
+                Site { residues: "KSTY".into(), protein_nterm: true, protein_cterm: false },
+                Site { residues: sage_core::crosslink::SDA_CARBENE.into(), protein_nterm: false, protein_cterm: false },
             )),
             _ => None,
         }
@@ -2033,8 +2130,14 @@ impl Settings {
                 warnings.push(multivalent_warning(xl.valency));
             }
             // A fixed modification on a reactive residue (typically TMT on K) blocks every link there
+            // not an end that takes any residue (SDA's carbene): it would flag
+            // carbamidomethyl C in every search
             let reactive = if xl.two_sites {
-                format!("{}{}", xl.site1.residues, xl.site2.residues)
+                [&xl.site1.residues, &xl.site2.residues]
+                    .into_iter()
+                    .filter(|r| !sage_core::crosslink::takes_any_residue(r))
+                    .map(String::as_str)
+                    .collect::<String>()
             } else {
                 xl.residues.clone()
             };
@@ -2739,6 +2842,59 @@ P1	3	S	UNIMOD:21
                 assert!(lfq.starts_with("peptide_a\tpeptide_b"));
             }
             let _ = std::fs::remove_dir_all(&out);
+        }
+    }
+
+    /// Each preset is sage.exe's reagent: its key, linker mass, stubs and sites
+    #[test]
+    fn reagent_presets_match_sage() {
+        for r in Reagent::ALL.into_iter().filter(|r| *r != Reagent::Custom) {
+            let core: sage_core::crosslink::Reagent = serde_json::from_value(serde_json::json!(r.key())).unwrap();
+            assert!((r.mass().unwrap() - core.mass() as f64).abs() < 1e-4, "{r:?}");
+            match (r.stubs(), core.stubs()) {
+                (Some((short, long, alt)), Some(s)) => {
+                    assert!((short - s.short as f64).abs() < 1e-4 && (long - s.long as f64).abs() < 1e-4, "{r:?}");
+                    assert_eq!(alt.len(), s.alt.len(), "{r:?}");
+                }
+                (None, None) => {}
+                _ => panic!("{r:?}: cleavable in one and not the other"),
+            }
+            match (r.sites(), core.sites()) {
+                (Some((a, b)), Some((x, y))) => assert_eq!((a.to_spec(), b.to_spec()), (x.to_string(), y.to_string()), "{r:?}"),
+                (None, None) => {}
+                _ => panic!("{r:?}: two sites in one and not the other"),
+            }
+        }
+    }
+
+    /// Every reagent that leaves a linker on the protein has its H2O, NH3 and
+    /// Tris monolinks, and each monolink is one of those, with Unimod's mass
+    /// where it carries a Unimod name
+    #[test]
+    fn monolinks_are_the_linker_plus_its_quencher() {
+        const QUENCH: [f64; 3] = [18.010565, 17.026549, 121.073893];
+        let is = |m: &Preset, linker: f64| QUENCH.iter().any(|q| (m.mass - linker - q).abs() < 1e-5);
+        for r in Reagent::ALL {
+            let Some(linker) = r.mass() else { continue };
+            let found = QUENCH.iter().filter(|q| MONOLINKS.iter().any(|m| (m.mass - linker - **q).abs() < 1e-5)).count();
+            let none = matches!(r, Reagent::Edc | Reagent::Dmtmm | Reagent::Sda);
+            assert_eq!(found, if none { 0 } else { 3 }, "{r:?}");
+            // its row in the menu holds them
+            let row: Vec<&Preset> = MONOLINKS.iter().filter(|m| Some(monolink_group_of(m)) == r.monolink_group()).collect();
+            assert_eq!(row.len(), if none { 0 } else { 3 }, "{r:?}");
+            assert!(row.iter().all(|m| is(m, linker)), "{r:?}");
+            let mut quenchers: Vec<&str> = row.iter().map(|m| monolink_quencher(m)).collect();
+            quenchers.sort_unstable();
+            let all: &[&str] = if none { &[] } else { &["+H2O", "+NH3", "+Tris"] };
+            assert_eq!(quenchers, all, "{r:?}");
+        }
+        for m in MONOLINKS {
+            assert!(Reagent::ALL.iter().filter_map(|r| r.mass()).any(|l| is(m, l)), "{}", m.label);
+            assert_eq!((m.target, m.kind), ("K", ModKind::Variable), "{}", m.label);
+            if let Some(id) = crate::unimod::parse_accession(m.name) {
+                let entry = &crate::unimod::bundled()[&id];
+                assert!((entry.mono_mass - m.mass).abs() < 2e-6, "{}: Unimod has {}", m.label, entry.mono_mass);
+            }
         }
     }
 }

@@ -48,8 +48,8 @@ fn user(name: &str, value: &str) -> String {
 }
 
 /// The reagent's term: XLMOD where it has one, UNIMOD for EDC (as the
-/// crosslinking specification's own EDC example), "unknown modification" for
-/// a custom mass
+/// crosslinking specification's own EDC example) and TBDSPP, "unknown
+/// modification" for a custom mass
 fn reagent_cv(ctx: &ExportContext) -> String {
     let (cv_ref, acc, name) = match (ctx.settings.reagent, ctx.settings.mass) {
         (Some(Reagent::Dss), _) | (None, None) => ("XLMOD", "XLMOD:02001", "DSS"),
@@ -58,8 +58,16 @@ fn reagent_cv(ctx: &ExportContext) -> String {
         (Some(Reagent::Bs2g), _) => ("XLMOD", "XLMOD:02005", "BS2G"),
         (Some(Reagent::Dsso), _) => ("XLMOD", "XLMOD:02126", "DSSO"),
         (Some(Reagent::Dsbu), _) => ("XLMOD", "XLMOD:02120", "BuUrBu"),
+        // not in XLMOD (nor Unimod): named, with their masses in the cleavage terms
+        (Some(r @ (Reagent::Dsau | Reagent::Dspu)), _) => {
+            return ms("MS:1001460", "unknown modification", Some(r.name()))
+        }
         (Some(Reagent::Dmtmm), _) => ("XLMOD", "XLMOD:02208", "DMTMM"),
         (Some(Reagent::Clixlink), _) => ("XLMOD", "XLMOD:02253", "cliXLink"),
+        (Some(Reagent::Phox), _) => ("XLMOD", "XLMOD:02258", "PhoX"),
+        // XLMOD has no TBDSPP; Unimod's term covers its crosslink (as PhoX's)
+        (Some(Reagent::Tbdspp), _) => ("UNIMOD", "UNIMOD:2058", "Xlink:DSPP[210]"),
+        (Some(Reagent::Sda), _) => ("XLMOD", "XLMOD:02134", "SDA"),
         (Some(Reagent::Edc), _) => ("UNIMOD", "UNIMOD:2018", "Xlink:EDC"),
         (None, Some(_)) => return ms("MS:1001460", "unknown modification", Some("custom crosslinker")),
     };
@@ -688,6 +696,7 @@ mod test {
             ("dsso", r#"{"reagent": "dsso"}"#),
             ("edc", r#"{"reagent": "edc"}"#),
             ("clixlink", r#"{"reagent": "clixlink"}"#),
+            ("dsau", r#"{"reagent": "dsau"}"#),
         ] {
             let settings: CrosslinkSettings = serde_json::from_str(json).unwrap();
             let ctx = context(&db, &settings, &files, &proteins, &statics, &variables);
@@ -705,6 +714,11 @@ mod test {
                 for v in ["A:54.01056:XY", "S:103.9932:B", "T:85.98264:B", "B:163.06332:ST", "X:213.04596:A", "Y:195.0354:A"] {
                     assert!(x.contains(&format!(r#"value="{v}""#)), "{v}");
                 }
+            } else if name == "dsau" {
+                // no XLMOD term: named, with its urea stubs
+                assert!(x.contains(r#"name="unknown modification" value="DSAU""#), "{x}");
+                assert!(x.contains(r#"value="A:57.02146:S""#), "{x}");
+                assert!(x.contains(r#"value="S:83.00073:A""#), "{x}");
             } else {
                 assert!(x.contains(r#"accession="UNIMOD:2018" name="Xlink:EDC""#));
                 assert!(x.contains(r#"monoisotopicMassDelta="-18.010565""#));

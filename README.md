@@ -122,13 +122,13 @@ To study the interface between two complexes, or a bait against its candidate pa
 
 | kind | presets | how XNova searches them |
 |---|---|---|
-| non-cleavable | `dss`, `bs3`, `dsg`, `bs2g`, or any mass | seed search and partner lookup, or chain reflection (CPU or GPU) |
-| MS-cleavable | `dsso`, `dsbu`, `clixlink`, or custom stubs | stub-doublet search |
-| zero-length / heterobifunctional | `edc`, `dmtmm`, or custom `site1` / `site2` | as non-cleavable, each link joining a `site1` group to a `site2` group |
+| non-cleavable | `dss`, `bs3`, `dsg`, `bs2g`, `phox`, `tbdspp`, or any mass | seed search and partner lookup, or chain reflection (CPU or GPU) |
+| MS-cleavable | `dsso`, `dsbu`, `dsau`, `dspu`, `clixlink`, or custom stubs | stub-doublet search |
+| zero-length / heterobifunctional | `edc`, `dmtmm`, `sda`, or custom `site1` / `site2` | as non-cleavable, each link joining a `site1` group to a `site2` group |
 
 * **MS-cleavable linkers** break in the collision cell and leave a stub on each peptide. The two stubs of a reagent differ by a fixed mass, so each peptide appears as a doublet. XNova finds peak pairs at the doublet spacing, which gives both peptide masses, and looks each one up directly in a narrow mass window: no pairwise enumeration, and a cost that grows roughly with the size of the database rather than its square, which makes proteome-scale searches practical. Loop-links of cleavable linkers are found through the ring ions of the opened linker.
 * **Asymmetric cleavable linkers** have two different arms that leave different stubs, so one peptide carries one arm's short stub and its partner the other arm's long stub. cliXlink is built in, any other can be described with a second arm (`"other"`), and every pair is tried both ways round, keeping the better orientation.
-* **Heterobifunctional and zero-length reagents** react with different groups at each end: EDC and DMTMM join an amine (K, protein N-terminus) to a carboxyl (D, E, protein C-terminus), at −18.0106 Da. Every reported link joins a `site1` group to a `site2` group (never K–K or D–E), in every backend and for loop-links, and the exports name the donor and acceptor ends accordingly.
+* **Heterobifunctional and zero-length reagents** react with different groups at each end: EDC and DMTMM join an amine (K, protein N-terminus) to a carboxyl (D, E, protein C-terminus), at −18.0106 Da; the photo-crosslinker SDA an amine (or S, T, Y) to any residue, at 82.0419 Da. Every reported link joins a `site1` group to a `site2` group (never K–K or D–E), in every backend and for loop-links, and the exports name the donor and acceptor ends accordingly.
 
 ### Multivalent crosslinks
 

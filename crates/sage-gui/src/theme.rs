@@ -475,6 +475,10 @@ pub fn install(ctx: &egui::Context, dark: bool) {
             s.spacing.item_spacing = vec2(8.0, 6.0);
             s.spacing.button_padding = vec2(10.0, 3.0);
             s.spacing.interact_size.y = 22.0;
+            // room for a long menu (every crosslinker's monolinks): egui's
+            // default 400 px caps a popup whatever height its menu asks for;
+            // popups still shrink to their contents and to the screen
+            s.spacing.default_area_size.y = 760.0;
         });
     }
     set_dark(ctx, dark);

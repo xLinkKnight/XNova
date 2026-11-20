@@ -9,7 +9,7 @@
 //! TWO_HUMAN:K3`), from the protein sequences of the FASTA.
 
 use super::crosslink_export::{mz, protein_starts, ExportContext};
-use sage_core::crosslink::{rank_score, CrosslinkMatch, LinkKind, PairClass, Reagent};
+use sage_core::crosslink::{rank_score, CrosslinkMatch, LinkKind, PairClass};
 use sage_core::database::PeptideIx;
 
 /// The report's file name, in the results folder
@@ -91,15 +91,7 @@ fn topology(m: &CrosslinkMatch) -> String {
 /// The reagent's name, or the custom linker's mass
 fn crosslinker(ctx: &ExportContext) -> String {
     match ctx.settings.reagent {
-        Some(Reagent::Dss) => "DSS".into(),
-        Some(Reagent::Bs3) => "BS3".into(),
-        Some(Reagent::Dsg) => "DSG".into(),
-        Some(Reagent::Bs2g) => "BS2G".into(),
-        Some(Reagent::Dsso) => "DSSO".into(),
-        Some(Reagent::Dsbu) => "DSBU".into(),
-        Some(Reagent::Edc) => "EDC".into(),
-        Some(Reagent::Dmtmm) => "DMTMM".into(),
-        Some(Reagent::Clixlink) => "cliXlink".into(),
+        Some(reagent) => reagent.name().into(),
         None => format!("custom ({:.4} Da)", ctx.settings.linker_mass()),
     }
 }
@@ -261,7 +253,7 @@ mod test {
     use super::super::crosslink_export::test::{csm, find, fixture};
     use super::super::crosslink_export::SpectrumFile;
     use super::*;
-    use sage_core::crosslink::{CrosslinkSettings, Species};
+    use sage_core::crosslink::{CrosslinkSettings, Reagent, Species};
     use sage_core::ion_series::Kind;
     use sage_core::mass::Tolerance;
 

@@ -686,15 +686,8 @@ impl Link {
 fn linker_name(settings: &CrosslinkSettings) -> String {
     use sage_core::crosslink::Reagent;
     match (settings.reagent, settings.mass) {
-        (Some(Reagent::Dss), _) | (None, None) => "DSS".into(),
-        (Some(Reagent::Bs3), _) => "BS3".into(),
-        (Some(Reagent::Dsg), _) => "DSG".into(),
-        (Some(Reagent::Bs2g), _) => "BS2G".into(),
-        (Some(Reagent::Dsso), _) => "DSSO".into(),
-        (Some(Reagent::Dsbu), _) => "DSBU".into(),
-        (Some(Reagent::Edc), _) => "EDC".into(),
-        (Some(Reagent::Dmtmm), _) => "DMTMM".into(),
-        (Some(Reagent::Clixlink), _) => "cliXlink".into(),
+        (Some(reagent), _) => reagent.name().into(),
+        (None, None) => Reagent::Dss.name().into(),
         (None, Some(mass)) => format!("{mass:+.4} Da"),
     }
 }
@@ -719,12 +712,18 @@ pub fn stubs_of(settings: &CrosslinkSettings) -> Vec<Stub> {
             }
             out.push(stub(&format!("S{prime}"), "sulfenic acid", long));
         }
-        Some(Reagent::Dsbu) => {
-            out.push(stub(&format!("Bu{prime}"), "butyl amine", short));
+        Some(r @ (Reagent::Dsbu | Reagent::Dsau | Reagent::Dspu)) => {
+            // the urea's two halves: an amine and an isocyanate
+            let (arm, what) = match r {
+                Reagent::Dsau => ("Ac", "acetyl"),
+                Reagent::Dspu => ("Pr", "propyl"),
+                _ => ("Bu", "butyl"),
+            };
+            out.push(stub(&format!("{arm}{prime}"), &format!("{what} amine"), short));
             for (i, &m) in alt.iter().enumerate() {
                 out.push(stub(&format!("x{}{prime}", i + 1), "stub", m));
             }
-            out.push(stub(&format!("BuUr{prime}"), "butyl urea", long));
+            out.push(stub(&format!("{arm}Ur{prime}"), &format!("{what} urea"), long));
         }
         _ => {
             out.push(stub(&format!("s{prime}"), "short stub", short));
