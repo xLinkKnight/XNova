@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - sage-gui's log (Progress tab) shows each line with the local time it arrived, written the way Windows is set to write times and dates (Settings > Time & language > Language & region: 1:32:22 PM in the US, 13:32:22 in the UK, a 24-hour clock if chosen there), a line with the date where a day begins, and sage.exe's messages without its own UTC timestamp and module name. Before each line: the time of day, the date and time, the time since the start, or nothing. It counts the warnings and errors, saves the log (Save log...) and saves it next to the results when a search ends (`xnova_log_<date>_<time>.txt`). While a search runs, sage-gui notes the computer's CPU and memory use every minute, and says so when sage.exe has written nothing for 2 minutes. Files > Resources > Log detail > Verbose adds sage.exe's detail messages, such as each spectrum file with its size.
 
 ### Changed
-- The program icon (both exe files, sage-gui's window and taskbar) is the XNova icon in fuchsia to orange.
+- The program icon (both exe files, sage-gui's window and taskbar) is the XNova icon in fuchsia to orange, and so is the logo in `assets/xnova-logo.png`.
 
 ### Fixed
 - A warning of the retention-time alignment (few landmark peptides) had a run of spaces in the middle.
