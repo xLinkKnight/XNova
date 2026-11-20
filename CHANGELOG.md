@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.5] - 2026-11-19
 
 ### Added
 - Five crosslinkers to choose from. PhoX (DSPP, 209.97181 Da) and TBDSPP (tBu-PhoX, the same crosslink once TFA has removed its tert-butyl groups): non-cleavable, IMAC-enrichable. DSAU (140.02219 Da) and DSPU (168.05349 Da): DSBU's MS-cleavable urea with C2 and C3 arms, stubs 57.02146 / 83.00073 and 71.03711 / 97.01638 Da (an amine and an isocyanate, 25.979 Da apart, as DSBU's). SDA and sulfo-SDA (82.04186 Da): a photo-crosslinker whose NHS ester takes K, S, T, Y and protein N-termini and whose diazirine any residue. The exports name them (mzIdentML: XLMOD:02258 PhoX, XLMOD:02134 SDA, UNIMOD:2058 for TBDSPP; DSAU and DSPU have no term), and the spectrum viewer names the urea stubs Ac/AcUr and Pr/PrUr.
