@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.6] - 2026-11-22
 
 ### Added
 - `crosslink.linear_proteins` (sage-gui: Crosslinking > Proteins for crosslinks): the linear search runs on every spectrum file first, and the crosslink search then searches only the proteins with a target peptide at 1% FDR in it (`linear_protein_fdr`, PSM and peptide level; a shared peptide brings all its proteins) instead of the whole FASTA. For whole-organism proteomes: far fewer peptide pairs to try. The proteins are written to `LinearProteins.fasta` with their FASTA records as they were, each once (a protein repeated in the FASTA or in both crosslink databases is written and searched once). Each spectrum file is read twice. The Progress tab has the two stages it adds.
