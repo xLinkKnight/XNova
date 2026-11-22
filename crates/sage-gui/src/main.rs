@@ -679,6 +679,7 @@ impl SageGui {
             crosslink: xl.enabled,
             linear: xl.enabled && xl.linear_search,
             linear_proteins: xl.enabled && xl.linear_search && xl.linear_proteins,
+            linear_spectra: xl.enabled && xl.linear_search && xl.skip_linear_spectra,
             quant: self.s.lfq || self.s.tmt != Tmt::None || self.s.silac != Silac::Off,
             gpu_backend: xl.enabled && matches!(xl.backend, Backend::Gpu | Backend::Auto),
             output_dir: out.clone(),
@@ -3306,6 +3307,17 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: 
                     xl.linear_search,
                     egui::Checkbox::new(&mut xl.linear_proteins, "only those the linear search finds (LinearProteins.fasta)"),
                 ));
+            row(ui, "Spectra for crosslinks", "The linear search runs on every spectrum file first; the crosslink \
+                search then leaves out every MS2 spectrum whose best linear match is a target peptide at 1% FDR: \
+                a spectrum a linear peptide explains is taken not to be a crosslink. Fewer spectra to search, so \
+                the crosslink search is faster; how much depends on the share of spectra the linear search \
+                identifies. A crosslink spectrum that a linear peptide also explains (one of the linear search's \
+                1% false matches, or a chimeric spectrum) is not searched for crosslinks. With or without \
+                'Proteins for crosslinks'; each spectrum file is read twice. Needs the linear search.",
+                |ui| ui.add_enabled(
+                    xl.linear_search,
+                    egui::Checkbox::new(&mut xl.skip_linear_spectra, "only those without a linear peptide match at 1% FDR"),
+                ));
             row(ui, "Multivalent crosslinks", "Also search species held together by two or more linkers, up to the \
                 number set here (2-4 linkers per species): several links between two peptides (a2b), chains and \
                 branches of three or more peptides (a1b1c, a1b,b1c,b1d), and copies of one peptide (a2a, a1a1b, as \
@@ -3810,6 +3822,7 @@ mod screenshots {
                                     crosslink: true,
                                     linear: true,
                                     linear_proteins: false,
+                                    linear_spectra: false,
                                     quant: false,
                                     gpu_backend: false,
                                     output_dir: PathBuf::from(&folder),
@@ -3862,6 +3875,7 @@ mod screenshots {
         let files = json["mzml_paths"].as_array().map_or(0, |a| a.len());
         let crosslink = json.get("crosslink").is_some_and(|c| !c.is_null());
         let narrowed = json["crosslink"]["linear_proteins"].as_bool() == Some(true);
+        let skipped = json["crosslink"]["skip_linear_spectra"].as_bool() == Some(true);
         let saved_in = results.clone();
         let mut app: Option<SageGui> = None;
         let mut harness = Harness::builder()
@@ -3882,6 +3896,7 @@ mod screenshots {
                             crosslink,
                             linear: crosslink,
                             linear_proteins: narrowed,
+                            linear_spectra: skipped,
                             quant: false,
                             gpu_backend: false,
                             output_dir: results.clone(),

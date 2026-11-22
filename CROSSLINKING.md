@@ -39,6 +39,8 @@ before. Two strategies are used, chosen by the reagent:
 | `linear_search` | `true` | also run an ordinary linear peptide search first, written to `results.sage.tsv`, `peptides.sage.tsv` and `proteins.sage.tsv` (plus the usual LFQ/TMT tables, `.pin` and HTML report when enabled). It uses the crosslink search's database settings, e.g. `peptide_min_mass` 350 Da. `false` skips it |
 | `linear_proteins` | `false` | with `linear_search`: search for crosslinks only among the proteins the linear search finds, see [Narrowing a proteome to the linear search's proteins](#narrowing-a-proteome-to-the-linear-searchs-proteins) |
 | `linear_protein_fdr` | `0.01` | `linear_proteins`: the PSM and peptide q-value a peptide needs to bring its proteins |
+| `skip_linear_spectra` | `false` | with `linear_search`: search for crosslinks only the spectra the linear search does not explain, see [Leaving out the spectra a linear peptide explains](#leaving-out-the-spectra-a-linear-peptide-explains) |
+| `linear_spectrum_fdr` | `0.01` | `skip_linear_spectra`: the PSM q-value at which a linear match explains its spectrum |
 | `require_complete_doublets` | `false` | cleavable only: require a doublet (two stub peaks) of *both* peptides. Default: a doublet of one peptide; the partner's mass follows from the precursor, and its stub peaks are counted in `stub_peaks` but not required (asymmetric linkers: one stub peak of the partner's own arm is) |
 | `precursor_window` | `true` | learn each run's precursor mass error from the confident matches of a first pass and accept only matches within the central 99% of it, see [FDR](#fdr-of-crosslink-searches). `false`: one pass, the whole precursor tolerance |
 | `residues` | `"K"` | residues the linker reacts with (e.g. `"KST"`) |
@@ -94,6 +96,36 @@ it. A peptide shared by several proteins brings them all.
   found. If the linear search finds no peptide at all, the whole database is
   searched and the log says so.
 * It works with two crosslink databases (each kept protein keeps its database).
+
+### Leaving out the spectra a linear peptide explains
+
+```json
+"crosslink": { "reagent": "dsso", "skip_linear_spectra": true }
+```
+
+With `"skip_linear_spectra": true` (sage-gui: Crosslinking > Spectra for
+crosslinks), the linear search runs on every spectrum file first, and the
+crosslink search then leaves out every MS2 spectrum whose best linear match
+(rank 1) is a target peptide at 1% FDR (`linear_spectrum_fdr`): a spectrum a
+linear peptide explains is taken not to be a crosslink. It works on its own or
+with `linear_proteins`; each spectrum file is read twice.
+
+* The log says how many spectra are left out, and each batch's crosslink search
+  line how many of its spectra (`40 with a linear match left out`).
+* How much faster the crosslink search gets depends on the share of spectra the
+  linear search identifies, and on how long those spectra take to search.
+* A crosslink spectrum that a linear peptide also explains is not searched for
+  crosslinks: one of the linear search's false matches at 1% FDR, or a
+  chimeric spectrum of a linear peptide and a crosslink. A stricter
+  `linear_spectrum_fdr` (e.g. 0.001) leaves fewer of them out.
+
+On four Pol II timsTOF runs (searched against 131 proteins), 17,284 of the
+697,599 MS2 spectra (2.5%) had a linear match at 1% FDR. Leaving them out did
+not make the crosslink search measurably faster; 3 of the 1,193 crosslink-spectrum
+matches at 1% FDR of the full search were among them (each crosslink scored far
+above its spectrum's linear match: hyperscore 155, 140 and 75 against 23, 22
+and 17), which cost one crosslink near the 1% cutoff. The filter pays where the
+linear search identifies a large share of the spectra.
 
 ## Saved crosslinkers and modifications (sage-gui)
 

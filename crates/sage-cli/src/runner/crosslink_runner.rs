@@ -157,6 +157,19 @@ fn absolute_positions(ctx: &super::crosslink_export::ExportContext, m: &Crosslin
     cells
 }
 
+/// Spectra a linear peptide explained: file id -> spectrum ids
+pub type Explained = HashMap<usize, std::collections::HashSet<String>>;
+
+/// The spectra whose linear match (rank 1, a target) is at `fdr` or better:
+/// a linear peptide explains them, so they are not crosslink spectra
+pub(super) fn explained_spectra(features: &[sage_core::scoring::Feature], fdr: f32) -> Explained {
+    let mut explained = Explained::new();
+    for f in features.iter().filter(|f| f.rank == 1 && f.label == 1 && f.spectrum_q <= fdr) {
+        explained.entry(f.file_id).or_default().insert(f.spec_id.clone());
+    }
+    explained
+}
+
 /// Narrow `fasta` to the proteins in `keep` and, with decoys from the FASTA
 /// (not generated), their decoys; each protein once (a protein repeated in
 /// the FASTA, or in both crosslink databases, whose database groups still say
@@ -310,14 +323,21 @@ impl Runner {
         }
 
         let start = Instant::now();
-        let searched = msn
-            .par_iter()
-            .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
-            .count();
+        // `skip_linear_spectra`: not the spectra a linear peptide explained
+        let explained = |spec: &ProcessedSpectrum| {
+            self.linear_spectra.as_ref().is_some_and(|e| e.get(&spec.file_id).is_some_and(|ids| ids.contains(spec.id.as_str())))
+        };
+        let wanted = |spec: &&ProcessedSpectrum| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks;
+        let left_out = match self.linear_spectra {
+            Some(_) => msn.par_iter().filter(wanted).filter(|spec| explained(spec)).count(),
+            None => 0,
+        };
+        let searched = msn.par_iter().filter(wanted).count() - left_out;
         let searching = crate::progress::step(format!("crosslink search, {}", self.files_of(msn)), searched, "spectra");
         let matches: Vec<CrosslinkMatch> = msn
             .par_iter()
-            .filter(|spec| spec.level == 2 && spec.masses.len() >= self.parameters.min_peaks)
+            .filter(wanted)
+            .filter(|spec| !explained(spec))
             .flat_map(|spec| {
                 let found = xl.score(spec);
                 searching.add(1);
@@ -332,8 +352,13 @@ impl Runner {
         if !settings.linear_search {
             self.warn_no_precursor(msn);
         }
+        let skipped = if self.linear_spectra.is_some() {
+            format!(", {left_out} with a linear match left out")
+        } else {
+            String::new()
+        };
         info!(
-            "- crosslink search: {:8} ms ({} spectra, {} candidate matches)",
+            "- crosslink search: {:8} ms ({} spectra, {} candidate matches{skipped})",
             start.elapsed().as_millis(),
             searched,
             matches.len()
@@ -385,7 +410,7 @@ impl Runner {
         parallel: usize,
         parquet: bool,
     ) -> anyhow::Result<telemetry::Telemetry> {
-        if self.parameters.crosslink.as_ref().is_some_and(|c| c.linear_proteins) {
+        if self.parameters.crosslink.as_ref().is_some_and(|c| c.linear_first()) {
             return self.run_linear_then_crosslink(parallel, parquet);
         }
         info!("linear peptide search (results.sage.tsv) and crosslink search, reading each spectrum file once");
@@ -429,7 +454,13 @@ impl Runner {
     /// twice: the crosslink database is only known once every file has been
     /// searched linearly.
     fn run_linear_then_crosslink(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
-        info!("linear peptide search (results.sage.tsv) of every file first; the proteins it finds make the crosslink search's database");
+        let xl = self.parameters.crosslink.clone().unwrap_or_default();
+        let then = match (xl.linear_proteins, xl.skip_linear_spectra) {
+            (true, true) => "the proteins it finds make the crosslink search's database, and the spectra it explains are left out",
+            (true, false) => "the proteins it finds make the crosslink search's database",
+            _ => "the spectra it explains are left out of the crosslink search",
+        };
+        info!("linear peptide search (results.sage.tsv) of every file first; {then}");
         if parquet {
             log::warn!("parquet output is not available for crosslink searches, writing tsv");
         }
@@ -446,7 +477,17 @@ impl Runner {
             results.into_iter().collect::<SageResults>()
         };
         let ms1 = self.finish_linear(outputs, parquet)?;
-        self.narrow_to_linear_proteins()?;
+        if xl.linear_proteins {
+            self.narrow_to_linear_proteins()?;
+        }
+        if let Some(explained) = &self.linear_spectra {
+            let n: usize = explained.values().map(|ids| ids.len()).sum();
+            info!(
+                "spectra for crosslinks: the {} MS2 spectra with a linear peptide match at {} FDR are left out of the crosslink search",
+                crate::progress::thousands(n),
+                crate::summary::percent_text(xl.linear_spectrum_fdr)
+            );
+        }
 
         // the settings' isotope labels are the new database's
         let settings = self.crosslink_settings();
@@ -1145,6 +1186,36 @@ mod test {
         // a decoy is placed where its target is
         let decoy = find(&db, "C[+57.021465]FEKDR", true);
         assert_eq!(ctx.absolute_positions(decoy, &[3]), "8");
+    }
+
+    /// `skip_linear_spectra`: the spectra a target linear PSM explains at the cutoff
+    #[test]
+    fn spectra_a_linear_peptide_explains() {
+        use sage_core::scoring::Feature;
+        let psm = |file_id: usize, spec_id: &str, rank: u32, label: i32, q: f32| Feature {
+            file_id,
+            spec_id: spec_id.into(),
+            rank,
+            label,
+            spectrum_q: q,
+            ..Default::default()
+        };
+        let features = vec![
+            psm(0, "scan=1", 1, 1, 0.001),
+            psm(0, "scan=2", 1, 1, 0.2),   // not confident: may be a crosslink
+            psm(0, "scan=3", 1, -1, 0.001), // a decoy explains nothing
+            psm(1, "scan=1", 1, 1, 0.009),
+            psm(1, "scan=4", 2, 1, 0.001),  // a second-rank match
+        ];
+        let explained = explained_spectra(&features, 0.01);
+        let ids = |file: usize| -> Vec<&str> {
+            let mut ids: Vec<&str> = explained.get(&file).map(|s| s.iter().map(String::as_str).collect()).unwrap_or_default();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids(0), ["scan=1"]);
+        assert_eq!(ids(1), ["scan=1"], "the same id in another file is another spectrum");
+        assert!(explained_spectra(&features, 0.0005).is_empty());
     }
 
     /// The crosslink database of the linear search's proteins, and

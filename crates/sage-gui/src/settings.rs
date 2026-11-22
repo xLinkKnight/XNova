@@ -529,6 +529,9 @@ pub struct Crosslink {
     /// With the linear search: search for crosslinks only in the proteins
     /// it finds (LinearProteins.fasta)
     pub linear_proteins: bool,
+    /// With the linear search: search for crosslinks only the spectra it
+    /// does not explain (no linear match at 1% FDR)
+    pub skip_linear_spectra: bool,
     /// Non-cleavable: matched linker-carrying ions required per chain
     pub min_linked_peaks: u32,
     /// Also search multivalent species (several linkers), up to `valency` linkers
@@ -566,6 +569,7 @@ impl Default for Crosslink {
             chain_survivors: 20000,
             linear_search: true,
             linear_proteins: false,
+            skip_linear_spectra: false,
             min_linked_peaks: 2,
             multivalent: false,
             valency: 2,
@@ -680,6 +684,9 @@ impl Crosslink {
         if self.linear_search && self.linear_proteins {
             m.insert("linear_proteins".into(), json!(true));
         }
+        if self.linear_search && self.skip_linear_spectra {
+            m.insert("skip_linear_spectra".into(), json!(true));
+        }
         // Sage's default (2) is left out, so configs still run in an older sage.exe
         if self.min_linked_peaks != 2 {
             m.insert("min_linked_peaks".into(), json!(self.min_linked_peaks));
@@ -754,6 +761,7 @@ impl Crosslink {
         c.chain_survivors = u32_or(v.get("chain_survivors"), c.chain_survivors);
         c.linear_search = bool_or(v.get("linear_search"), c.linear_search);
         c.linear_proteins = bool_or(v.get("linear_proteins"), false);
+        c.skip_linear_spectra = bool_or(v.get("skip_linear_spectra"), false);
         c.min_linked_peaks = u32_or(v.get("min_linked_peaks"), c.min_linked_peaks);
         if let Some(n) = v.get("multivalent").and_then(Value::as_u64) {
             c.multivalent = true;
@@ -2922,5 +2930,17 @@ P1	3	S	UNIMOD:21
         // no linear search, no narrowing (sage.exe would refuse it)
         s.crosslink.linear_search = false;
         assert!(s.to_json(&[])["crosslink"].get("linear_proteins").is_none());
+
+        // the spectra the linear search explains, left out: on its own too
+        s.crosslink.linear_search = true;
+        s.crosslink.linear_proteins = false;
+        s.crosslink.skip_linear_spectra = true;
+        let v = s.to_json(&[]);
+        assert_eq!(v["crosslink"]["skip_linear_spectra"], json!(true));
+        assert!(v["crosslink"].get("linear_proteins").is_none());
+        let back = Settings::from_json(&v).unwrap();
+        assert!(back.crosslink.skip_linear_spectra && !back.crosslink.linear_proteins);
+        s.crosslink.linear_search = false;
+        assert!(s.to_json(&[])["crosslink"].get("skip_linear_spectra").is_none());
     }
 }

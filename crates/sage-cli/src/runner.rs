@@ -63,6 +63,9 @@ pub struct Runner {
     /// Crosslink searches with `linear_proteins`: the proteins the linear
     /// search found, which make the crosslink search's database
     linear_proteins: Option<std::collections::HashSet<std::sync::Arc<str>>>,
+    /// Crosslink searches with `skip_linear_spectra`: the spectra the linear
+    /// search explained (file id -> spectrum ids), left out of the crosslink search
+    linear_spectra: Option<crosslink_runner::Explained>,
     /// The spectrum files' positions for the Annotator exports, read once
     annotator_files: std::sync::Mutex<HashMap<usize, Option<std::sync::Arc<annotator_export::SpectrumFile>>>>,
 }
@@ -207,6 +210,7 @@ impl Runner {
                         qc: Default::default(),
                         library: None,
                         linear_proteins: None,
+                        linear_spectra: None,
                         annotator_files: Default::default(),
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
@@ -230,6 +234,7 @@ impl Runner {
             qc: Default::default(),
             library: None,
             linear_proteins: None,
+            linear_spectra: None,
             annotator_files: Default::default(),
         })
     }
@@ -618,10 +623,19 @@ impl Runner {
             );
             info!(
                 "plan: {}",
-                if xl.linear_search && xl.linear_proteins {
-                    "the linear peptide search of each batch of files, then its results; the proteins of its \
-                     peptides make the crosslink database (LinearProteins.fasta); then the crosslink search of \
-                     each batch of files (each file read twice), then the crosslink FDR and reports"
+                if xl.linear_first() {
+                    match (xl.linear_proteins, xl.skip_linear_spectra) {
+                        (true, true) => "the linear peptide search of each batch of files, then its results; the proteins \
+                            of its peptides make the crosslink database (LinearProteins.fasta); then the crosslink search \
+                            of each batch of files, without the spectra the linear search explained (each file read \
+                            twice), then the crosslink FDR and reports",
+                        (true, false) => "the linear peptide search of each batch of files, then its results; the proteins \
+                            of its peptides make the crosslink database (LinearProteins.fasta); then the crosslink search \
+                            of each batch of files (each file read twice), then the crosslink FDR and reports",
+                        _ => "the linear peptide search of each batch of files, then its results; then the crosslink \
+                            search of each batch of files, without the spectra the linear search explained (each file \
+                            read twice), then the crosslink FDR and reports",
+                    }
                 } else if xl.linear_search {
                     "the linear peptide search and the crosslink search of each batch of files, each file read once; \
                      then the linear results, then the crosslink FDR and reports"
@@ -1001,6 +1015,10 @@ impl Runner {
                 proteins.extend(self.database[f.peptide_idx].proteins.iter().cloned());
             }
             self.linear_proteins = Some(proteins);
+        }
+        // the spectra the crosslink search then leaves out: a target PSM at the cutoff
+        if let Some(fdr) = self.parameters.crosslink.as_ref().filter(|c| c.skip_linear_spectra).map(|c| c.linear_spectrum_fdr) {
+            self.linear_spectra = Some(crosslink_runner::explained_spectra(&outputs.features, fdr));
         }
 
         if let Some(library) = self.parameters.spectral_library.clone() {

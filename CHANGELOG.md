@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `crosslink.skip_linear_spectra` (sage-gui: Crosslinking > Spectra for crosslinks): the linear search runs on every spectrum file first, and the crosslink search then leaves out every MS2 spectrum whose best linear match is a target peptide at 1% FDR (`linear_spectrum_fdr`): a spectrum a linear peptide explains is taken not to be a crosslink. On its own or with `linear_proteins`. The log says how many spectra are left out, overall and per batch of files; the Progress tab gives the number. On four Pol II timsTOF runs it left out 2.5% of the MS2 spectra (those with a linear match at 1% FDR) and the crosslink search was not measurably faster; 3 of the 1,193 crosslink matches at 1% FDR of the full search were on those spectra (their linear matches scored far lower), costing one crosslink near the cutoff. It pays where the linear search identifies many of the spectra.
+
 ## [v1.9.6] - 2026-11-22
 
 ### Added

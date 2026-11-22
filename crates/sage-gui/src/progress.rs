@@ -69,6 +69,9 @@ pub struct Plan {
     /// ...and the crosslink search only searches the proteins it found,
     /// reading the files again after the linear results
     pub linear_proteins: bool,
+    /// ...or (also) leaves out the spectra it explained: the crosslink
+    /// search, too, reads the files again after the linear results
+    pub linear_spectra: bool,
     pub quant: bool,
     pub gpu_backend: bool,
     pub output_dir: PathBuf,
@@ -229,9 +232,13 @@ impl Tracker {
         if plan.crosslink && plan.linear {
             // both searches run on each batch of files; the linear results come first
             stages.push(Stage::Linear);
+            // the linear search alone first; then the crosslink search, of its
+            // proteins and/or of the spectra it did not explain
             if plan.linear_proteins {
-                // the linear search alone first; then the crosslink search of its proteins
-                stages.extend([Stage::XlDatabase, Stage::XlSearch]);
+                stages.push(Stage::XlDatabase);
+            }
+            if plan.linear_proteins || plan.linear_spectra {
+                stages.push(Stage::XlSearch);
             }
         }
         if plan.crosslink {
@@ -467,8 +474,15 @@ impl Tracker {
             self.results_part = Some((i, n, what, None));
             return;
         }
-        // the crosslink search narrowed to the linear search's proteins
-        if self.plan.linear_proteins {
+        // the crosslink search after the linear one: of its proteins, and/or
+        // of the spectra it did not explain
+        if self.plan.linear_proteins || self.plan.linear_spectra {
+            if let Some(rest) = msg.strip_prefix("spectra for crosslinks: the ") {
+                if let Some((n, _)) = rest.split_once(' ') {
+                    self.set_metric("Spectra left out (linear match)", n.to_string());
+                }
+                return;
+            }
             if msg.starts_with("=== crosslink database") {
                 self.reach(Stage::XlDatabase);
                 return;
@@ -892,7 +906,17 @@ mod test {
     use super::*;
 
     fn plan(crosslink: bool, quant: bool) -> Plan {
-        Plan { files: 4, raw_files: 0, crosslink, linear: false, linear_proteins: false, quant, gpu_backend: false, output_dir: PathBuf::new() }
+        Plan {
+            files: 4,
+            raw_files: 0,
+            crosslink,
+            linear: false,
+            linear_proteins: false,
+            linear_spectra: false,
+            quant,
+            gpu_backend: false,
+            output_dir: PathBuf::new(),
+        }
     }
 
     fn feed(t: &mut Tracker, lines: &[&str]) -> Vec<String> {
@@ -1067,6 +1091,31 @@ mod test {
         let m = |k: &str| t.metrics.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
         assert_eq!(m("Proteins for crosslinks").as_deref(), Some("15 of 130"));
         assert_eq!(m("Crosslink database peptides").as_deref(), Some("22,147"));
+    }
+
+    /// Leaving out the spectra the linear search explained, without
+    /// narrowing the proteins: the crosslink search after the linear results,
+    /// no database stage
+    #[test]
+    fn follows_the_crosslink_search_of_the_unexplained_spectra() {
+        let mut t = Tracker::new(Plan { linear: true, linear_spectra: true, ..plan(true, false) });
+        assert_eq!(t.stages, [Stage::Start, Stage::Database, Stage::Search, Stage::Linear, Stage::XlSearch, Stage::Results]);
+        let mut log: Vec<String> = Vec::new();
+        let mut step = |t: &mut Tracker, msgs: &[&str]| {
+            log.extend(msgs.iter().map(|m| format!("[2026-11-22T18:00:07Z INFO  sage_cli::runner] {m}")));
+            t.update(&log, log.len());
+        };
+        step(&mut t, &["using 16 CPU thread(s)", "processing files 0 .. 4 ", "- file IO:        4 ms", "- search:         1 ms (500 spectra/s)",
+            "=== linear peptide results (results.sage.tsv) ===", "discovered 1207 target peptides at 1% FDR",
+            "spectra for crosslinks: the 17,455 MS2 spectra with a linear peptide match at 1% FDR are left out of the crosslink search",
+            "=== searching the spectrum files: crosslink search ===", "processing files 0 .. 4 "]);
+        assert_eq!(t.stage(), Stage::XlSearch);
+        assert_eq!(t.activity(), "Crosslink search: files 1\u{2013}4 of 4");
+        step(&mut t, &["- crosslink search:       12 ms (100 spectra, 5 candidate matches, 40 with a linear match left out)"]);
+        let m = |k: &str| t.metrics.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
+        assert_eq!(m("Spectra left out (linear match)").as_deref(), Some("17,455"));
+        // the spectra left out do not count as searched
+        assert_eq!((t.spectra, t.candidates), (100, 5));
     }
 
     #[test]

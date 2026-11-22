@@ -437,6 +437,17 @@ pub struct CrosslinkSettings {
     /// The q-value cutoff of `linear_proteins`, for PSMs and peptides
     #[serde(default = "default_linear_protein_fdr")]
     pub linear_protein_fdr: f32,
+    /// With `linear_search`: search for crosslinks only the MS2 spectra
+    /// without a linear peptide-spectrum match (rank 1, target) at
+    /// `linear_spectrum_fdr`: a spectrum a linear peptide explains is taken
+    /// not to be a crosslink. The linear search runs on every file first, as
+    /// with `linear_proteins` (with or without it); each file is read twice.
+    /// Off by default.
+    #[serde(default)]
+    pub skip_linear_spectra: bool,
+    /// The PSM q-value cutoff of `skip_linear_spectra`
+    #[serde(default = "default_linear_protein_fdr")]
+    pub linear_spectrum_fdr: f32,
     /// Non-cleavable linkers: matched fragment ions that carry the linker
     /// (contain the link site; loop-links: both sites) required on *each*
     /// chain. These are the only direct evidence of the link: without them a
@@ -472,6 +483,8 @@ impl Default for CrosslinkSettings {
             linear_search: default_linear_search(),
             linear_proteins: false,
             linear_protein_fdr: default_linear_protein_fdr(),
+            skip_linear_spectra: false,
+            linear_spectrum_fdr: default_linear_protein_fdr(),
             min_linked_peaks: default_linked_peaks(),
             labels: Vec::new(),
         }
@@ -582,6 +595,14 @@ impl CrosslinkSettings {
         if !(self.linear_protein_fdr > 0.0 && self.linear_protein_fdr <= 1.0) {
             return Err(format!("crosslink.linear_protein_fdr must be above 0 and at most 1, got {}", self.linear_protein_fdr));
         }
+        if self.skip_linear_spectra && !self.linear_search {
+            return Err(
+                "crosslink.skip_linear_spectra needs crosslink.linear_search: the linear search finds the spectra to skip".into(),
+            );
+        }
+        if !(self.linear_spectrum_fdr > 0.0 && self.linear_spectrum_fdr <= 1.0) {
+            return Err(format!("crosslink.linear_spectrum_fdr must be above 0 and at most 1, got {}", self.linear_spectrum_fdr));
+        }
         if self.chain_survivors == 0 {
             return Err("crosslink.chain_survivors must be at least 1".into());
         }
@@ -652,6 +673,12 @@ impl CrosslinkSettings {
                 .and_then(Reagent::sites)
                 .map(|(s1, s2)| (s1.into(), s2.into())),
         }
+    }
+
+    /// Does the linear search run on every file before the crosslink search
+    /// (`linear_proteins` or `skip_linear_spectra`), each file read twice?
+    pub fn linear_first(&self) -> bool {
+        self.linear_search && (self.linear_proteins || self.skip_linear_spectra)
     }
 
     /// Do the two ends of the linker react with different groups?
@@ -3261,6 +3288,19 @@ mod test {
         let bad: CrosslinkSettings =
             serde_json::from_str(r#"{"linear_proteins": true, "linear_protein_fdr": 0.0}"#).unwrap();
         assert!(bad.validate().unwrap_err().contains("linear_protein_fdr"));
+
+        // skipping the spectra the linear search explains: with or without
+        // the proteins, never without the linear search
+        let skip: CrosslinkSettings = serde_json::from_str(r#"{"skip_linear_spectra": true}"#).unwrap();
+        assert!(skip.validate().is_ok() && skip.linear_first() && !skip.linear_proteins);
+        assert!((skip.linear_spectrum_fdr - 0.01).abs() < 1e-9);
+        assert!(!CrosslinkSettings::default().linear_first());
+        let off: CrosslinkSettings =
+            serde_json::from_str(r#"{"skip_linear_spectra": true, "linear_search": false}"#).unwrap();
+        assert!(off.validate().unwrap_err().contains("skip_linear_spectra"));
+        let bad: CrosslinkSettings =
+            serde_json::from_str(r#"{"skip_linear_spectra": true, "linear_spectrum_fdr": 1.5}"#).unwrap();
+        assert!(bad.validate().unwrap_err().contains("linear_spectrum_fdr"));
     }
 
     /// A confident target crosslink match of `a` and `b`, as `assign_q_values` leaves it
