@@ -49,6 +49,25 @@ impl Tracker {
             *d = text.into();
         }
     }
+
+    /// Counts this step's items from code that does not know the step (a
+    /// report writer)
+    pub fn counter(&self) -> Counter {
+        Counter(Some(self.done.clone()))
+    }
+}
+
+/// Counts a step's items from inside the code doing them; the default one
+/// counts nothing (tests, callers without a step)
+#[derive(Clone, Default)]
+pub struct Counter(Option<Arc<AtomicUsize>>);
+
+impl Counter {
+    pub fn add(&self, n: usize) {
+        if let Some(done) = &self.0 {
+            done.fetch_add(n, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for Tracker {

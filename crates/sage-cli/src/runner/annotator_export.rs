@@ -17,7 +17,9 @@ use sage_core::crosslink::{CrosslinkMatch, CrosslinkSettings, LinkKind, PairClas
 use sage_core::database::IndexedDatabase;
 use sage_core::peptide::Peptide;
 use sage_core::scoring::Feature;
+use rayon::prelude::*;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 /// Matches at or below this spectrum q-value are exported
 const Q_CUTOFF: f32 = 0.01;
@@ -166,7 +168,7 @@ pub fn bruker_positions(tdf: &std::path::Path) -> anyhow::Result<HashMap<String,
 }
 
 /// Where Annotator finds one spectrum file's spectra
-struct SpectrumFile {
+pub(super) struct SpectrumFile {
     /// Local path (or URL) as passed to Annotator
     path: String,
     /// Sage spectrum id → 0-based position in the file
@@ -176,12 +178,25 @@ struct SpectrumFile {
 impl Runner {
     /// Path and spectrum positions of each spectrum file in `file_ids`
     /// (mzML, MGF, and local Bruker `.d` DDA-PASEF folders)
-    fn annotator_files(&self, file_ids: &BTreeSet<usize>) -> HashMap<usize, SpectrumFile> {
-        let mut files = HashMap::new();
-        for &file_id in file_ids {
-            let Some(url) = self.parameters.mzml_paths.get(file_id) else {
-                continue;
-            };
+    /// The spectrum files of `file_ids`, each read once per search (the
+    /// linear and the crosslink export share them) and several at a time
+    fn annotator_files(&self, file_ids: &BTreeSet<usize>) -> HashMap<usize, Arc<SpectrumFile>> {
+        let Ok(mut known) = self.annotator_files.lock() else {
+            return HashMap::new();
+        };
+        let unread: Vec<usize> = file_ids.iter().copied().filter(|id| !known.contains_key(id)).collect();
+        let read: Vec<(usize, Option<SpectrumFile>)> =
+            unread.par_iter().map(|&id| (id, self.annotator_file(id))).collect();
+        for (id, file) in read {
+            known.insert(id, file.map(Arc::new));
+        }
+        file_ids.iter().filter_map(|id| known.get(id).cloned().flatten().map(|f| (*id, f))).collect()
+    }
+
+    /// One spectrum file's positions; `None` (with a warning) if it cannot be read
+    fn annotator_file(&self, file_id: usize) -> Option<SpectrumFile> {
+        {
+            let url = self.parameters.mzml_paths.get(file_id)?;
             let local = (url.scheme() == "file").then(|| url.to_file_path().ok()).flatten();
             let path = local
                 .as_ref()
@@ -198,13 +213,13 @@ impl Runner {
                 Err(anyhow::anyhow!("Annotator reads mzML, MGF and Bruker .d here"))
             };
             match positions {
-                Ok(positions) => {
-                    files.insert(file_id, SpectrumFile { path, positions });
+                Ok(positions) => Some(SpectrumFile { path, positions }),
+                Err(e) => {
+                    log::warn!("Annotator export: {url} left out ({e})");
+                    None
                 }
-                Err(e) => log::warn!("Annotator export: {url} left out ({e})"),
             }
         }
-        files
     }
 
     fn write_annotator(&self, name: &str, rows: Vec<(usize, String, String, u8)>) -> anyhow::Result<Url> {

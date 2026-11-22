@@ -60,6 +60,11 @@ pub struct Runner {
     qc: std::sync::Mutex<qc::QcCollector>,
     /// The linear spectral library's scales, for the crosslink library
     library: Option<library::LibraryContext>,
+    /// Crosslink searches with `linear_proteins`: the proteins the linear
+    /// search found, which make the crosslink search's database
+    linear_proteins: Option<std::collections::HashSet<std::sync::Arc<str>>>,
+    /// The spectrum files' positions for the Annotator exports, read once
+    annotator_files: std::sync::Mutex<HashMap<usize, Option<std::sync::Arc<annotator_export::SpectrumFile>>>>,
 }
 
 #[derive(Default)]
@@ -201,6 +206,8 @@ impl Runner {
                         spectra_searched: AtomicUsize::new(0),
                         qc: Default::default(),
                         library: None,
+                        linear_proteins: None,
+                        annotator_files: Default::default(),
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
                     parameters.database.clone().build_from_peptides(peptides)
@@ -222,6 +229,8 @@ impl Runner {
             spectra_searched: AtomicUsize::new(0),
             qc: Default::default(),
             library: None,
+            linear_proteins: None,
+            annotator_files: Default::default(),
         })
     }
 
@@ -609,7 +618,11 @@ impl Runner {
             );
             info!(
                 "plan: {}",
-                if xl.linear_search {
+                if xl.linear_search && xl.linear_proteins {
+                    "the linear peptide search of each batch of files, then its results; the proteins of its \
+                     peptides make the crosslink database (LinearProteins.fasta); then the crosslink search of \
+                     each batch of files (each file read twice), then the crosslink FDR and reports"
+                } else if xl.linear_search {
                     "the linear peptide search and the crosslink search of each batch of files, each file read once; \
                      then the linear results, then the crosslink FDR and reports"
                 } else {
@@ -980,6 +993,15 @@ impl Runner {
         // are reported with protein group FDR = 1.0
         let q_protein_group =
             sage_core::fdr::picked_protein_group(&self.database, &mut outputs.features);
+        // the proteins the crosslink search is then narrowed to: every protein
+        // of a target peptide at the cutoff (shared peptides bring all theirs)
+        if let Some(fdr) = self.parameters.crosslink.as_ref().filter(|c| c.linear_proteins).map(|c| c.linear_protein_fdr) {
+            let mut proteins = std::collections::HashSet::new();
+            for f in outputs.features.iter().filter(|f| f.label == 1 && f.spectrum_q <= fdr && f.peptide_q <= fdr) {
+                proteins.extend(self.database[f.peptide_idx].proteins.iter().cloned());
+            }
+            self.linear_proteins = Some(proteins);
+        }
 
         if let Some(library) = self.parameters.spectral_library.clone() {
             // the library's retention times are the aligned ones

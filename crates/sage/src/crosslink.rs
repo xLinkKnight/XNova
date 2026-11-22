@@ -77,6 +77,10 @@ fn default_linear_search() -> bool {
     true
 }
 
+fn default_linear_protein_fdr() -> f32 {
+    0.01
+}
+
 fn default_chain_survivors() -> usize {
     20_000
 }
@@ -423,6 +427,16 @@ pub struct CrosslinkSettings {
     /// to `crosslinks.sage.tsv`). On unless set to `false`.
     #[serde(default = "default_linear_search")]
     pub linear_search: bool,
+    /// With `linear_search`: search for crosslinks only among the proteins
+    /// the linear search finds (every protein of a target peptide at
+    /// `linear_protein_fdr`, PSM and peptide q-value), written to
+    /// `LinearProteins.fasta`. Narrows a whole-proteome FASTA to the proteins
+    /// in the sample; each spectrum file is then read twice. Off by default.
+    #[serde(default)]
+    pub linear_proteins: bool,
+    /// The q-value cutoff of `linear_proteins`, for PSMs and peptides
+    #[serde(default = "default_linear_protein_fdr")]
+    pub linear_protein_fdr: f32,
     /// Non-cleavable linkers: matched fragment ions that carry the linker
     /// (contain the link site; loop-links: both sites) required on *each*
     /// chain. These are the only direct evidence of the link: without them a
@@ -456,6 +470,8 @@ impl Default for CrosslinkSettings {
             backend: Backend::Cpu,
             chain_survivors: default_chain_survivors(),
             linear_search: default_linear_search(),
+            linear_proteins: false,
+            linear_protein_fdr: default_linear_protein_fdr(),
             min_linked_peaks: default_linked_peaks(),
             labels: Vec::new(),
         }
@@ -559,6 +575,12 @@ impl CrosslinkSettings {
         }
         if self.candidates == 0 {
             return Err("crosslink.candidates must be at least 1".into());
+        }
+        if self.linear_proteins && !self.linear_search {
+            return Err("crosslink.linear_proteins needs crosslink.linear_search: the linear search finds the proteins".into());
+        }
+        if !(self.linear_protein_fdr > 0.0 && self.linear_protein_fdr <= 1.0) {
+            return Err(format!("crosslink.linear_protein_fdr must be above 0 and at most 1, got {}", self.linear_protein_fdr));
         }
         if self.chain_survivors == 0 {
             return Err("crosslink.chain_survivors must be at least 1".into());
@@ -3224,6 +3246,21 @@ mod test {
                 vec![("GLEKVSTAAMQR".to_string(), 3), ("TDYHFPNEWKLIR".to_string(), 4)]
             );
         }
+    }
+
+    /// Searching only the linear search's proteins needs the linear search
+    #[test]
+    fn linear_proteins_need_the_linear_search() {
+        let cfg: CrosslinkSettings = serde_json::from_str(r#"{"reagent": "dsso"}"#).unwrap();
+        assert!(!cfg.linear_proteins && (cfg.linear_protein_fdr - 0.01).abs() < 1e-9);
+        let cfg: CrosslinkSettings = serde_json::from_str(r#"{"reagent": "dsso", "linear_proteins": true}"#).unwrap();
+        assert!(cfg.validate().is_ok() && cfg.linear_search);
+        let off: CrosslinkSettings =
+            serde_json::from_str(r#"{"reagent": "dsso", "linear_proteins": true, "linear_search": false}"#).unwrap();
+        assert!(off.validate().unwrap_err().contains("linear_search"));
+        let bad: CrosslinkSettings =
+            serde_json::from_str(r#"{"linear_proteins": true, "linear_protein_fdr": 0.0}"#).unwrap();
+        assert!(bad.validate().unwrap_err().contains("linear_protein_fdr"));
     }
 
     /// A confident target crosslink match of `a` and `b`, as `assign_q_values` leaves it

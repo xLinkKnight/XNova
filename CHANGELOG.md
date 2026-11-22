@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `crosslink.linear_proteins` (sage-gui: Crosslinking > Proteins for crosslinks): the linear search runs on every spectrum file first, and the crosslink search then searches only the proteins with a target peptide at 1% FDR in it (`linear_protein_fdr`, PSM and peptide level; a shared peptide brings all its proteins) instead of the whole FASTA. For whole-organism proteomes: far fewer peptide pairs to try. The proteins are written to `LinearProteins.fasta` with their FASTA records as they were, each once (a protein repeated in the FASTA or in both crosslink databases is written and searched once). Each spectrum file is read twice. The Progress tab has the two stages it adds.
+- `abs_pos_a` and `abs_pos_b` in `crosslinks.sage.tsv` and `crosslinks_FDRfiltered.sage.tsv`: the link residues' positions in their proteins' own numbering (one per protein, `;`-separated, in the order of `proteins_a` / `proteins_b`); multivalent searches add `abs_pos_c`, ... for the peptides of each species.
+- The crosslink results are made in numbered parts, each announced in the log and then given its time and rate (`- crosslinks.mzid for xiVIEW and PRIDE: 1.3 s, 80,815 matches/s`); a part running longer than 15 s writes `progress:` lines with its matches done, rate and time left. sage-gui's Progress tab shows the part under way ("Results, part 8 of 10: crosslinks.mzid for xiVIEW and PRIDE, 40%") and moves its bar.
+
+### Changed
+- The crosslink results are much faster: 31 s to 4 s on our 21-file DSSO search of RNA polymerase II, identical files. Writing `crosslinks.mzid` looked up each spectrum's retention time and each peptide evidence's number by going through everything written before (28 s to 1.3 s); each peptide is now placed in its proteins once for all the reports; the Annotator exports read each spectrum file's index once per search (the linear and crosslink exports shared none) and several files at a time.
+- The Progress tab's bar follows the crosslink search of a batch of files by the share of its spectra searched (from sage.exe's progress lines), instead of counting a batch half done when it starts.
+
 ## [v1.9.5] - 2026-11-19
 
 ### Added

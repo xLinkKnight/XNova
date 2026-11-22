@@ -9,7 +9,7 @@
 //! protein, so the protein sequences are taken from the FASTA.
 
 use sage_core::crosslink::{CrosslinkMatch, CrosslinkSettings, LinkKind, PairClass, Reagent};
-use sage_core::database::IndexedDatabase;
+use sage_core::database::{IndexedDatabase, PeptideIx};
 use sage_core::ion_series::Kind;
 use sage_core::mass::{Tolerance, PROTON};
 use sage_core::modification::{ModId, ModificationSpecificity};
@@ -110,6 +110,48 @@ pub struct ExportContext<'a> {
     pub variable_mods: &'a [(ModificationSpecificity, ModId, Option<usize>)],
     pub precursor_tol: Tolerance,
     pub version: &'a str,
+    /// Counts the matches written, for the progress of the writer at work
+    pub progress: crate::progress::Counter,
+    /// Where each peptide is in its proteins, found once per peptide
+    pub starts: StartsCache,
+}
+
+/// [`protein_starts`] of each peptide, kept: a peptide is in many matches,
+/// and finding it means reading its proteins' sequences
+#[derive(Default)]
+pub struct StartsCache(std::sync::Mutex<HashMap<PeptideIx, std::sync::Arc<Vec<(String, Option<usize>)>>>>);
+
+impl ExportContext<'_> {
+    /// [`protein_starts`] of the peptide `ix`, found once
+    pub fn starts_of(&self, ix: PeptideIx) -> std::sync::Arc<Vec<(String, Option<usize>)>> {
+        if let Some(found) = self.starts.0.lock().ok().and_then(|c| c.get(&ix).cloned()) {
+            return found;
+        }
+        let found = std::sync::Arc::new(protein_starts(self, &self.db[ix]));
+        if let Ok(mut cache) = self.starts.0.lock() {
+            cache.insert(ix, found.clone());
+        }
+        found
+    }
+
+    /// The 1-based positions in its proteins of a peptide's link residues
+    /// (0-based `sites` in the peptide): one entry per protein, in the order
+    /// of its proteins, separated by `;`; several residues of one peptide
+    /// (a loop-link, a multivalent species) separated by `,`. `?` where the
+    /// peptide is not in the protein's sequence.
+    pub fn absolute_positions(&self, ix: PeptideIx, sites: &[u16]) -> String {
+        self.starts_of(ix)
+            .iter()
+            .map(|(_, start)| {
+                sites
+                    .iter()
+                    .map(|&s| start.map_or_else(|| "?".to_string(), |st| (st + s as usize).to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect::<Vec<_>>()
+            .join(";")
+    }
 }
 
 /// The target sequence a peptide came from: decoys are targets with their
@@ -214,12 +256,14 @@ pub fn xiview_csv(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> anyhow::Re
     let linker = ctx.settings.linker_mass();
     let mut loops = 0;
     for m in matches {
+        ctx.progress.add(1);
         let Some(beta) = m.beta.filter(|_| m.kind == LinkKind::Inter) else {
             loops += 1;
             continue;
         };
-        let side = |p: &Peptide| {
-            let starts = protein_starts(ctx, p);
+        let side = |ix: PeptideIx| {
+            let p = &ctx.db[ix];
+            let starts = ctx.starts_of(ix);
             let names = starts.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(";");
             let positions = starts
                 .iter()
@@ -229,9 +273,8 @@ pub fn xiview_csv(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> anyhow::Re
             let decoy = if p.decoy { "True" } else { "False" };
             (xi_sequence(ctx, p), positions, names, decoy)
         };
-        let (a, b) = (&ctx.db[m.alpha], &ctx.db[beta]);
-        let (seq1, pos1, prot1, decoy1) = side(a);
-        let (seq2, pos2, prot2, decoy2) = side(b);
+        let (seq1, pos1, prot1, decoy1) = side(m.alpha);
+        let (seq2, pos2, prot2, decoy2) = side(beta);
         let (peak_list, scan_id) = match ctx.files.get(m.file_id) {
             Some(file) => (file.name.clone(), file.xiview_scan_id(&m.spec_id)),
             None => (String::new(), m.spec_id.clone()),
@@ -421,6 +464,7 @@ pub fn proxl_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Stri
     let mut reported: BTreeMap<String, (&str, Vec<ProxlPeptide>, Vec<&CrosslinkMatch>)> = BTreeMap::new();
     let mut accessions = BTreeSet::new();
     for m in matches.iter().filter(|m| m.rank == 1 && m.class == PairClass::TT) {
+        ctx.progress.add(1);
         let alpha = &ctx.db[m.alpha];
         let (kind, mut peptides) = match (m.kind, m.beta) {
             (LinkKind::Inter, Some(beta)) => (
@@ -759,6 +803,8 @@ pub(super) mod test {
             variable_mods: &variables,
             precursor_tol: Tolerance::Ppm(-10.0, 10.0),
             version: "test",
+            progress: Default::default(),
+            starts: Default::default(),
         };
 
         // xiVIEW: crosslinks only, decoys flagged, positions in the protein
@@ -891,6 +937,8 @@ pub(super) mod test {
             variable_mods: &variables,
             precursor_tol: Tolerance::Ppm(-10.0, 10.0),
             version: "test",
+            progress: Default::default(),
+            starts: Default::default(),
         };
         let (csv, _) = xiview_csv(&ctx, std::slice::from_ref(&m)).unwrap();
         assert!(String::from_utf8(csv).unwrap().contains(",run02.mgf,index=41,"));

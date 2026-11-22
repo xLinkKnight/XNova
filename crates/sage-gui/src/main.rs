@@ -678,6 +678,7 @@ impl SageGui {
             raw_files: if convert { self.s.spectra.iter().filter(|f| Settings::is_thermo_raw(f)).count() } else { 0 },
             crosslink: xl.enabled,
             linear: xl.enabled && xl.linear_search,
+            linear_proteins: xl.enabled && xl.linear_search && xl.linear_proteins,
             quant: self.s.lfq || self.s.tmt != Tmt::None || self.s.silac != Silac::Off,
             gpu_backend: xl.enabled && matches!(xl.backend, Backend::Gpu | Backend::Auto),
             output_dir: out.clone(),
@@ -1581,6 +1582,9 @@ impl SageGui {
                 ui.label(if done || current { label } else { label.color(muted) });
                 let detail = match (stage, done) {
                     (progress::Stage::Search, _) if t.plan.files > 0 => {
+                        format!("{} of {} files", t.linear_files_done.unwrap_or(t.files_done), t.plan.files)
+                    }
+                    (progress::Stage::XlSearch, _) if t.plan.files > 0 && t.linear_files_done.is_some() => {
                         format!("{} of {} files", t.files_done, t.plan.files)
                     }
                     (progress::Stage::Convert, _) => format!("{} of {} files", t.converted, t.plan.raw_files),
@@ -3289,8 +3293,19 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: 
                 proteins.sage.tsv (peptides at 1% FDR and their protein groups); LFQ / TMT tables, pin file and HTML \
                 report follow the Scoring & output tab. It uses the crosslink search's database settings (e.g. \
                 minimum peptide mass 350 Da). Unlinked peptides, mono-links and the seeds of crosslinks all show \
-                up here. On by default; roughly doubles the file reading time.",
+                up here. On by default; each spectrum file is read once for both searches.",
                 |ui| ui.checkbox(&mut xl.linear_search, "also run a linear peptide search (peptide and protein reports)"));
+            row(ui, "Proteins for crosslinks", "For whole-proteome FASTA files. The linear search runs on every \
+                spectrum file first; the crosslink search then searches only the proteins with a target peptide at \
+                1% FDR (PSM and peptide level) in it, instead of the whole FASTA (a peptide shared by several \
+                proteins brings them all). Those proteins are written to LinearProteins.fasta with their FASTA \
+                headers, each once. Far fewer peptide pairs to try, so a proteome-scale crosslink search is faster \
+                and needs less memory; a crosslink of a protein with no linear peptide is missed, the crosslink FDR \
+                is over the smaller database, and each spectrum file is read twice. Needs the linear search.",
+                |ui| ui.add_enabled(
+                    xl.linear_search,
+                    egui::Checkbox::new(&mut xl.linear_proteins, "only those the linear search finds (LinearProteins.fasta)"),
+                ));
             row(ui, "Multivalent crosslinks", "Also search species held together by two or more linkers, up to the \
                 number set here (2-4 linkers per species): several links between two peptides (a2b), chains and \
                 branches of three or more peptides (a1b1c, a1b,b1c,b1d), and copies of one peptide (a2a, a1a1b, as \
@@ -3794,6 +3809,7 @@ mod screenshots {
                                     raw_files: 0,
                                     crosslink: true,
                                     linear: true,
+                                    linear_proteins: false,
                                     quant: false,
                                     gpu_backend: false,
                                     output_dir: PathBuf::from(&folder),
@@ -3845,6 +3861,7 @@ mod screenshots {
         let results = PathBuf::from(json["output_directory"].as_str().unwrap());
         let files = json["mzml_paths"].as_array().map_or(0, |a| a.len());
         let crosslink = json.get("crosslink").is_some_and(|c| !c.is_null());
+        let narrowed = json["crosslink"]["linear_proteins"].as_bool() == Some(true);
         let saved_in = results.clone();
         let mut app: Option<SageGui> = None;
         let mut harness = Harness::builder()
@@ -3864,6 +3881,7 @@ mod screenshots {
                             raw_files: 0,
                             crosslink,
                             linear: crosslink,
+                            linear_proteins: narrowed,
                             quant: false,
                             gpu_backend: false,
                             output_dir: results.clone(),

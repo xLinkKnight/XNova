@@ -8,7 +8,7 @@
 //! needs. Each crosslink is also given in its proteins (`ONE_HUMAN:K12-
 //! TWO_HUMAN:K3`), from the protein sequences of the FASTA.
 
-use super::crosslink_export::{mz, protein_starts, ExportContext};
+use super::crosslink_export::{mz, ExportContext};
 use sage_core::crosslink::{rank_score, CrosslinkMatch, LinkKind, PairClass};
 use sage_core::database::PeptideIx;
 
@@ -167,6 +167,7 @@ pub fn csm_report(ctx: &ExportContext, matches: &[CrosslinkMatch], filenames: &[
 
     let (mut high, mut medium) = (0, 0);
     for m in rows {
+        ctx.progress.add(1);
         if m.spectrum_q <= HIGH {
             high += 1;
         } else {
@@ -175,7 +176,7 @@ pub fn csm_report(ctx: &ExportContext, matches: &[CrosslinkMatch], filenames: &[
         let peptides = members(m);
         let scores = peptide_scores(m);
         // each peptide's proteins and 1-based start in each
-        let starts: Vec<Vec<(String, Option<usize>)>> = peptides.iter().map(|(ix, _)| protein_starts(ctx, &db[*ix])).collect();
+        let starts: Vec<_> = peptides.iter().map(|(ix, _)| ctx.starts_of(*ix)).collect();
         let residue = |p: usize, site: u16| db[peptides[p].0].sequence.get(site as usize).map_or('?', |&c| c as char);
         // a link residue in the first protein of its peptide
         let in_protein = |p: usize, site: u16| match starts[p].first() {
@@ -282,6 +283,8 @@ mod test {
             variable_mods: &variables,
             precursor_tol: Tolerance::Ppm(-10.0, 10.0),
             version: "test",
+            progress: Default::default(),
+            starts: Default::default(),
         };
         // MAGLEK... starts at residue 1 of P11111 (ONE), CDKEFR at 5 of P22222 (TWO), STKPLEK at 16 of TWO
         let a = find(&db, "MAGLEKVSTAAM[+15.9949]QR", false);

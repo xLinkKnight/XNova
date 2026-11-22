@@ -526,6 +526,9 @@ pub struct Crosslink {
     pub chain_survivors: u32,
     /// Also run a linear peptide search (results.sage.tsv)
     pub linear_search: bool,
+    /// With the linear search: search for crosslinks only in the proteins
+    /// it finds (LinearProteins.fasta)
+    pub linear_proteins: bool,
     /// Non-cleavable: matched linker-carrying ions required per chain
     pub min_linked_peaks: u32,
     /// Also search multivalent species (several linkers), up to `valency` linkers
@@ -562,6 +565,7 @@ impl Default for Crosslink {
             backend: Backend::Cpu,
             chain_survivors: 20000,
             linear_search: true,
+            linear_proteins: false,
             min_linked_peaks: 2,
             multivalent: false,
             valency: 2,
@@ -672,6 +676,10 @@ impl Crosslink {
         m.insert("chain_survivors".into(), json!(self.chain_survivors));
         // always written: Sage turns the linear search on when it is absent
         m.insert("linear_search".into(), json!(self.linear_search));
+        // only when on (off is Sage's default), and only with the linear search
+        if self.linear_search && self.linear_proteins {
+            m.insert("linear_proteins".into(), json!(true));
+        }
         // Sage's default (2) is left out, so configs still run in an older sage.exe
         if self.min_linked_peaks != 2 {
             m.insert("min_linked_peaks".into(), json!(self.min_linked_peaks));
@@ -745,6 +753,7 @@ impl Crosslink {
         }
         c.chain_survivors = u32_or(v.get("chain_survivors"), c.chain_survivors);
         c.linear_search = bool_or(v.get("linear_search"), c.linear_search);
+        c.linear_proteins = bool_or(v.get("linear_proteins"), false);
         c.min_linked_peaks = u32_or(v.get("min_linked_peaks"), c.min_linked_peaks);
         if let Some(n) = v.get("multivalent").and_then(Value::as_u64) {
             c.multivalent = true;
@@ -2896,5 +2905,22 @@ P1	3	S	UNIMOD:21
                 assert!((entry.mono_mass - m.mass).abs() < 2e-6, "{}: Unimod has {}", m.label, entry.mono_mass);
             }
         }
+    }
+
+    /// "Proteins for crosslinks": written only when on, and only with the linear search
+    #[test]
+    fn linear_proteins_only_with_the_linear_search() {
+        let mut s = Settings::default();
+        s.crosslink.enabled = true;
+        assert!(s.to_json(&[])["crosslink"].get("linear_proteins").is_none());
+        s.crosslink.linear_proteins = true;
+        let v = s.to_json(&[]);
+        assert_eq!(v["crosslink"]["linear_proteins"], json!(true));
+        let back = Settings::from_json(&v).unwrap();
+        assert!(back.crosslink.linear_proteins && back.crosslink.linear_search);
+        assert_eq!(back.to_json(&[]), v);
+        // no linear search, no narrowing (sage.exe would refuse it)
+        s.crosslink.linear_search = false;
+        assert!(s.to_json(&[])["crosslink"].get("linear_proteins").is_none());
     }
 }

@@ -37,6 +37,8 @@ before. Two strategies are used, chosen by the reagent:
 | `chain_survivors` | `20000` | `reflect`/`gpu` only: peptides kept per spectrum after the per-chain filter (best by chain score) |
 | `min_linked_peaks` | `2` | matched fragment ions that carry the linker required on *each* chain, reported as `linked_a` / `linked_b`. Non-cleavable: ions that contain the link site (loop-links: both sites). Cleavable loop-links: stub-carrying ions inside the opened ring. They are the only direct evidence of the link; without them a correct peptide with any modification of about the linker's mass passes as a loop-link, and a strong peptide with a barely matched partner as a crosslink. `0` turns the check off |
 | `linear_search` | `true` | also run an ordinary linear peptide search first, written to `results.sage.tsv`, `peptides.sage.tsv` and `proteins.sage.tsv` (plus the usual LFQ/TMT tables, `.pin` and HTML report when enabled). It uses the crosslink search's database settings, e.g. `peptide_min_mass` 350 Da. `false` skips it |
+| `linear_proteins` | `false` | with `linear_search`: search for crosslinks only among the proteins the linear search finds, see [Narrowing a proteome to the linear search's proteins](#narrowing-a-proteome-to-the-linear-searchs-proteins) |
+| `linear_protein_fdr` | `0.01` | `linear_proteins`: the PSM and peptide q-value a peptide needs to bring its proteins |
 | `require_complete_doublets` | `false` | cleavable only: require a doublet (two stub peaks) of *both* peptides. Default: a doublet of one peptide; the partner's mass follows from the precursor, and its stub peaks are counted in `stub_peaks` but not required (asymmetric linkers: one stub peak of the partner's own arm is) |
 | `precursor_window` | `true` | learn each run's precursor mass error from the confident matches of a first pass and accept only matches within the central 99% of it, see [FDR](#fdr-of-crosslink-searches). `false`: one pass, the whole precursor tolerance |
 | `residues` | `"K"` | residues the linker reacts with (e.g. `"KST"`) |
@@ -63,6 +65,35 @@ results: `results.sage.tsv` (PSMs), `peptides.sage.tsv` (peptides at 1% FDR) and
 (their protein groups, each with its `protein_group_q`), plus the LFQ/TMT tables and HTML report when
 enabled. Protein groups are not cut at 1%: Sage's picked protein FDR cannot go below 1 / (number of
 protein groups), about 0.08 for a 13-protein complex. Run as normal: `sage config.json`.
+
+### Narrowing a proteome to the linear search's proteins
+
+```json
+"crosslink": { "reagent": "dsso", "linear_proteins": true }
+```
+
+A crosslink search tries pairs of peptides, so its cost grows far faster than
+the database. Against a whole-organism proteome, most proteins in the FASTA
+are not in the sample. With `"linear_proteins": true` (sage-gui: Crosslinking >
+Proteins for crosslinks), the linear search runs on every spectrum file
+first and its results are written as usual; then every protein with a target
+peptide at 1% FDR (`linear_protein_fdr`, PSM and peptide q-value) makes the
+crosslink search's database, and the crosslink search runs on every file in
+it. A peptide shared by several proteins brings them all.
+
+* `LinearProteins.fasta` holds those proteins, their FASTA records copied as
+  they were (headers included), each once: a protein repeated in the FASTA, or
+  in both crosslink databases, is written and searched once.
+* Decoys are made from the narrowed proteins as usual; with decoys from the
+  FASTA, each kept protein keeps its decoy.
+* The log gives how many proteins were kept, of how many, and the size of the
+  new database; the crosslink FDR is over that database.
+* Each spectrum file is read twice (once per search): the crosslink database
+  is known only once every file has been searched linearly.
+* A crosslink of a protein that shows no linear peptide at the cutoff is not
+  found. If the linear search finds no peptide at all, the whole database is
+  searched and the log says so.
+* It works with two crosslink databases (each kept protein keeps its database).
 
 ## Saved crosslinkers and modifications (sage-gui)
 
@@ -483,6 +514,25 @@ peptides, but raise `chain_survivors` if you suspect misses.
    matched ions on each. `alpha` is the better-supported chain.
 5. **FDR** - see [FDR of crosslink searches](#fdr-of-crosslink-searches).
 
+## The crosslink results in the log
+
+After the crosslink search, sage.exe makes the crosslink results in numbered
+parts, each announced and then timed:
+
+```
+crosslink results 3 of 10: crosslinks.sage.tsv and crosslinks_FDRfiltered.sage.tsv (110,854 matches)
+wrote crosslinks_FDRfiltered.sage.tsv (2161 target crosslink-spectrum matches of 577 unique crosslinks, both at 1% FDR)
+- crosslinks.sage.tsv and crosslinks_FDRfiltered.sage.tsv: 488 ms, 226,919 matches/s
+```
+
+The parts are the crosslink FDR, the crosslink spectral library, the spectrum
+positions the viewers need (MGF, mzML without scan numbers), the two TSV files,
+the crosslinked proteins' FASTA files, the CSM report, the xiVIEW, ProXL and
+mzIdentML files, the Annotator file, LFQ, SILAC, and the quality control with
+results.json, as the search has them. A part that runs longer than 15 s writes
+`progress:` lines with the matches done, the rate and the time left. sage-gui's
+Progress tab shows the part under way and moves its bar with them.
+
 ## FDR of crosslink searches
 
 `spectrum_q` is per CSM; `crosslink_q` is per unique crosslink (peptide pair +
@@ -585,6 +635,19 @@ target-target, -1 otherwise; `class` is `TT`/`TD`/`DD` (loop-links: `TT`/`DD`).
 `linked_a` / `linked_b` count those that carry the linker (non-cleavable linkers
 only, see `min_linked_peaks`). With two crosslink databases, `database_a` /
 `database_b` say which one each peptide is from (`1`, `2` or `1+2`).
+
+`abs_pos_a` / `abs_pos_b` give the link residues' positions in their proteins
+(1-based, the protein sequence's own numbering): `abs_pos_a` is `link_a` in each
+protein of `proteins_a`, `abs_pos_b` is `link_b` in each protein of `proteins_b`
+(for a loop-link, both are in `proteins_a`). A peptide in several proteins has
+one position per protein, separated by `;` in the order of its proteins. A
+multivalent search adds `abs_pos_c`, `abs_pos_d`, ... (as many as the largest
+species can have peptides); for a multivalent species, `abs_pos_a`, `abs_pos_b`,
+`abs_pos_c`, ... are its peptides `[1]`, `[2]`, `[3]`, ... of the `species`
+column, each with all its link residues separated by `,`. A decoy peptide is
+placed where its target peptide is; `?` where a peptide is not found in its
+protein's sequence. `crosslinks_CSMs.csv` gives the same as `Protein link sites A`,
+`B`, ... (with the residue, e.g. `K1246`).
 
 ## Crosslinked proteins as FASTA files
 

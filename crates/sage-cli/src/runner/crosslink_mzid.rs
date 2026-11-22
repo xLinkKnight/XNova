@@ -17,10 +17,11 @@
 //!   q ≤ 0.01, so viewers can show the FDR.
 
 use super::crosslink_export::{
-    decimal, decimal32, mz, protein_starts, target_sequence, xml_escape, ExportContext,
+    decimal, decimal32, mz, target_sequence, xml_escape, ExportContext,
     SpectrumKind, Q_CUTOFF,
 };
 use sage_core::crosslink::{CrosslinkMatch, LinkKind, Reagent, SITE1, SITE2};
+use sage_core::database::PeptideIx;
 use sage_core::ion_series::Kind;
 use sage_core::mass::Tolerance;
 use sage_core::modification::{ModId, Modification, ModificationSpecificity};
@@ -287,6 +288,8 @@ struct Peptides {
     /// protein name → (DBSequence id, sequence if a target)
     proteins: Vec<(String, Option<String>)>,
     protein_ids: HashMap<String, usize>,
+    /// `<PeptideEvidence>` elements written so far (their ids are numbered)
+    evidence_count: usize,
 }
 
 /// One end of the link on a peptide: (0-based residue, donor?, pair id)
@@ -301,11 +304,13 @@ impl Peptides {
             evidence_xml: String::new(),
             proteins: Vec::new(),
             protein_ids: HashMap::new(),
+            evidence_count: 0,
         }
     }
 
     /// The `<Peptide>` for `p` carrying the given link ends (and its evidence)
-    fn get(&mut self, ctx: &ExportContext, p: &Peptide, ends: &[LinkEnd]) -> String {
+    fn get(&mut self, ctx: &ExportContext, ix: PeptideIx, ends: &[LinkEnd]) -> String {
+        let p = &ctx.db[ix];
         let key = format!("{}|{:?}", p.display(&ctx.db.modifications), ends);
         if let Some(id) = self.ids.get(&key) {
             return id.clone();
@@ -376,7 +381,7 @@ impl Peptides {
         // where the peptide is found
         let target = target_sequence(p);
         let mut refs = Vec::new();
-        for (name, start) in protein_starts(ctx, p) {
+        for (name, start) in ctx.starts_of(ix).iter().cloned() {
             let dbs = match self.protein_ids.get(&name) {
                 Some(&i) => i,
                 None => {
@@ -386,7 +391,8 @@ impl Peptides {
                     self.proteins.len()
                 }
             };
-            let pe = format!("PE_{}", self.evidence.values().map(Vec::len).sum::<usize>() + refs.len() + 1);
+            self.evidence_count += 1;
+            let pe = format!("PE_{}", self.evidence_count);
             let _ = write!(self.evidence_xml, r#"<PeptideEvidence id="{pe}" peptide_ref="{id}" dBSequence_ref="DBS_{dbs}""#);
             if let Some(s) = start {
                 let _ = write!(self.evidence_xml, r#" start="{s}" end="{}""#, s + len - 1);
@@ -416,12 +422,13 @@ pub fn mzid_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Strin
     let mut peptides = Peptides::new();
     // crosslinked species → pair id
     let mut pairs: HashMap<String, usize> = HashMap::new();
-    // spectrum → identification items, in the order spectra appear
-    let mut results: Vec<((usize, String), String)> = Vec::new();
+    // spectrum → identification items (and its retention time), in the order spectra appear
+    let mut results: Vec<((usize, String), String, f32)> = Vec::new();
     let mut result_of: HashMap<(usize, String), usize> = HashMap::new();
     let mut local: HashMap<usize, usize> = HashMap::new();
 
     for m in matches {
+        ctx.progress.add(1);
         let alpha = &ctx.db[m.alpha];
         let mut species = |a: String, b: String| {
             let n = pairs.len() + 1;
@@ -429,7 +436,7 @@ pub fn mzid_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Strin
         };
         let key = (m.file_id, m.spec_id.clone());
         let r = *result_of.entry(key.clone()).or_insert_with(|| {
-            results.push((key.clone(), String::new()));
+            results.push((key.clone(), String::new(), m.rt));
             results.len() - 1
         });
         let k = {
@@ -471,17 +478,18 @@ pub fn mzid_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Strin
                     Some(first) => first,
                     None => (alpha.sequence.len(), beta.sequence.as_ref()) > (beta.sequence.len(), alpha.sequence.as_ref()),
                 };
-                let (d, ds, a, as_) = if alpha_donor {
-                    (alpha, m.alpha_site, beta, m.beta_site)
+                let (d_ix, ds, a_ix, as_) = if alpha_donor {
+                    (m.alpha, m.alpha_site, beta_ix, m.beta_site)
                 } else {
-                    (beta, m.beta_site, alpha, m.alpha_site)
+                    (beta_ix, m.beta_site, m.alpha, m.alpha_site)
                 };
+                let (d, a) = (&ctx.db[d_ix], &ctx.db[a_ix]);
                 let pair = species(
                     format!("{}({})", d.display(&ctx.db.modifications), ds),
                     format!("{}({})", a.display(&ctx.db.modifications), as_),
                 );
-                let donor = peptides.get(ctx, d, &[(ds, true, pair)]);
-                let acceptor = peptides.get(ctx, a, &[(as_, false, pair)]);
+                let donor = peptides.get(ctx, d_ix, &[(ds, true, pair)]);
+                let acceptor = peptides.get(ctx, a_ix, &[(as_, false, pair)]);
                 let marker = ms("MS:1002511", "crosslink spectrum identification item", Some(&k.to_string()));
                 item(format!("{sii}_d"), &donor, &peptides, &marker)
                     + &item(format!("{sii}_a"), &acceptor, &peptides, &marker)
@@ -492,7 +500,7 @@ pub fn mzid_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Strin
                     std::mem::swap(&mut first, &mut second);
                 }
                 let pair = species(format!("{}({first},{second})", alpha.display(&ctx.db.modifications)), String::new());
-                let pep = peptides.get(ctx, alpha, &[(first, true, pair), (second, false, pair)]);
+                let pep = peptides.get(ctx, m.alpha, &[(first, true, pair), (second, false, pair)]);
                 item(sii, &pep, &peptides, &ms("MS:1003329", "looplink spectrum identification item", None))
             }
         };
@@ -615,20 +623,16 @@ pub fn mzid_xml(ctx: &ExportContext, matches: &[CrosslinkMatch]) -> Option<Strin
         );
     }
     x.push_str("</Inputs>\n<AnalysisData><SpectrumIdentificationList id=\"SIL_1\">\n");
-    for (r, ((file_id, spec_id), items)) in results.iter().enumerate() {
+    for (r, ((file_id, spec_id), items, rt)) in results.iter().enumerate() {
         let file = ctx.files.get(*file_id);
         let spectrum_id = file.map_or_else(|| spec_id.clone(), |f| f.xiview_scan_id(spec_id));
-        let rt = matches
-            .iter()
-            .find(|m| m.file_id == *file_id && &m.spec_id == spec_id)
-            .map_or(0.0, |m| m.rt);
         let _ = writeln!(
             x,
             r#"<SpectrumIdentificationResult id="SIR_{}" spectrumID="{}" spectraData_ref="SD_{}">{items}<cvParam cvRef="PSI-MS" accession="MS:1000016" name="scan start time" value="{}" unitCvRef="UO" unitAccession="UO:0000031" unitName="minute"/></SpectrumIdentificationResult>"#,
             r + 1,
             xml_escape(&spectrum_id),
             file_id + 1,
-            decimal32(rt)
+            decimal32(*rt)
         );
     }
     x.push_str("</SpectrumIdentificationList></AnalysisData></DataCollection>\n</MzIdentML>\n");
@@ -681,6 +685,8 @@ mod test {
             variable_mods: variables,
             precursor_tol: Tolerance::Ppm(-5.0, 5.0),
             version: "test",
+            progress: Default::default(),
+            starts: Default::default(),
         }
     }
 

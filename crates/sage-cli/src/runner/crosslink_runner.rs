@@ -27,6 +27,9 @@ use std::time::Instant;
 const FDR_CUTOFF: f32 = 0.01;
 /// Target-target CSMs that pass [`FDR_CUTOFF`], same columns as `crosslinks.sage.tsv`
 const FDR_FILTERED: &str = "crosslinks_FDRfiltered.sage.tsv";
+/// The proteins the linear search found, which the crosslink search was
+/// narrowed to (`linear_proteins`), with their FASTA headers
+pub const LINEAR_PROTEINS: &str = "LinearProteins.fasta";
 
 type Reporters = HashMap<(usize, String), (f32, Vec<f32>)>;
 
@@ -119,6 +122,118 @@ fn species_text(db: &sage_core::database::IndexedDatabase, s: &sage_core::crossl
     };
     let links: Vec<String> = s.links.iter().map(|&(a, sa, b, sb)| format!("{}-{}", residue(a, sa), residue(b, sb))).collect();
     format!("{} | {}", peptides.join(" "), links.join("; "))
+}
+
+/// The `abs_pos_` columns' letters: `a` and `b`, and for a multivalent search
+/// one per peptide a species may have (the valency + 1)
+fn abs_pos_letters(settings: &CrosslinkSettings) -> Vec<char> {
+    let peptides = settings.multivalent.map_or(2, |v| (v as usize + 1).max(2));
+    (0..peptides).map(|i| (b'a' + i as u8) as char).collect()
+}
+
+/// The `abs_pos_` cells of a match: where its link residues are in their
+/// proteins (1-based, the proteins' own numbering). A pair: `abs_pos_a` for
+/// `link_a` in `proteins_a`, `abs_pos_b` for `link_b` in `proteins_b`. A
+/// loop-link: both in `proteins_a`. A multivalent species: `abs_pos_a`,
+/// `abs_pos_b`, `abs_pos_c`, ... for the peptides `[1]`, `[2]`, `[3]`, ... of
+/// its `species` column, each with all its link residues. Several proteins
+/// are separated by `;`, several residues of one peptide by `,`.
+fn absolute_positions(ctx: &super::crosslink_export::ExportContext, m: &CrosslinkMatch, columns: usize) -> Vec<String> {
+    let mut cells: Vec<String> = match (m.kind, m.beta) {
+        (LinkKind::Multi, _) => super::crosslink_report::members(m)
+            .iter()
+            .map(|(ix, sites)| ctx.absolute_positions(*ix, sites))
+            .collect(),
+        (LinkKind::Loop, _) | (_, None) => vec![
+            ctx.absolute_positions(m.alpha, &[m.alpha_site]),
+            ctx.absolute_positions(m.alpha, &[m.beta_site]),
+        ],
+        (_, Some(beta)) => vec![
+            ctx.absolute_positions(m.alpha, &[m.alpha_site]),
+            ctx.absolute_positions(beta, &[m.beta_site]),
+        ],
+    };
+    cells.resize(columns, String::new());
+    cells
+}
+
+/// Narrow `fasta` to the proteins in `keep` and, with decoys from the FASTA
+/// (not generated), their decoys; each protein once (a protein repeated in
+/// the FASTA, or in both crosslink databases, whose database groups still say
+/// so). Returns `(kept, total)`: the distinct target proteins kept, and in
+/// all. A decoy is an accession containing `decoy_tag`, as Sage reads them.
+pub(super) fn keep_proteins(
+    fasta: &mut sage_core::fasta::Fasta,
+    keep: &std::collections::HashSet<std::sync::Arc<str>>,
+    decoy_tag: &str,
+    generate_decoys: bool,
+) -> (usize, usize) {
+    let is_decoy = |acc: &str| !generate_decoys && !decoy_tag.is_empty() && acc.contains(decoy_tag);
+    let total = fasta.targets.iter().filter(|(acc, _)| !is_decoy(acc)).map(|(acc, _)| acc.clone()).collect::<std::collections::HashSet<_>>().len();
+    let mut seen = std::collections::HashSet::new();
+    fasta.targets.retain(|(acc, _)| {
+        let wanted = if is_decoy(acc) { keep.contains(acc.replacen(decoy_tag, "", 1).as_str()) } else { keep.contains(acc.as_ref()) };
+        wanted && seen.insert(acc.clone())
+    });
+    let kept = fasta.targets.iter().filter(|(acc, _)| !is_decoy(acc)).count();
+    (kept, total)
+}
+
+/// The crosslink results in numbered parts. Each is announced in the log
+/// (`crosslink results 7 of 9: crosslinks.mzid for xiVIEW and PRIDE (108,693
+/// matches)`) and ends with its time and rate (`- crosslinks.mzid for xiVIEW
+/// and PRIDE: 1.2 s, 90,578 matches/s`); one that runs long has `progress:`
+/// lines with its share done and the time left. The Progress tab follows them.
+struct Parts {
+    n: usize,
+    i: usize,
+}
+
+struct Part {
+    name: String,
+    items: usize,
+    unit: &'static str,
+    start: Instant,
+    tracker: crate::progress::Tracker,
+}
+
+impl Parts {
+    /// Begin the next part, of `items` `unit`s; `counted`: its code counts
+    /// them as it goes (otherwise its progress lines give the time only)
+    fn start(&mut self, name: &str, items: usize, unit: &'static str, counted: bool) -> Part {
+        self.i += 1;
+        let label = format!("crosslink results {} of {}: {name}", self.i, self.n.max(self.i));
+        let size = if items > 0 { format!(" ({} {unit})", crate::progress::thousands(items)) } else { String::new() };
+        info!("{label}{size}");
+        let tracker = crate::progress::step(label, if counted { items } else { 0 }, unit);
+        Part { name: name.to_string(), items, unit, start: Instant::now(), tracker }
+    }
+}
+
+impl Part {
+    fn counter(&self) -> crate::progress::Counter {
+        self.tracker.counter()
+    }
+
+    fn add(&self, n: usize) {
+        self.tracker.add(n);
+    }
+
+    fn detail(&self, text: impl Into<String>) {
+        self.tracker.detail(text);
+    }
+
+    /// The part is over: its time, and its rate when it had items
+    fn done(self) {
+        let took = self.start.elapsed();
+        let secs = took.as_secs_f64();
+        let rate = if self.items > 0 && secs >= 0.001 {
+            format!(", {} {}/s", crate::progress::thousands((self.items as f64 / secs).round() as usize), self.unit)
+        } else {
+            String::new()
+        };
+        info!("- {}: {}{rate}", self.name, crate::progress::duration(took));
+    }
 }
 
 /// What a crosslink search keeps from each chunk of spectrum files
@@ -270,6 +385,9 @@ impl Runner {
         parallel: usize,
         parquet: bool,
     ) -> anyhow::Result<telemetry::Telemetry> {
+        if self.parameters.crosslink.as_ref().is_some_and(|c| c.linear_proteins) {
+            return self.run_linear_then_crosslink(parallel, parquet);
+        }
         info!("linear peptide search (results.sage.tsv) and crosslink search, reading each spectrum file once");
         if parquet {
             log::warn!("parquet output is not available for crosslink searches, writing tsv");
@@ -304,50 +422,123 @@ impl Runner {
         self.finish_crosslink(settings, found)
     }
 
+    /// A crosslink search narrowed to the proteins of the linear search
+    /// (`linear_proteins`): the linear search of every file and its results
+    /// first, then a database of the proteins it found (LinearProteins.fasta),
+    /// then the crosslink search of every file in it. Each file is read
+    /// twice: the crosslink database is only known once every file has been
+    /// searched linearly.
+    fn run_linear_then_crosslink(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        info!("linear peptide search (results.sage.tsv) of every file first; the proteins it finds make the crosslink search's database");
+        if parquet {
+            log::warn!("parquet output is not available for crosslink searches, writing tsv");
+        }
+        let batch_size = parallel.max(1);
+        info!("=== searching the spectrum files: linear search ===");
+        let outputs = {
+            let linear = self.linear_scorer();
+            let mut results = Vec::new();
+            for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
+                let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+                let features = self.search_processed_spectra(&linear, &msn);
+                results.push(self.complete_features(msn, ms1, features));
+            }
+            results.into_iter().collect::<SageResults>()
+        };
+        let ms1 = self.finish_linear(outputs, parquet)?;
+        self.narrow_to_linear_proteins()?;
+
+        // the settings' isotope labels are the new database's
+        let settings = self.crosslink_settings();
+        info!("=== searching the spectrum files: crosslink search ===");
+        let mut found = {
+            let scorer = self.crosslink_base_scorer();
+            let kernel = sage_core::crosslink::make_kernel(&settings, &self.database).map_err(anyhow::Error::msg)?;
+            let xl = CrosslinkScorer::new(&scorer, &settings).with_kernel(kernel.as_deref());
+            if let Some(kernel) = &kernel {
+                info!("crosslink chain scoring backend: {}", kernel.name());
+            }
+            let mut found = CrosslinkChunks::default();
+            for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
+                let (_, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+                self.search_crosslink_chunk(&xl, &settings, &msn, &mut found);
+            }
+            found
+        };
+        // the linear search's MS1 spectra are the crosslink search's
+        if self.crosslink_needs_ms1() {
+            found.ms1_spectra = ms1;
+        }
+        self.finish_crosslink(settings, found)
+    }
+
+    /// Rebuild the database from the proteins the linear search found, and
+    /// write them to LinearProteins.fasta with their FASTA headers. With no
+    /// protein found, the whole database stays.
+    fn narrow_to_linear_proteins(&mut self) -> anyhow::Result<()> {
+        let keep = self.linear_proteins.take().unwrap_or_default();
+        let fdr = self.parameters.crosslink.as_ref().map_or(0.01, |c| c.linear_protein_fdr);
+        let percent = crate::summary::percent_text(fdr);
+        info!("=== crosslink database: the proteins of the linear search ===");
+        let mut fasta = super::read_protein_databases(&mut self.parameters.database)?;
+        if keep.is_empty() {
+            let total = keep_proteins(&mut fasta.clone(), &keep, &self.parameters.database.decoy_tag, self.parameters.database.generate_decoys).1;
+            log::warn!(
+                "the linear search found no peptide at {percent} FDR: the crosslink search uses the whole database ({} proteins)",
+                crate::progress::thousands(total)
+            );
+            return Ok(());
+        }
+        let (kept, total) =
+            keep_proteins(&mut fasta, &keep, &self.parameters.database.decoy_tag, self.parameters.database.generate_decoys);
+
+        // LinearProteins.fasta: their FASTA records as they were
+        let wanted: std::collections::BTreeSet<&str> = keep.iter().map(|a| a.as_ref()).collect();
+        let mut written = std::collections::HashSet::new();
+        let mut text = String::new();
+        for path in self.parameters.database.fasta_files() {
+            let source = sage_cloudpath::util::read_text(&sage_cloudpath::to_url(path)?)?;
+            text += &super::xlink_proteins::select_records(&source, &wanted, &mut written);
+        }
+        let path = self.make_path(LINEAR_PROTEINS);
+        sage_cloudpath::write_bytes_sync(&path, text.into_bytes())?;
+        self.parameters.output_paths.push(path);
+        info!(
+            "crosslink database: {} of the {} proteins have a peptide at {percent} FDR in the linear search; written to {LINEAR_PROTEINS}",
+            crate::progress::thousands(kept),
+            crate::progress::thousands(total)
+        );
+
+        let start = Instant::now();
+        let _step = crate::progress::step("building the crosslink database of the linear search's proteins", 0, "");
+        self.database = self.parameters.database.clone().build(fasta);
+        info!(
+            "crosslink database: {} peptides, {} fragments, built in {}",
+            crate::progress::thousands(self.database.peptides.len()),
+            crate::progress::thousands(self.database.fragments.len()),
+            crate::progress::duration(start.elapsed())
+        );
+        Ok(())
+    }
+
     /// The crosslink search's results, once every file is searched: FDR,
-    /// quantification and the crosslink outputs
+    /// quantification and the crosslink outputs, in numbered [`Parts`]
     fn finish_crosslink(
         mut self,
         settings: CrosslinkSettings,
         found: CrosslinkChunks,
     ) -> anyhow::Result<telemetry::Telemetry> {
+        use super::crosslink_export::{proxl_xml, xiview_csv, ExportContext, SpectrumFile};
+        use super::crosslink_report::{csm_report, members, FILE as REPORT, MEDIUM};
         info!("=== crosslink results ===");
-        let _step = crate::progress::step("crosslink FDR and reports", 0, "");
         let CrosslinkChunks { mut matches, ms1_spectra, reporters, searched } = found;
         // telemetry counts the spectra searched for crosslinks
         self.spectra_searched.store(searched, Ordering::Relaxed);
         let silac = self.database.silac.is_some();
         let lfq = self.parameters.quant.lfq;
         let tmt = self.parameters.quant.tmt.clone();
-
-        let (csms, links) = if settings.precursor_window {
-            // each run's precursor mass error, learned from a first pass
-            let (counts, windows) = assign_q_values_in_window(&mut matches);
-            if windows.is_empty() {
-                info!("precursor mass window: too few confident matches to learn it from; none applied");
-            }
-            let mut files: Vec<_> = windows.into_iter().collect();
-            files.sort_by_key(|(file, _)| *file);
-            for (file, (lo, hi)) in files {
-                let outside = matches.iter().filter(|m| m.file_id == file && (m.precursor_ppm < lo || m.precursor_ppm > hi)).count();
-                let name = self.parameters.mzml_paths.get(file).and_then(sage_cloudpath::filename).unwrap_or_default();
-                info!("precursor mass window of {name}: {lo:+.1} to {hi:+.1} ppm ({outside} matches outside, left out)");
-            }
-            counts
-        } else {
-            assign_q_values(&mut matches)
-        };
-        matches.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
-        log_fdr_groups(&matches);
-
-        info!(
-            "discovered {} target crosslink-spectrum matches at 1% FDR",
-            csms
-        );
-        info!("discovered {} unique target crosslinks at 1% FDR", links);
-        if let Some(library) = self.parameters.spectral_library.clone() {
-            self.write_crosslink_library(&matches, &settings, &library)?;
-        }
+        let library = self.parameters.spectral_library.clone();
+        let annotator = self.parameters.write_annotator;
 
         let filenames = self
             .parameters
@@ -359,31 +550,219 @@ impl Runner {
                     .to_string()
             })
             .collect::<Vec<_>>();
+        // How the viewers find each match's spectrum; spectrum positions are
+        // read again only where ids alone are not enough (MGF, mzML without scan=)
+        let mut files: Vec<SpectrumFile> = filenames.iter().map(|name| SpectrumFile::from_name(name)).collect();
+        let reread: Vec<usize> = files
+            .iter()
+            .enumerate()
+            .filter(|(file_id, file)| {
+                let ids = matches.iter().filter(|m| m.file_id == *file_id && m.kind != LinkKind::Multi).map(|m| m.spec_id.as_str());
+                file.needs_positions(ids)
+            })
+            .map(|(file_id, _)| file_id)
+            .collect();
 
-        let reporters_out = tmt.as_ref().map(|_| &reporters);
-        let path = self.write_crosslinks("crosslinks.sage.tsv", &matches, &filenames, reporters_out)?;
-        self.parameters.output_paths.push(path);
-        // Only the accepted results: target-target CSMs at 1% FDR whose
-        // crosslinks are at 1% FDR too, so that unique crosslinks counted
-        // from the file are at 1% (`CrosslinkMatch::accepted`)
-        let accepted = matches.iter().filter(|m| m.accepted(FDR_CUTOFF)).cloned().collect::<Vec<_>>();
-        let path = self.write_crosslinks(FDR_FILTERED, &accepted, &filenames, reporters_out)?;
-        let unique = accepted.iter().map(sage_core::crosslink::link_key).collect::<std::collections::HashSet<_>>().len();
-        info!(
-            "wrote {} ({} target crosslink-spectrum matches of {} unique crosslinks, both at 1% FDR)",
-            FDR_FILTERED,
-            accepted.len(),
-            unique
-        );
-        self.parameters.output_paths.push(path);
-        // the crosslinked proteins at 1%, 5% and 10% FDR, as FASTA files
-        let fastas = self.write_xlink_proteins(&matches)?;
-        self.parameters.output_paths.extend(fastas);
-        // the CSM report, then the files for xiVIEW, ProXL and mzIdentML
-        self.write_viewer_exports(&matches, &settings, &filenames)?;
-        if self.parameters.write_annotator {
+        let mut parts = Parts {
+            n: 8 + library.is_some() as usize
+                + !reread.is_empty() as usize
+                + annotator as usize
+                + lfq as usize
+                + silac as usize,
+            i: 0,
+        };
+
+        let part = parts.start("crosslink FDR", matches.len(), "matches", false);
+        let (csms, links) = if settings.precursor_window {
+            // each run's precursor mass error, learned from a first pass
+            let (counts, windows) = assign_q_values_in_window(&mut matches);
+            if windows.is_empty() {
+                info!("precursor mass window: too few confident matches to learn it from; none applied");
+            }
+            let mut windows: Vec<_> = windows.into_iter().collect();
+            windows.sort_by_key(|(file, _)| *file);
+            for (file, (lo, hi)) in windows {
+                let outside = matches.iter().filter(|m| m.file_id == file && (m.precursor_ppm < lo || m.precursor_ppm > hi)).count();
+                let name = filenames.get(file).map(String::as_str).unwrap_or_default();
+                info!("precursor mass window of {name}: {lo:+.1} to {hi:+.1} ppm ({outside} matches outside, left out)");
+            }
+            counts
+        } else {
+            assign_q_values(&mut matches)
+        };
+        matches.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
+        log_fdr_groups(&matches);
+        info!("discovered {} target crosslink-spectrum matches at 1% FDR", csms);
+        info!("discovered {} unique target crosslinks at 1% FDR", links);
+        part.done();
+
+        if let Some(library) = &library {
+            let part = parts.start("crosslink spectral library, xlibrary.tsv", matches.len(), "matches", false);
+            self.write_crosslink_library(&matches, &settings, library)?;
+            part.done();
+        }
+
+        if !reread.is_empty() {
+            let part = parts.start("spectrum positions for the viewers", reread.len(), "files", true);
+            for &file_id in &reread {
+                let name = &filenames[file_id];
+                part.detail(format!("now {name}"));
+                match self
+                    .parameters
+                    .mzml_paths
+                    .get(file_id)
+                    .ok_or_else(|| anyhow::anyhow!("no path"))
+                    .and_then(|url| Ok(sage_cloudpath::util::read_spectrum_positions(url)?))
+                {
+                    Ok(positions) => files[file_id].positions = Some(positions),
+                    Err(e) => log::warn!(
+                        "could not read spectrum positions of {name} ({e}): xiVIEW/ProXL may not find its spectra"
+                    ),
+                }
+                part.add(1);
+            }
+            part.done();
+        }
+
+        // Protein sequences locate each peptide in its proteins
+        let fasta = super::read_protein_databases(&mut self.parameters.database.clone())?;
+        let wanted: std::collections::HashSet<&str> = matches
+            .iter()
+            .flat_map(|m| members(m).into_iter().map(|(ix, _)| ix))
+            .flat_map(|ix| self.database[ix].proteins.iter().map(|p| p.as_ref()))
+            .collect();
+        let proteins: HashMap<String, String> = fasta
+            .targets
+            .iter()
+            .filter(|(acc, _)| wanted.contains(acc.as_ref()))
+            .map(|(acc, seq)| (acc.to_string(), seq.clone()))
+            .collect();
+        drop(fasta);
+        // the FASTA file, or both crosslink databases
+        let fasta_name = self
+            .parameters
+            .database
+            .fasta_files()
+            .into_iter()
+            .map(|path| {
+                sage_cloudpath::to_url(path)
+                    .ok()
+                    .and_then(|url| sage_cloudpath::filename(&url).map(String::from))
+                    .unwrap_or_else(|| path.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let static_mods = self.parameters.database.modifications.static_mods.clone();
+        let variable_mods = self.parameters.database.modifications.variable_mods.clone();
+        let version = self.parameters.version.clone();
+        let mut written = Vec::new();
+        {
+            let mut ctx = ExportContext {
+                db: &self.database,
+                settings: &settings,
+                files: &files,
+                proteins: &proteins,
+                fasta_name: &fasta_name,
+                fragment_tol: self.parameters.fragment_tol,
+                ion_kinds: &self.database.ion_kinds,
+                static_mods: &static_mods,
+                variable_mods: &variable_mods,
+                precursor_tol: self.parameters.precursor_tol,
+                version: &version,
+                progress: Default::default(),
+                starts: Default::default(),
+            };
+
+            // Only the accepted results: target-target CSMs at 1% FDR whose
+            // crosslinks are at 1% FDR too, so that unique crosslinks counted
+            // from the file are at 1% (`CrosslinkMatch::accepted`)
+            let accepted = matches.iter().filter(|m| m.accepted(FDR_CUTOFF)).cloned().collect::<Vec<_>>();
+            let part = parts.start(
+                &format!("crosslinks.sage.tsv and {FDR_FILTERED}"),
+                matches.len() + accepted.len(),
+                "matches",
+                true,
+            );
+            ctx.progress = part.counter();
+            let reporters_out = tmt.as_ref().map(|_| &reporters);
+            written.push(self.write_crosslinks("crosslinks.sage.tsv", &matches, &filenames, reporters_out, &ctx)?);
+            written.push(self.write_crosslinks(FDR_FILTERED, &accepted, &filenames, reporters_out, &ctx)?);
+            let unique = accepted.iter().map(sage_core::crosslink::link_key).collect::<std::collections::HashSet<_>>().len();
+            info!(
+                "wrote {} ({} target crosslink-spectrum matches of {} unique crosslinks, both at 1% FDR)",
+                FDR_FILTERED,
+                accepted.len(),
+                unique
+            );
+            part.done();
+
+            // the crosslinked proteins at 1%, 5% and 10% FDR, as FASTA files
+            let part = parts.start("crosslinked proteins as FASTA files", 0, "", false);
+            written.extend(self.write_xlink_proteins(&matches)?);
+            part.done();
+
+            // the CSM report: every kind of match, multivalent species too
+            let rows = matches.iter().filter(|m| m.class == PairClass::TT && m.spectrum_q <= MEDIUM).count();
+            let part = parts.start(REPORT, rows, "matches", true);
+            ctx.progress = part.counter();
+            let (report, high, medium) = csm_report(&ctx, &matches, &filenames)?;
+            let path = self.make_path(REPORT);
+            sage_cloudpath::write_bytes_sync(&path, report)?;
+            info!("wrote {REPORT}: {high} target crosslink-spectrum matches at 1% FDR (High), {medium} more at 5% (Medium)");
+            written.push(path);
+            part.done();
+
+            // xiVIEW, ProXL and mzIdentML describe pairs and loop-links only
+            let pairs: Vec<CrosslinkMatch> = matches.iter().filter(|m| m.kind != LinkKind::Multi).cloned().collect();
+            let multi = matches.len() - pairs.len();
+            if multi > 0 {
+                info!("{multi} multivalent matches are in crosslinks.sage.tsv and {REPORT} only (not in the xiVIEW, ProXL and mzIdentML files)");
+            }
+
+            let part = parts.start("crosslinks_xiView.csv for xiVIEW", pairs.len(), "matches", true);
+            ctx.progress = part.counter();
+            let (csv, loops) = xiview_csv(&ctx, &pairs)?;
+            let path = self.make_path("crosslinks_xiView.csv");
+            sage_cloudpath::write_bytes_sync(&path, csv)?;
+            if loops > 0 {
+                info!("{} loop-link matches are not in crosslinks_xiView.csv: xiVIEW's CSV format cannot describe them", loops);
+            }
+            written.push(path);
+            part.done();
+
+            let proxl = pairs.iter().filter(|m| m.rank == 1 && m.class == PairClass::TT).count();
+            let part = parts.start("crosslinks_proXL.xml for ProXL", proxl, "matches", true);
+            ctx.progress = part.counter();
+            match proxl_xml(&ctx, &pairs) {
+                Some(xml) => {
+                    let path = self.make_path("crosslinks_proXL.xml");
+                    sage_cloudpath::write_bytes_sync(&path, xml.into_bytes())?;
+                    written.push(path);
+                }
+                None => log::warn!("no target crosslink matches: crosslinks_proXL.xml was not written (ProXL needs at least one)"),
+            }
+            part.done();
+
+            // mzIdentML 1.3.0 for xiVIEW (also a local installation) and PRIDE
+            let part = parts.start("crosslinks.mzid for xiVIEW and PRIDE", pairs.len(), "matches", true);
+            ctx.progress = part.counter();
+            match super::crosslink_mzid::mzid_xml(&ctx, &pairs) {
+                Some(xml) => {
+                    let path = self.make_path("crosslinks.mzid");
+                    sage_cloudpath::write_bytes_sync(&path, xml.into_bytes())?;
+                    written.push(path);
+                }
+                None => log::warn!("no crosslink matches: crosslinks.mzid was not written (mzIdentML needs at least one)"),
+            }
+            part.done();
+        }
+        self.parameters.output_paths.extend(written);
+
+        if annotator {
+            let part = parts.start("crosslinks.annotator.csv for Annotator", 0, "", false);
             let path = self.write_annotator_crosslinks(&matches, &settings)?;
             self.parameters.output_paths.push(path);
+            part.done();
         }
         if tmt.is_some() {
             let quantified = matches
@@ -394,6 +773,7 @@ impl Runner {
         }
 
         if lfq {
+            let part = parts.start("crosslink LFQ, crosslinks.lfq.tsv", 0, "", false);
             let areas = quantify_lfq(
                 &matches,
                 &settings,
@@ -407,13 +787,17 @@ impl Runner {
             info!("discovered {} target crosslink MS1 peaks at 5% FDR", quantified);
             let path = self.write_crosslink_lfq(&matches, &areas, &filenames)?;
             self.parameters.output_paths.push(path);
+            part.done();
         }
         if silac {
+            let part = parts.start("SILAC ratios of the crosslinks", 0, "", false);
             if let Some(path) = self.write_silac_crosslinks(&matches, &settings, &ms1_spectra, &filenames)? {
                 self.parameters.output_paths.push(path);
             }
+            part.done();
         }
 
+        let part = parts.start("quality control and results.json", 0, "", false);
         // polymer check and diagnostic ions (the linear search, if any, did them already)
         if self.parameters.qc.is_none() {
             self.finish_qc(None, &filenames)?;
@@ -433,6 +817,7 @@ impl Runner {
         let bytes = serde_json::to_vec_pretty(&self.parameters)?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         self.parameters.output_paths.push(path);
+        part.done();
         // the settings, files and checks for people; results.json has them as JSON
         crate::summary::to_log(&self.parameters);
 
@@ -456,6 +841,7 @@ impl Runner {
         matches: &[CrosslinkMatch],
         filenames: &[String],
         reporters: Option<&Reporters>,
+        ctx: &super::crosslink_export::ExportContext,
     ) -> anyhow::Result<sage_cloudpath::Url> {
         let path = self.make_path(name);
         let db = &self.database;
@@ -509,6 +895,10 @@ impl Runner {
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
+        // the link residues' positions in their proteins: a and b, and for
+        // multivalent species one column per peptide (up to the valency + 1)
+        let letters = abs_pos_letters(ctx.settings);
+        headers.extend(letters.iter().map(|x| format!("abs_pos_{x}")));
         let silac = db.silac.is_some();
         if silac {
             headers.push("silac_channel".into());
@@ -531,6 +921,7 @@ impl Runner {
         wtr.write_record(&headers)?;
 
         for m in matches {
+            ctx.progress.add(1);
             let alpha = &db[m.alpha];
             let (peptide_b, proteins_b) = match m.beta {
                 Some(ix) => (
@@ -582,6 +973,7 @@ impl Runner {
                 m.species.as_deref().map(|s| species_text(db, s)).unwrap_or_default(),
                 m.species.as_deref().map(|s| s.topology_peaks.to_string()).unwrap_or_default(),
             ];
+            record.extend(absolute_positions(ctx, m, letters.len()));
             if silac {
                 let peptides: Vec<_> = match &m.species {
                     Some(s) => s.peptides.clone(),
@@ -620,133 +1012,6 @@ impl Runner {
         let bytes = wtr.into_inner()?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         Ok(path)
-    }
-
-    /// `crosslinks_xiView.csv` and `crosslinks_proXL.xml` for the xiVIEW and
-    /// ProXL viewers (see `crosslink_export`)
-    /// `crosslinks_CSMs.csv` (every match), and the files for xiVIEW, ProXL
-    /// and mzIdentML, which describe pairs and loop-links only
-    fn write_viewer_exports(
-        &mut self,
-        all: &[CrosslinkMatch],
-        settings: &sage_core::crosslink::CrosslinkSettings,
-        filenames: &[String],
-    ) -> anyhow::Result<()> {
-        use super::crosslink_export::{proxl_xml, xiview_csv, ExportContext, SpectrumFile};
-        use super::crosslink_report::{csm_report, members, FILE as REPORT};
-        let pairs: Vec<CrosslinkMatch> = all.iter().filter(|m| m.kind != LinkKind::Multi).cloned().collect();
-        let multi = all.len() - pairs.len();
-        if multi > 0 {
-            info!("{multi} multivalent matches are in crosslinks.sage.tsv and {REPORT} only (not in the xiVIEW, ProXL and mzIdentML files)");
-        }
-        let matches = pairs.as_slice();
-        // Protein sequences locate each peptide in its protein
-        let fasta = super::read_protein_databases(&mut self.parameters.database.clone())?;
-        let wanted: std::collections::HashSet<&str> = all
-            .iter()
-            .flat_map(|m| members(m).into_iter().map(|(ix, _)| ix))
-            .flat_map(|ix| self.database[ix].proteins.iter().map(|p| p.as_ref()))
-            .collect();
-        let proteins: HashMap<String, String> = fasta
-            .targets
-            .iter()
-            .filter(|(acc, _)| wanted.contains(acc.as_ref()))
-            .map(|(acc, seq)| (acc.to_string(), seq.clone()))
-            .collect();
-        // the FASTA file, or both crosslink databases
-        let fasta_name = self
-            .parameters
-            .database
-            .fasta_files()
-            .into_iter()
-            .map(|path| {
-                sage_cloudpath::to_url(path)
-                    .ok()
-                    .and_then(|url| sage_cloudpath::filename(&url).map(String::from))
-                    .unwrap_or_else(|| path.to_string())
-            })
-            .collect::<Vec<_>>()
-            .join(" + ");
-
-        // How the viewers find each match's spectrum; spectrum positions are
-        // read again only where ids alone are not enough (MGF, mzML without scan=)
-        let files: Vec<SpectrumFile> = filenames
-            .iter()
-            .enumerate()
-            .map(|(file_id, name)| {
-                let mut file = SpectrumFile::from_name(name);
-                let ids = matches.iter().filter(|m| m.file_id == file_id).map(|m| m.spec_id.as_str());
-                if file.needs_positions(ids) {
-                    match self
-                        .parameters
-                        .mzml_paths
-                        .get(file_id)
-                        .ok_or_else(|| anyhow::anyhow!("no path"))
-                        .and_then(|url| Ok(sage_cloudpath::util::read_spectrum_positions(url)?))
-                    {
-                        Ok(positions) => file.positions = Some(positions),
-                        Err(e) => log::warn!(
-                            "could not read spectrum positions of {name} ({e}): xiVIEW/ProXL may not find its spectra"
-                        ),
-                    }
-                }
-                file
-            })
-            .collect();
-        let ctx = ExportContext {
-            db: &self.database,
-            settings,
-            files: &files,
-            proteins: &proteins,
-            fasta_name: &fasta_name,
-            fragment_tol: self.parameters.fragment_tol,
-            ion_kinds: &self.database.ion_kinds,
-            static_mods: &self.parameters.database.modifications.static_mods,
-            variable_mods: &self.parameters.database.modifications.variable_mods,
-            precursor_tol: self.parameters.precursor_tol,
-            version: &self.parameters.version,
-        };
-
-        // the CSM report: every kind of match, multivalent species too
-        let (report, high, medium) = csm_report(&ctx, all, filenames)?;
-        let path = self.make_path(REPORT);
-        sage_cloudpath::write_bytes_sync(&path, report)?;
-        info!("wrote {REPORT}: {high} target crosslink-spectrum matches at 1% FDR (High), {medium} more at 5% (Medium)");
-        self.parameters.output_paths.push(path);
-
-        let (csv, loops) = xiview_csv(&ctx, matches)?;
-        let path = self.make_path("crosslinks_xiView.csv");
-        sage_cloudpath::write_bytes_sync(&path, csv)?;
-        if loops > 0 {
-            info!("{} loop-link matches are not in crosslinks_xiView.csv: xiVIEW's CSV format cannot describe them", loops);
-        }
-        let mut written = vec![path];
-
-        match proxl_xml(&ctx, matches) {
-            Some(xml) => {
-                let path = self.make_path("crosslinks_proXL.xml");
-                sage_cloudpath::write_bytes_sync(&path, xml.into_bytes())?;
-                written.push(path);
-            }
-            None => log::warn!("no target crosslink matches: crosslinks_proXL.xml was not written (ProXL needs at least one)"),
-        }
-
-        // mzIdentML 1.3.0 for xiVIEW (also a local installation) and PRIDE
-        match super::crosslink_mzid::mzid_xml(&ctx, matches) {
-            Some(xml) => {
-                let path = self.make_path("crosslinks.mzid");
-                sage_cloudpath::write_bytes_sync(&path, xml.into_bytes())?;
-                written.push(path);
-            }
-            None => log::warn!("no crosslink matches: crosslinks.mzid was not written (mzIdentML needs at least one)"),
-        }
-        let names = written
-            .iter()
-            .filter_map(|p| sage_cloudpath::filename(p).map(String::from))
-            .collect::<Vec<_>>();
-        info!("wrote {} for crosslink viewers", names.join(" and "));
-        self.parameters.output_paths.extend(written);
-        Ok(())
     }
 
     /// `crosslinks.lfq.tsv`: MS1 intensities of each quantified (target)
@@ -819,5 +1084,96 @@ impl Runner {
         let bytes = wtr.into_inner()?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         Ok(path)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::super::crosslink_export::test::{csm, find, fixture};
+    use super::super::crosslink_export::{ExportContext, SpectrumFile};
+    use super::*;
+    use sage_core::crosslink::Species;
+    use sage_core::fasta::Fasta;
+    use sage_core::ion_series::Kind;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    /// abs_pos_*: where the link residues are in their proteins
+    #[test]
+    fn absolute_positions_follow_the_link_columns() {
+        let (db, statics, variables, proteins) = fixture();
+        let settings = CrosslinkSettings { multivalent: Some(2), ..Default::default() };
+        let files = vec![SpectrumFile::from_name("run01.d")];
+        let ctx = ExportContext {
+            db: &db,
+            settings: &settings,
+            files: &files,
+            proteins: &proteins,
+            fasta_name: "test.fasta",
+            fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+            ion_kinds: &[Kind::B, Kind::Y],
+            static_mods: &statics,
+            variable_mods: &variables,
+            precursor_tol: Tolerance::Ppm(-10.0, 10.0),
+            version: "test",
+            progress: Default::default(),
+            starts: Default::default(),
+        };
+        // MAGLEK... is residue 1 on of ONE, CDKEFR 5 on of TWO, STKPLEK 16 on of TWO
+        let a = find(&db, "MAGLEKVSTAAM[+15.9949]QR", false);
+        let b = find(&db, "C[+57.021465]DKEFR", false);
+        let c = find(&db, "STKPLEK", false);
+        assert_eq!(abs_pos_letters(&settings), ['a', 'b', 'c']);
+        assert_eq!(abs_pos_letters(&CrosslinkSettings::default()), ['a', 'b']);
+
+        // a pair: link_a (K6 of the peptide) is K6 of ONE, link_b (K3) is K7 of TWO
+        let pair = csm(a, Some(b), (5, 2), PairClass::TT, 1, 0.01);
+        assert_eq!(absolute_positions(&ctx, &pair, 3), ["6", "7", ""]);
+        // a loop-link: both residues in peptide_a's protein
+        let looped = csm(c, None, (6, 2), PairClass::TT, 1, 0.01);
+        assert_eq!(absolute_positions(&ctx, &looped, 2), ["22", "18"]);
+        // a multivalent species: one column per peptide of its species column,
+        // each with all its link residues
+        let mut chain = csm(a, Some(b), (5, 2), PairClass::TT, 1, 0.01);
+        chain.kind = LinkKind::Multi;
+        chain.species = Some(Box::new(Species {
+            peptides: vec![a, b, c],
+            links: vec![(0, 5, 1, 2), (2, 2, 0, 7)],
+            ..Default::default()
+        }));
+        assert_eq!(absolute_positions(&ctx, &chain, 3), ["6,8", "7", "18"]);
+        // a decoy is placed where its target is
+        let decoy = find(&db, "C[+57.021465]FEKDR", true);
+        assert_eq!(ctx.absolute_positions(decoy, &[3]), "8");
+    }
+
+    /// The crosslink database of the linear search's proteins, and
+    /// LinearProteins.fasta: each protein once
+    #[test]
+    fn linear_proteins_are_kept_once() {
+        let text = ">sp|P1|ONE_HUMAN one\nMKTAYIAKQR\n>sp|P2|TWO_HUMAN two\nMSTNPKPQRK\n\
+                    >sp|P1|ONE_HUMAN one, again\nMKTAYIAKQR\n>sp|P3|THREE_HUMAN three\nMADEEKLPPG\n";
+        let keep: HashSet<Arc<str>> = ["sp|P1|ONE_HUMAN", "sp|P3|THREE_HUMAN"].into_iter().map(Arc::from).collect();
+        let mut fasta = Fasta::parse(text.into(), "rev_", true);
+        assert_eq!(keep_proteins(&mut fasta, &keep, "rev_", true), (2, 3));
+        let accessions: Vec<&str> = fasta.targets.iter().map(|(a, _)| a.as_ref()).collect();
+        assert_eq!(accessions, ["sp|P1|ONE_HUMAN", "sp|P3|THREE_HUMAN"]);
+
+        // the FASTA file: each record once, its header as it was
+        let wanted: std::collections::BTreeSet<&str> = keep.iter().map(|a| a.as_ref()).collect();
+        let mut written = HashSet::new();
+        let out = super::super::xlink_proteins::select_records(text, &wanted, &mut written);
+        assert_eq!(out, ">sp|P1|ONE_HUMAN one\nMKTAYIAKQR\n>sp|P3|THREE_HUMAN three\nMADEEKLPPG\n");
+        // ... also when the protein is in a second FASTA (two crosslink databases)
+        let second = super::super::xlink_proteins::select_records(">sp|P3|THREE_HUMAN three\nMADEEKLPPG\n", &wanted, &mut written);
+        assert_eq!(second, "");
+
+        // decoys from the FASTA come with their targets
+        let text = ">P1\nMKTAYIAKQR\n>rev_P1\nMQKAIYATKR\n>P2\nMSTNPKPQRK\n>rev_P2\nMKRQPKPNTS\n";
+        let keep: HashSet<Arc<str>> = ["P1"].into_iter().map(Arc::from).collect();
+        let mut fasta = Fasta::parse(text.into(), "rev_", false);
+        assert_eq!(keep_proteins(&mut fasta, &keep, "rev_", false), (1, 2));
+        let accessions: Vec<&str> = fasta.targets.iter().map(|(a, _)| a.as_ref()).collect();
+        assert_eq!(accessions, ["P1", "rev_P1"]);
     }
 }

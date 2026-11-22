@@ -148,9 +148,14 @@ fn signed(v: &Value) -> String {
 /// A fraction as a percentage: 0.01 is "1%"
 fn percent(v: &Value) -> String {
     match v.as_f64() {
-        Some(x) => format!("{}%", trim(&format!("{:.2}", x * 100.0))),
+        Some(x) => percent_text(x),
         None => text(v),
     }
+}
+
+/// A fraction as a percentage: 0.01 is "1%", 0.005 is "0.5%"
+pub fn percent_text(x: impl Into<f64>) -> String {
+    format!("{}%", trim(&format!("{:.2}", x.into() * 100.0)))
 }
 
 /// A mass held as f32, to 4 decimals as the run's header gives it
@@ -536,6 +541,19 @@ fn crosslinker(list: &mut List, mut xl: Map<String, Value>) {
     if let Some(v) = flag(&mut xl, "linear_search") {
         list.item("linear search too", v);
     }
+    let fdr = take(&mut xl, "linear_protein_fdr");
+    if let Some(v) = take(&mut xl, "linear_proteins") {
+        let narrowed = v.as_bool() == Some(true);
+        let cutoff = fdr.as_ref().map(percent).unwrap_or_else(|| "1%".into());
+        list.item(
+            "crosslink database",
+            if narrowed {
+                format!("the proteins of the linear search's peptides at {cutoff} FDR (LinearProteins.fasta)")
+            } else {
+                "the whole FASTA".into()
+            },
+        );
+    }
     rest(list, xl);
 }
 
@@ -841,7 +859,8 @@ mod test {
             "crosslink": {"reagent": "dsso", "mass": null, "cleavable": null, "residues": "KSTY", "protein_nterm": true,
                           "allow_cterm_residue": false, "loop_links": true, "multivalent": 2, "candidates": 30,
                           "min_chain_peaks": 3, "require_complete_doublets": false, "precursor_window": true,
-                          "backend": "cpu", "chain_survivors": 20000, "linear_search": true, "min_linked_peaks": 2},
+                          "backend": "cpu", "chain_survivors": 20000, "linear_search": true, "linear_proteins": false,
+                          "linear_protein_fdr": 0.01, "min_linked_peaks": 2},
             "score_type": "SageHyperScore",
             "spectral_library": {"formats": ["openswath", "spectronaut"], "psm_fdr": 0.01, "peptide_fdr": 0.01,
                                  "protein_fdr": 0.01, "crosslink_fdr": 0.01, "proteotypic": true, "consensus": true,
@@ -956,6 +975,19 @@ mod test {
         let lines = lines(&v);
         assert_eq!(value(find(&lines, "reagent")), "SDA, 82.0419 Da, non-cleavable");
         assert_eq!(value(find(&lines, "reacts with")), "site 1: KSTY and protein N-termini; site 2: any residue");
+    }
+
+    #[test]
+    fn the_crosslink_database_is_named() {
+        let mut v = polii();
+        assert_eq!(value(find(&lines(&v), "crosslink database")), "the whole FASTA");
+        v["crosslink"]["linear_proteins"] = json!(true);
+        v["crosslink"]["linear_protein_fdr"] = json!(0.01);
+        assert_eq!(
+            value(find(&lines(&v), "crosslink database")),
+            "the proteins of the linear search's peptides at 1% FDR (LinearProteins.fasta)"
+        );
+        assert_eq!(percent_text(0.005), "0.5%");
     }
 
     #[test]

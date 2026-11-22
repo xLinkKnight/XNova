@@ -13,6 +13,10 @@ pub enum Stage {
     Database,
     Linear,
     Search,
+    /// `linear_proteins`: the crosslink database of the linear search's proteins
+    XlDatabase,
+    /// `linear_proteins`: the crosslink search, after the linear one
+    XlSearch,
     Rescore,
     Proteins,
     Quant,
@@ -27,6 +31,8 @@ impl Stage {
             Stage::Database => "Digest proteins and build the fragment index",
             Stage::Linear => "Linear peptide results (results.sage.tsv)",
             Stage::Search => "Search spectrum files",
+            Stage::XlDatabase => "Crosslink database of the linear search's proteins",
+            Stage::XlSearch => "Crosslink search of the spectrum files",
             Stage::Rescore => "Align retention times and rescore matches",
             Stage::Proteins => "Infer proteins",
             Stage::Quant => "Quantify",
@@ -42,6 +48,8 @@ impl Stage {
             Stage::Database => 0.8,
             Stage::Linear => 1.0,
             Stage::Search => 6.0,
+            Stage::XlDatabase => 0.3,
+            Stage::XlSearch => 6.0,
             Stage::Rescore => 0.8,
             Stage::Proteins => 0.3,
             Stage::Quant => 1.0,
@@ -58,6 +66,9 @@ pub struct Plan {
     pub crosslink: bool,
     /// Crosslink searches: a linear peptide search runs first
     pub linear: bool,
+    /// ...and the crosslink search only searches the proteins it found,
+    /// reading the files again after the linear results
+    pub linear_proteins: bool,
     pub quant: bool,
     pub gpu_backend: bool,
     pub output_dir: PathBuf,
@@ -96,9 +107,18 @@ pub struct Tracker {
     converting: bool,
     pub files_done: usize,
     pub files_started: usize,
+    /// The batch of files being searched: the share of its spectra searched,
+    /// from sage.exe's `progress:` lines
+    batch_share: Option<f32>,
+    /// `linear_proteins`: the files the linear pass searched, kept when the
+    /// crosslink pass counts them again
+    pub linear_files_done: Option<usize>,
     /// A crosslink search with the linear search: the crosslink search's
     /// own results have begun (the linear search's come first)
     crosslink_results: bool,
+    /// The part of the crosslink results under way: (part, of parts, what,
+    /// share of it done)
+    pub results_part: Option<(usize, usize, String, Option<f32>)>,
     /// Metrics in the order Sage reports them: (label, value)
     pub metrics: Vec<(String, String)>,
     search_ms: u64,
@@ -125,6 +145,24 @@ fn parse_log(line: &str) -> Option<(&str, &str)> {
     let (head, msg) = rest.split_once("] ")?;
     let level = head.split_whitespace().nth(1)?;
     Some((level, msg))
+}
+
+/// `4 of 9: crosslinks.mzid for xiVIEW and PRIDE (108,693 matches)` (after
+/// "crosslink results "): the part, the number of parts and what it does
+fn results_part(rest: &str) -> Option<(usize, usize, String)> {
+    let (i, rest) = rest.split_once(" of ")?;
+    let (n, what) = rest.split_once(": ")?;
+    // what it does, without its size or its progress counts
+    let what = what.split(" (").next().unwrap_or(what);
+    let what = what.split(": ").next().unwrap_or(what);
+    Some((i.trim().parse().ok()?, n.trim().parse().ok()?, what.trim().to_string()))
+}
+
+/// The share done of a `progress:` line: `... (41%) ...` is 0.41
+fn percent_of(line: &str) -> Option<f32> {
+    let (head, _) = line.split_once("%)")?;
+    let (_, pct) = head.rsplit_once('(')?;
+    pct.trim().parse::<f32>().ok().map(|p| (p / 100.0).clamp(0.0, 1.0))
 }
 
 fn number(text: &str) -> Option<u64> {
@@ -191,6 +229,10 @@ impl Tracker {
         if plan.crosslink && plan.linear {
             // both searches run on each batch of files; the linear results come first
             stages.push(Stage::Linear);
+            if plan.linear_proteins {
+                // the linear search alone first; then the crosslink search of its proteins
+                stages.extend([Stage::XlDatabase, Stage::XlSearch]);
+            }
         }
         if plan.crosslink {
             // crosslinks: FDR right after the search, then quantification
@@ -217,7 +259,10 @@ impl Tracker {
             converting: false,
             files_done: 0,
             files_started: 0,
+            batch_share: None,
+            linear_files_done: None,
             crosslink_results: false,
+            results_part: None,
             metrics: Vec::new(),
             search_ms: 0,
             io_ms: 0,
@@ -389,7 +434,19 @@ impl Tracker {
             }
             return;
         };
-        // sage.exe's word on a long step (every 15 s): not a stage of its own
+        // sage.exe's word on a long step (every 15 s): not a stage of its own.
+        // A part of the crosslink results gives its share done.
+        if let Some(rest) = msg.strip_prefix("progress: crosslink results ") {
+            if let (Some((i, n, what)), Some(share)) = (results_part(rest), percent_of(rest)) {
+                self.results_part = Some((i, n, what, Some(share)));
+            }
+            return;
+        }
+        // the crosslink search of a batch: most of its time
+        if msg.starts_with("progress: crosslink search, files ") {
+            self.batch_share = percent_of(msg);
+            return;
+        }
         if msg.starts_with("progress:") {
             return;
         }
@@ -402,6 +459,39 @@ impl Tracker {
             return;
         }
 
+        // the crosslink results, part by part:
+        // "crosslink results 4 of 9: crosslinks.mzid for xiVIEW and PRIDE (108,693 matches)"
+        if let Some((i, n, what)) = msg.strip_prefix("crosslink results ").and_then(results_part) {
+            self.crosslink_results = true;
+            self.reach(Stage::Results);
+            self.results_part = Some((i, n, what, None));
+            return;
+        }
+        // the crosslink search narrowed to the linear search's proteins
+        if self.plan.linear_proteins {
+            if msg.starts_with("=== crosslink database") {
+                self.reach(Stage::XlDatabase);
+                return;
+            }
+            if let Some(rest) = msg.strip_prefix("crosslink database: ") {
+                if let Some((kept, tail)) = rest.split_once(" of the ") {
+                    if let Some((total, _)) = tail.split_once(" proteins") {
+                        self.set_metric("Proteins for crosslinks", format!("{kept} of {total}"));
+                    }
+                } else if let Some((peptides, _)) = rest.split_once(" peptides") {
+                    self.set_metric("Crosslink database peptides", peptides.to_string());
+                }
+                return;
+            }
+            if msg.starts_with("=== searching the spectrum files: crosslink search") {
+                self.reach(Stage::XlSearch);
+                self.linear_files_done = Some(self.files_done);
+                self.files_started = 0;
+                self.files_done = 0;
+                self.batch_share = None;
+                return;
+            }
+        }
         if msg.starts_with("linear peptide search (results.sage.tsv)") {
             // "... and crosslink search, reading each spectrum file once": the
             // plan has the stages already
@@ -460,6 +550,7 @@ impl Tracker {
         } else if let Some(rest) = msg.strip_prefix("processing files ") {
             // "processing files 0 .. 4 " (a batch searched in parallel)
             self.reach(Stage::Search);
+            self.batch_share = None;
             if let Some((_, end)) = rest.split_once("..") {
                 if let Some(n) = number(end) {
                     self.files_started = n as usize;
@@ -515,11 +606,16 @@ impl Tracker {
         let total: f32 = self.stages.iter().map(|s| s.weight()).sum();
         let done: f32 = self.stages[..self.current].iter().map(|s| s.weight()).sum();
         let within = match self.stage() {
-            Stage::Search if self.plan.files > 0 => {
-                // half credit for the batch in progress
-                (self.files_done as f32 + 0.5 * (self.files_started - self.files_done) as f32) / self.plan.files as f32
+            Stage::Search | Stage::XlSearch if self.plan.files > 0 => {
+                // the batch in progress: its share searched, or half
+                let share = self.batch_share.unwrap_or(0.5);
+                (self.files_done as f32 + share * (self.files_started - self.files_done) as f32) / self.plan.files as f32
             }
             Stage::Convert if self.plan.raw_files > 0 => self.converted as f32 / self.plan.raw_files as f32,
+            Stage::Results => match &self.results_part {
+                Some((i, n, _, share)) => (i.saturating_sub(1) as f32 + share.unwrap_or(0.0)) / (*n).max(1) as f32,
+                None => 0.1,
+            },
             _ => 0.3,
         };
         ((done + self.stage().weight() * within.clamp(0.0, 1.0)) / total).clamp(0.0, 0.99)
@@ -544,6 +640,22 @@ impl Tracker {
             ),
             Stage::Search => format!("Searched {} of {} files", self.files_done, self.plan.files),
             Stage::Linear => "Linear peptide search: FDR and results".into(),
+            Stage::XlSearch if self.files_started == self.files_done + 1 => {
+                format!("Crosslink search: file {} of {}", self.files_started, self.plan.files)
+            }
+            Stage::XlSearch if self.files_started > self.files_done => format!(
+                "Crosslink search: files {}\u{2013}{} of {}",
+                self.files_done + 1,
+                self.files_started,
+                self.plan.files
+            ),
+            Stage::Results => match &self.results_part {
+                Some((i, n, what, share)) => {
+                    let share = share.map(|s| format!(", {:.0}%", s * 100.0)).unwrap_or_default();
+                    format!("Results, part {i} of {n}: {what}{share}")
+                }
+                None => Stage::Results.label().to_string(),
+            },
             s => s.label().to_string(),
         }
     }
@@ -780,7 +892,7 @@ mod test {
     use super::*;
 
     fn plan(crosslink: bool, quant: bool) -> Plan {
-        Plan { files: 4, raw_files: 0, crosslink, linear: false, quant, gpu_backend: false, output_dir: PathBuf::new() }
+        Plan { files: 4, raw_files: 0, crosslink, linear: false, linear_proteins: false, quant, gpu_backend: false, output_dir: PathBuf::new() }
     }
 
     fn feed(t: &mut Tracker, lines: &[&str]) -> Vec<String> {
@@ -899,6 +1011,62 @@ mod test {
         let m = |k: &str| t.metrics.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
         assert_eq!(m("Peptide-spectrum matches (PSMs) at 1% FDR").as_deref(), Some("12"));
         assert_eq!(t.identifications(), Some(3));
+    }
+
+    /// The crosslink search of the linear search's proteins: the linear
+    /// search of every file, its results, the new database, then the
+    /// crosslink search of every file; then the crosslink results part by part
+    #[test]
+    fn follows_the_crosslink_search_of_the_linear_proteins() {
+        let mut t = Tracker::new(Plan { linear: true, linear_proteins: true, ..plan(true, false) });
+        assert_eq!(
+            t.stages,
+            [Stage::Start, Stage::Database, Stage::Search, Stage::Linear, Stage::XlDatabase, Stage::XlSearch, Stage::Results]
+        );
+        let mut log: Vec<String> = Vec::new();
+        let mut step = |t: &mut Tracker, msgs: &[&str]| {
+            log.extend(msgs.iter().map(|m| format!("[2026-11-22T18:00:07Z INFO  sage_cli::runner] {m}")));
+            t.update(&log, log.len());
+        };
+        step(&mut t, &["using 16 CPU thread(s)",
+            "linear peptide search (results.sage.tsv) of every file first; the proteins it finds make the crosslink search's database",
+            "=== searching the spectrum files: linear search ===",
+            "processing files 0 .. 2 ", "- file IO:        4 ms", "- search:         1 ms (500 spectra/s)",
+            "processing files 2 .. 4 ", "- file IO:        4 ms", "- search:         1 ms (500 spectra/s)"]);
+        assert_eq!(t.stage(), Stage::Search);
+        assert_eq!((t.files_started, t.files_done), (4, 4));
+        step(&mut t, &["=== linear peptide results (results.sage.tsv) ===", "aligning file #0: robust affine y = 1.0000x + 0.0000, nonlinear knots = 0",
+            "discovered 1207 target peptides at 1% FDR"]);
+        assert_eq!(t.stage(), Stage::Linear);
+        step(&mut t, &["=== crosslink database: the proteins of the linear search ===",
+            "crosslink database: 15 of the 130 proteins have a peptide at 1% FDR in the linear search; written to LinearProteins.fasta",
+            "crosslink database: 22,147 peptides, 912,000 fragments, built in 25 ms"]);
+        assert_eq!(t.stage(), Stage::XlDatabase);
+        step(&mut t, &["=== searching the spectrum files: crosslink search ===", "processing files 0 .. 2 "]);
+        assert_eq!(t.stage(), Stage::XlSearch);
+        assert_eq!(t.activity(), "Crosslink search: files 1\u{2013}2 of 4");
+        step(&mut t, &["- crosslink search:       12 ms (100 spectra, 5 candidate matches)", "processing files 2 .. 4 "]);
+        assert_eq!(t.activity(), "Crosslink search: files 3\u{2013}4 of 4");
+        assert_eq!(t.linear_files_done, Some(4));
+        let half = t.fraction();
+        step(&mut t, &["progress: crosslink search, files 3-4 of 4: 900 of 1,000 spectra (90%), 26/s, about 3.8 s left (35.0 s so far)"]);
+        assert!(t.fraction() > half, "the batch's share moves the bar");
+        step(&mut t, &["- crosslink search:       12 ms (100 spectra, 5 candidate matches)",
+            "=== crosslink results ===",
+            "crosslink results 1 of 8: crosslink FDR (1,000 matches)",
+            "precursor mass window of a.d: -3.0 to +4.0 ppm (5 matches outside, left out)",
+            "discovered 300 target crosslink-spectrum matches at 1% FDR"]);
+        assert_eq!(t.stage(), Stage::Results);
+        assert_eq!(t.activity(), "Results, part 1 of 8: crosslink FDR");
+        let at_part_one = t.fraction();
+        step(&mut t, &["- crosslink FDR: 118 ms, 8,474 matches/s",
+            "crosslink results 7 of 8: crosslinks.mzid for xiVIEW and PRIDE (1,000 matches)",
+            "progress: crosslink results 7 of 8: crosslinks.mzid for xiVIEW and PRIDE: 400 of 1,000 matches (40%), 26/s, about 23.1 s left (15.2 s so far)"]);
+        assert_eq!(t.activity(), "Results, part 7 of 8: crosslinks.mzid for xiVIEW and PRIDE, 40%");
+        assert!(t.fraction() > at_part_one);
+        let m = |k: &str| t.metrics.iter().find(|(l, _)| l == k).map(|(_, v)| v.clone());
+        assert_eq!(m("Proteins for crosslinks").as_deref(), Some("15 of 130"));
+        assert_eq!(m("Crosslink database peptides").as_deref(), Some("22,147"));
     }
 
     #[test]
