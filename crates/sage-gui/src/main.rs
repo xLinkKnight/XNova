@@ -771,8 +771,8 @@ impl SageGui {
         let log = job.log.lock().unwrap().lines.clone();
         tracker.update(&log, total);
         if job.is_running() {
-            // notes on the running search: the computer's CPU and memory every
-            // minute, and a word when sage.exe has written nothing for 2 minutes
+            // notes on the running search: XNova's and the computer's CPU and
+            // memory every minute, and a word when sage.exe has written nothing for 2 minutes
             let now = std::time::Instant::now();
             if total != self.watch.lines {
                 self.watch.lines = total;
@@ -781,7 +781,9 @@ impl SageGui {
             }
             let usage = self.usage.latest(ctx).map(|u| {
                 format!(
-                    "computer: CPU {:.0}%, RAM {:.1} of {:.1} GB in use",
+                    "XNova: CPU {:.0}%, RAM {:.1} GB; computer: CPU {:.0}%, RAM {:.1} of {:.1} GB in use",
+                    u.own_cpu,
+                    u.own_ram as f64 / system::GB,
                     u.cpu,
                     u.ram_used as f64 / system::GB,
                     u.ram_total as f64 / system::GB
@@ -1047,18 +1049,18 @@ impl SageGui {
                     self.xiview_status(ui);
                 }
                 if let Some(job) = &self.job {
-                    let (text, color) = match job.status() {
-                        Status::Running(step) => (format!("Running: {step}"), theme::accent_text(ui)),
-                        Status::Finished => ("Finished".to_string(), theme::status_of(ui).ok),
+                    use theme::StepMark;
+                    let (mark, text, color) = match job.status() {
+                        Status::Running(step) => (StepMark::Running, format!("Running: {step}"), theme::accent_text(ui)),
+                        Status::Finished => (StepMark::Done, "Finished".to_string(), theme::status_of(ui).ok),
                         Status::Failed(_) => (
+                            StepMark::Failed,
                             "Failed: see the Progress tab for what went wrong".to_string(),
                             theme::status_of(ui).bad,
                         ),
-                        Status::Cancelled => ("Cancelled".to_string(), Color32::GRAY),
+                        Status::Cancelled => (StepMark::Cancelled, "Cancelled".to_string(), Color32::GRAY),
                     };
-                    if job.is_running() {
-                        ui.spinner();
-                    }
+                    theme::step_mark(ui, mark);
                     ui.label(RichText::new(text).color(color));
                 }
                 if self.tab == Tab::Progress {
@@ -1577,18 +1579,18 @@ impl SageGui {
 
         heading(ui, "Search progress");
         ui.horizontal(|ui| {
-            let (text, color) = match t.state {
-                progress::State::Running => (format!("Running: {}", t.activity()), theme::accent(ui)),
-                progress::State::Finished => ("✔ Search finished successfully".to_string(), ok),
+            use theme::StepMark;
+            let (mark, text, color) = match t.state {
+                progress::State::Running => (StepMark::Running, format!("Running: {}", t.activity()), theme::accent(ui)),
+                progress::State::Finished => (StepMark::Done, "Search finished successfully".to_string(), ok),
                 progress::State::Failed => (
-                    format!("✖ Search failed: {}", t.diagnosis.as_ref().map_or("see below", |d| d.title.as_str())),
+                    StepMark::Failed,
+                    format!("Search failed: {}", t.diagnosis.as_ref().map_or("see below", |d| d.title.as_str())),
                     bad,
                 ),
-                progress::State::Cancelled => ("■ Search cancelled".to_string(), muted),
+                progress::State::Cancelled => (StepMark::Cancelled, "Search cancelled".to_string(), muted),
             };
-            if running {
-                ui.spinner();
-            }
+            theme::step_mark(ui, mark);
             ui.label(theme::bold(text).color(color));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(RichText::new(format!("elapsed {}", progress::format_duration(t.elapsed()))).color(muted));
@@ -1627,17 +1629,14 @@ impl SageGui {
             for (i, stage) in t.stages.iter().enumerate() {
                 let done = t.took[i].is_some() && (i < t.current || t.state == progress::State::Finished);
                 let current = i == t.current && !done;
-                if done {
-                    ui.label(RichText::new("✔").color(ok));
-                } else if current && running {
-                    ui.spinner();
-                } else if current && t.state == progress::State::Failed {
-                    ui.label(RichText::new("✖").color(bad));
-                } else if current && t.state == progress::State::Cancelled {
-                    ui.label(RichText::new("■").color(muted));
-                } else {
-                    ui.label(RichText::new("○").color(muted));
-                }
+                use theme::StepMark;
+                theme::step_mark(ui, match t.state {
+                    _ if done => StepMark::Done,
+                    progress::State::Running if current => StepMark::Running,
+                    progress::State::Failed if current => StepMark::Failed,
+                    progress::State::Cancelled if current => StepMark::Cancelled,
+                    _ => StepMark::Pending,
+                });
                 let label = RichText::new(stage.label());
                 ui.label(if done || current { label } else { label.color(muted) });
                 let detail = match (stage, done) {
@@ -1776,21 +1775,31 @@ impl SageGui {
         }
     }
 
-    /// CPU, RAM, GPU and vRAM utilisation of the whole computer, right to left
+    /// CPU, RAM, GPU and vRAM used by XNova (sage-gui and the programs it
+    /// started, such as sage.exe), right to left; the whole computer's figures
+    /// are in the tooltips, and a figure turns red when the whole computer's
+    /// is at 90% or more
     fn usage_meters(&self, ui: &mut Ui) {
         let Some(u) = self.usage.latest(ui.ctx()) else {
-            ui.label(RichText::new("measuring usage…").color(theme::muted(ui)));
+            ui.label(RichText::new("measuring usage\u{2026}").color(theme::muted(ui)));
             return;
         };
         let gb = |b: u64| b as f64 / system::GB;
-        let meter = |ui: &mut Ui, name: &str, pct: Option<f32>, tip: String| {
-            let value = match pct {
-                Some(p) => RichText::new(format!("{p:.0}%")).strong().color(if p >= 90.0 {
+        let size = |b: u64| {
+            if b >= 1 << 30 {
+                format!("{:.1} GB", gb(b))
+            } else {
+                format!("{:.0} MB", b as f64 / (1u64 << 20) as f64)
+            }
+        };
+        let meter = |ui: &mut Ui, name: &str, value: Option<String>, alarm: bool, tip: String| {
+            let value = match value {
+                Some(v) => RichText::new(v).strong().color(if alarm {
                     theme::status_of(ui).bad
                 } else {
                     ui.visuals().text_color()
                 }),
-                None => RichText::new("–").color(theme::muted(ui)),
+                None => RichText::new("\u{2013}").color(theme::muted(ui)),
             };
             // right to left: value first, then its name
             let r = ui.label(value).on_hover_text(&tip);
@@ -1798,38 +1807,76 @@ impl SageGui {
             ui.add_space(10.0);
             r
         };
+        let processes = match u.own_processes {
+            0 | 1 => "sage-gui".to_string(),
+            2 => "sage-gui and the program it started (sage.exe)".to_string(),
+            n => format!("sage-gui and the {} programs it started, such as sage.exe", n - 1),
+        };
+        let main = u.main_gpu().filter(|g| g.vram_total >= 512 << 20).or(u.main_gpu());
+        let dedicated = main.filter(|g| g.vram_total >= 512 << 20);
+        meter(
+            ui,
+            "vRAM",
+            dedicated.map(|g| size(g.own_vram)),
+            dedicated.and_then(|g| g.vram_pct()).is_some_and(|p| p >= 90.0),
+            match dedicated {
+                Some(g) => format!(
+                    "{}: XNova uses {} of its {:.1} GB of dedicated video memory ({:.0}%).\n\
+                     Whole computer: {:.1} GB in use ({:.0}%).",
+                    g.name,
+                    size(g.own_vram),
+                    gb(g.vram_total),
+                    g.own_vram_pct().unwrap_or(0.0),
+                    gb(g.vram_used),
+                    g.vram_pct().unwrap_or(0.0)
+                ),
+                None => "No graphics card with its own video memory.".into(),
+            },
+        );
         let all_gpus = u
             .gpus
             .iter()
-            .map(|g| match g.vram_pct() {
-                Some(v) if g.vram_total >= 512 << 20 => format!(
-                    "{}: {:.0}% busy, {:.1} of {:.1} GB vRAM ({v:.0}%)",
-                    g.name, g.util, gb(g.vram_used), gb(g.vram_total)
-                ),
-                _ => format!("{}: {:.0}% busy (integrated, uses system RAM)", g.name, g.util),
-            })
+            .map(|g| format!("{}: XNova {:.0}% busy, whole computer {:.0}%", g.name, g.own_util, g.util))
             .collect::<Vec<_>>()
-            .join("
-");
-        let main = u.main_gpu().filter(|g| g.vram_total >= 512 << 20).or(u.main_gpu());
-        let gpu_tip = format!("Whole computer, as in Task Manager (busiest engine type).
-{all_gpus}");
-        let vram_pct = main.filter(|g| g.vram_total >= 512 << 20).and_then(|g| g.vram_pct());
-        meter(ui, "vRAM", vram_pct, match main {
-            Some(g) if vram_pct.is_some() => format!(
-                "{}: {:.1} of {:.1} GB dedicated video memory in use (whole computer).",
-                g.name, gb(g.vram_used), gb(g.vram_total)
+            .join("\n");
+        meter(
+            ui,
+            "GPU",
+            main.map(|g| format!("{:.0}%", g.own_util)),
+            main.is_some_and(|g| g.util >= 90.0),
+            format!(
+                "How busy XNova keeps the graphics card: its busiest engine type, as in Task Manager's GPU column.\n{all_gpus}"
             ),
-            _ => "No graphics card with its own video memory.".into(),
-        });
-        meter(ui, "GPU", main.map(|g| g.util), gpu_tip);
-        meter(ui, "RAM", Some(u.ram_pct()), format!(
-            "{:.1} of {:.1} GB of memory in use (whole computer).",
-            gb(u.ram_used), gb(u.ram_total)
-        ));
-        meter(ui, "CPU", Some(u.cpu), format!(
-            "Processor use of the whole computer across {} logical CPUs.",
-            system::cpu_threads()
+        );
+        meter(
+            ui,
+            "RAM",
+            Some(size(u.own_ram)),
+            u.ram_pct() >= 90.0,
+            format!(
+                "Memory XNova holds in RAM (the working sets of {processes}): {} of {:.1} GB ({:.0}%).\n\
+                 Whole computer: {:.1} GB in use ({:.0}%).",
+                size(u.own_ram),
+                gb(u.ram_total),
+                u.own_ram_pct(),
+                gb(u.ram_used),
+                u.ram_pct()
+            ),
+        );
+        meter(
+            ui,
+            "CPU",
+            Some(format!("{:.0}%", u.own_cpu)),
+            u.cpu >= 90.0,
+            format!(
+                "Processor use of {processes}, as a share of the computer's {} logical CPUs \
+                 (as in Task Manager's CPU column).\nWhole computer: {:.0}%.",
+                system::cpu_threads(),
+                u.cpu
+            ),
+        );
+        ui.label(RichText::new("XNova").strong().color(theme::muted(ui))).on_hover_text(format!(
+            "The resources XNova is using: {processes}. Hover a figure for the whole computer's."
         ));
     }
 
@@ -4143,6 +4190,75 @@ mod screenshots {
         let path = out.join("library_crosslinking_edit.png");
         harness.render().expect("render").save(&path).unwrap();
         println!("{}", path.display());
+    }
+
+    /// The Progress tab's step marks (done, under way, to come; failed) and
+    /// XNova's usage meters along the bottom, mid-search and after a failure,
+    /// light and dark: `progress_marks_<running|failed>_<light|dark>.png` in
+    /// `SAGE_GUI_FIGURES`
+    #[test]
+    #[ignore]
+    fn progress_marks_preview() {
+        use std::time::{Duration, Instant};
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        for dark in [false, true] {
+            for (name, failed) in [("running", false), ("failed", true)] {
+                let mut app: Option<SageGui> = None;
+                let mut harness = Harness::builder()
+                    .with_size(egui::vec2(1100.0, 620.0))
+                    .with_pixels_per_point(1.5)
+                    .build_state(
+                        move |ctx, _: &mut ()| {
+                            let Some(app) = app.as_mut() else {
+                                theme::install(ctx, dark);
+                                let mut new = SageGui::new(ctx);
+                                new.dark = dark;
+                                theme::set_dark(ctx, dark);
+                                new.tab = Tab::Progress;
+                                let mut t = progress::Tracker::new(progress::Plan {
+                                    files: 4,
+                                    raw_files: 4,
+                                    crosslink: true,
+                                    linear: true,
+                                    linear_proteins: true,
+                                    linear_spectra: false,
+                                    quant: false,
+                                    gpu_backend: true,
+                                    output_dir: PathBuf::from("C:/results"),
+                                });
+                                t.converted = 4;
+                                t.files_done = 2;
+                                t.linear_files_done = Some(4);
+                                t.current = 5;
+                                for i in 0..5 {
+                                    t.took[i] = Some(Duration::from_secs(4 + 37 * i as u64));
+                                }
+                                if failed {
+                                    t.finish(progress::State::Failed, Some("sage.exe exited with exit code: 1"), &[]);
+                                }
+                                new.tracker = Some(t);
+                                app = Some(new);
+                                return;
+                            };
+                            app.draw(ctx);
+                        },
+                        (),
+                    );
+                harness.run_steps(4);
+                // the usage meters fill in after the first sample, about a second
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_millis(2500) {
+                    harness.step();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                harness.run_steps(2);
+                let theme = if dark { "dark" } else { "light" };
+                let path = out.join(format!("progress_marks_{name}_{theme}.png"));
+                harness.render().expect("render").save(&path).unwrap();
+                println!("{}", path.display());
+            }
+        }
     }
 
     /// Files > Resources on a computer with two GPUs (an NVIDIA T400 and an RTX

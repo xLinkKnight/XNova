@@ -618,3 +618,94 @@ pub fn theme_switch(ui: &mut Ui, dark: &mut bool) -> bool {
     ui.label(RichText::new("☀").color(muted));
     clicked
 }
+
+/// The mark of a search step in the Progress tab
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepMark {
+    /// a green disc with a check
+    Done,
+    /// an amber ring that turns
+    Running,
+    /// a grey dashed circle
+    Pending,
+    /// a red disc with a cross
+    Failed,
+    /// a grey disc with a square
+    Cancelled,
+}
+
+/// Width and height of a [`step_mark`]
+pub const STEP_MARK: f32 = 18.0;
+
+/// Amber of the step under way: between the theme's yellow and orange
+pub fn running_of(dark: bool) -> Color32 {
+    if dark {
+        rgb(240, 170, 40)
+    } else {
+        rgb(212, 130, 0)
+    }
+}
+
+/// A step's mark, painted at one size and centred in its own square so that
+/// a column of them lines up whatever the state (text glyphs and egui's
+/// spinner differ in size and baseline)
+pub fn step_mark(ui: &mut Ui, mark: StepMark) -> Response {
+    use std::f32::consts::TAU;
+    let (rect, response) = ui.allocate_exact_size(vec2(STEP_MARK, STEP_MARK), Sense::hover());
+    let dark = ui.visuals().dark_mode;
+    let c = rect.center();
+    let r = 7.0;
+    let status = status_of(ui);
+    // the check, cross and square: dark on the dark theme's light colours, white on the light theme's
+    let inner = if dark { rgb(28, 29, 31) } else { Color32::WHITE };
+    let painter = ui.painter();
+    let arc = |from: f32, to: f32, radius: f32| -> Vec<egui::Pos2> {
+        let n = ((to - from).abs() / TAU * 48.0).ceil().max(2.0) as usize;
+        (0..=n)
+            .map(|i| {
+                let a = from + (to - from) * i as f32 / n as f32;
+                c + radius * vec2(a.cos(), a.sin())
+            })
+            .collect()
+    };
+    match mark {
+        StepMark::Done => {
+            painter.circle_filled(c, r, status.ok);
+            let check = vec![c + vec2(-3.3, 0.2), c + vec2(-1.0, 2.6), c + vec2(3.4, -2.4)];
+            painter.add(egui::Shape::line(check, Stroke::new(1.8_f32, inner)));
+        }
+        StepMark::Running => {
+            let amber = running_of(dark);
+            painter.circle_stroke(c, r - 0.5, Stroke::new(1.6_f32, amber.gamma_multiply(0.25)));
+            let t = ui.input(|i| i.time) as f32;
+            let start = t * 5.0;
+            painter.add(egui::Shape::line(arc(start, start + 0.72 * TAU, r - 0.5), Stroke::new(2.0_f32, amber)));
+            ui.ctx().request_repaint();
+        }
+        StepMark::Pending => {
+            let grey = muted(ui);
+            let dashes = 12;
+            for k in 0..dashes {
+                let from = -TAU / 4.0 + k as f32 * TAU / dashes as f32;
+                painter.add(egui::Shape::line(arc(from, from + 0.55 * TAU / dashes as f32, r - 0.5), Stroke::new(1.4_f32, grey)));
+            }
+        }
+        StepMark::Failed => {
+            painter.circle_filled(c, r, status.bad);
+            let d = 2.7;
+            painter.line_segment([c + vec2(-d, -d), c + vec2(d, d)], Stroke::new(1.8_f32, inner));
+            painter.line_segment([c + vec2(-d, d), c + vec2(d, -d)], Stroke::new(1.8_f32, inner));
+        }
+        StepMark::Cancelled => {
+            painter.circle_filled(c, r, muted(ui));
+            painter.rect_filled(Rect::from_center_size(c, vec2(5.0, 5.0)), 1.0, inner);
+        }
+    }
+    response.on_hover_text(match mark {
+        StepMark::Done => "Done",
+        StepMark::Running => "Under way",
+        StepMark::Pending => "To come",
+        StepMark::Failed => "Failed",
+        StepMark::Cancelled => "Cancelled",
+    })
+}

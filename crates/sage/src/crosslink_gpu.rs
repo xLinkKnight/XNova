@@ -19,6 +19,12 @@
 //! of the bin), and the CPU then keeps exactly the best `max_survivors` with
 //! [`top_survivors`], as when every score was copied back.
 //!
+//! Each fragment window is looked up in a spectrum's peaks starting from a
+//! table: for every half-dalton bin, the first peak in that bin or above. The
+//! window's exact edges then decide which peaks count, as a binary search
+//! over all the peaks did (see `peak_bin` in the shader), so the scores are
+//! the same; the table only saves the search's steps.
+//!
 //! Tables larger than the device's buffer limits are split into chunks of
 //! consecutive peptides and dispatched one after another.
 
@@ -61,7 +67,8 @@ struct Batch {
     pep_base: u32,
     // survivors `entries` holds
     capacity: u32,
-    pad0: u32,
+    // spectra in the batch (`spectra`)
+    n_spectra: u32,
     pad1: u32,
 }
 
@@ -78,8 +85,9 @@ struct Query {
     abs_lo: f32,
     abs_hi: f32,
     max_survivors: u32,
-    pad0: u32,
-    pad1: u32,
+    // the spectrum's peak table: where in `table`, and its bins
+    table_off: u32,
+    n_bins: u32,
     // per fragment charge z = 1, 2, ...: x = 1/z, y = slack/z (KernelParams::charge_terms)
     charges: array<vec2<f32>, 32>,
 }
@@ -106,6 +114,10 @@ const BIN_BASE: u32 = __BIN_BASE__u;
 @group(0) @binding(11) var<storage, read_write> counter: array<atomic<u32>>;
 // (query, peptide, score bits, info) of the peptides copied back
 @group(0) @binding(12) var<storage, read_write> entries: array<vec4<u32>>;
+// per spectrum: for each bin, the first of its peaks whose bin is that or above
+@group(0) @binding(13) var<storage, read_write> table: array<u32>;
+// per spectrum: (peak_off, n_peaks, table_off, n_bins)
+@group(0) @binding(14) var<storage, read> spectra: array<vec4<u32>>;
 
 // The histogram bin of a score (its bits)
 fn bin_of(bits: u32) -> u32 {
@@ -115,21 +127,59 @@ fn bin_of(bits: u32) -> u32 {
     return clamp(bits >> BIN_SHIFT, BIN_BASE, BIN_BASE + BINS - 1u) - BIN_BASE;
 }
 
-// Intensity of the most intense peak in [lo, hi] (the later peak wins ties),
-// or -1.0 when there is none. Peaks are sorted by mass.
-fn best_peak(off: u32, n: u32, lo: f32, hi: f32) -> f32 {
+// The peak-table bin of a mass: floor(2 x mass), 0 below 0, at most
+// n_bins - 1. Doubling is exact and floor is exact, so every device computes
+// the same bin, and the bin never decreases as the mass grows: that is all
+// the lookup below relies on.
+fn peak_bin(mass: f32, n_bins: u32) -> u32 {
+    let v = floor(mass * 2.0);
+    if (!(v >= 0.0)) {
+        return 0u;
+    }
+    if (v >= f32(n_bins - 1u)) {
+        return n_bins - 1u;
+    }
+    return u32(v);
+}
+
+// Each spectrum's peak table: entry b is the first peak whose bin is b or
+// more. x = bin, y = spectrum of the batch
+@compute @workgroup_size(64)
+fn build_table(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.y >= batch.n_spectra) {
+        return;
+    }
+    let s = spectra[gid.y];
+    let b = gid.x;
+    if (b >= s.w) {
+        return;
+    }
     var l = 0u;
-    var r = n;
+    var r = s.y;
     while (l < r) {
         let mid = (l + r) / 2u;
-        if (peaks[off + mid].x < lo) {
+        if (peak_bin(peaks[s.x + mid].x, s.w) < b) {
             l = mid + 1u;
         } else {
             r = mid;
         }
     }
+    table[s.z + b] = l;
+}
+
+// Intensity of the most intense peak in [lo, hi] (the later peak wins ties),
+// or -1.0 when there is none. Peaks are sorted by mass.
+//
+// The first peak at lo or above, as a binary search finds it: every peak
+// before the table's entry for lo's bin is in a lower bin, so lighter than lo
+// (a bin never decreases with the mass); the few peaks of lo's own bin below
+// lo are then stepped over.
+fn best_peak(off: u32, n: u32, table_off: u32, n_bins: u32, lo: f32, hi: f32) -> f32 {
+    var i = table[table_off + peak_bin(lo, n_bins)];
+    while (i < n && peaks[off + i].x < lo) {
+        i = i + 1u;
+    }
     var best = -1.0;
-    var i = l;
     while (i < n && peaks[off + i].x <= hi) {
         if (peaks[off + i].y >= best) {
             best = peaks[off + i].y;
@@ -166,6 +216,8 @@ fn score_peptides(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_sites = min(s1 - s0, 16u);
     let peak_off = queries[q].peak_off;
     let n_peaks = queries[q].n_peaks;
+    let table_off = queries[q].table_off;
+    let n_bins = queries[q].n_bins;
     let max_charge = queries[q].max_charge;
     let lo_factor = queries[q].lo_factor;
     let hi_factor = queries[q].hi_factor;
@@ -197,7 +249,7 @@ fn score_peptides(@builtin(global_invocation_id) gid: vec3<u32>) {
             let t = mass * k.x;
             let lo = t * lo_factor + abs_lo;
             let hi = t * hi_factor + abs_hi;
-            let a = best_peak(peak_off, n_peaks, lo, hi);
+            let a = best_peak(peak_off, n_peaks, table_off, n_bins, lo, hi);
             if (a >= 0.0) {
                 un = un + 1u;
                 ui = ui + a;
@@ -205,7 +257,7 @@ fn score_peptides(@builtin(global_invocation_id) gid: vec3<u32>) {
             let ts = (mass + shift) * k.x;
             let slo = ts * lo_factor + abs_lo - k.y;
             let shi = ts * hi_factor + abs_hi + k.y;
-            let b = best_peak(peak_off, n_peaks, slo, shi);
+            let b = best_peak(peak_off, n_peaks, table_off, n_bins, slo, shi);
             if (b >= 0.0) {
                 sn = sn + 1u;
                 si = si + b;
@@ -307,7 +359,7 @@ struct GpuBatch {
     site_base: u32,
     pep_base: u32,
     capacity: u32,
-    pad0: u32,
+    n_spectra: u32,
     pad1: u32,
 }
 
@@ -325,13 +377,13 @@ struct GpuQuery {
     abs_lo: f32,
     abs_hi: f32,
     max_survivors: u32,
-    pad0: u32,
-    pad1: u32,
+    table_off: u32,
+    n_bins: u32,
     charges: [[f32; 2]; MAX_CHARGE_TERMS],
 }
 
 impl GpuQuery {
-    fn new(peak_off: usize, n_peaks: usize, params: &KernelParams) -> Self {
+    fn new(spectrum: &GpuSpectrum, params: &KernelParams) -> Self {
         // Fragment charges beyond the table (precursors above 33+) are not tried
         let mut charges = [[0f32; 2]; MAX_CHARGE_TERMS];
         let mut n_charges = 0;
@@ -341,8 +393,8 @@ impl GpuQuery {
         }
         let (lo_factor, hi_factor) = params.fragment_tol.factors();
         Self {
-            n_peaks: n_peaks as u32,
-            peak_off: peak_off as u32,
+            n_peaks: spectrum.n_peaks,
+            peak_off: spectrum.peak_off,
             max_charge: n_charges as u32 + 1,
             min_matched: params.min_matched as u32,
             precursor_mass: params.precursor_mass,
@@ -351,10 +403,31 @@ impl GpuQuery {
             abs_lo: params.fragment_tol.abs_lo,
             abs_hi: params.fragment_tol.abs_hi,
             max_survivors: params.max_survivors.min(u32::MAX as usize) as u32,
-            pad0: 0,
-            pad1: 0,
+            table_off: spectrum.table_off,
+            n_bins: spectrum.n_bins,
             charges,
         }
+    }
+}
+
+/// A spectrum of a batch, as `spectra` in the shader holds it
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct GpuSpectrum {
+    peak_off: u32,
+    n_peaks: u32,
+    table_off: u32,
+    n_bins: u32,
+}
+
+impl GpuSpectrum {
+    /// Its peaks from `peak_off` and its table from `table_off`: a bin for
+    /// each half-dalton up to its heaviest peak, and one above
+    fn new(masses: &[f32], peak_off: usize, table_off: usize) -> Self {
+        let heaviest = masses.iter().copied().fold(0.0f32, f32::max);
+        // (at most 2^20 bins: masses beyond 524,288 Da share the last; the lookup stays exact)
+        let n_bins = if heaviest.is_finite() { ((heaviest * 2.0).floor() as u32).min(1 << 20) + 2 } else { 2 };
+        GpuSpectrum { peak_off: peak_off as u32, n_peaks: masses.len() as u32, table_off: table_off as u32, n_bins }
     }
 }
 
@@ -374,6 +447,15 @@ struct Chunk {
     ions: wgpu::Buffer,
     sites: wgpu::Buffer,
     pep_mass: wgpu::Buffer,
+}
+
+/// A batch's spectra and their peak tables (see `build_table` in the shader)
+struct PeakTables {
+    table: wgpu::Buffer,
+    spectra: wgpu::Buffer,
+    /// spectra in the batch, and the most bins of any
+    count: u32,
+    most_bins: u32,
 }
 
 /// Device buffers of a batch, kept from one batch to the next
@@ -454,7 +536,9 @@ pub fn pick_adapter(names: &[String], want: &str) -> Result<usize, String> {
 pub struct GpuKernel {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    /// the shader's three steps: score, find each query's threshold, copy back
+    /// the shader's steps: the spectra's peak tables, score, find each
+    /// query's threshold, copy back
+    build_table: wgpu::ComputePipeline,
     score: wgpu::ComputePipeline,
     threshold: wgpu::ComputePipeline,
     compact: wgpu::ComputePipeline,
@@ -622,7 +706,8 @@ impl GpuKernel {
                 cache: None,
             })
         };
-        let (score, threshold, compact) = (pipeline("score_peptides"), pipeline("threshold"), pipeline("compact"));
+        let (build_table, score, threshold, compact) =
+            (pipeline("build_table"), pipeline("score_peptides"), pipeline("threshold"), pipeline("compact"));
 
         let max_binding = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) as usize;
         let chunks = build_chunks(&device, &table, max_binding)?;
@@ -648,6 +733,7 @@ impl GpuKernel {
         Ok(Self {
             device,
             queue,
+            build_table,
             score,
             threshold,
             compact,
@@ -700,7 +786,7 @@ impl GpuKernel {
     }
 
     /// Each chunk's `Batch` uniform
-    fn uniforms(&self, n_queries: usize, capacity: usize) -> Vec<wgpu::Buffer> {
+    fn uniforms(&self, n_queries: usize, n_spectra: usize, capacity: usize) -> Vec<wgpu::Buffer> {
         self.chunks
             .iter()
             .map(|c| {
@@ -711,7 +797,7 @@ impl GpuKernel {
                     site_base: c.site_base,
                     pep_base: c.first as u32,
                     capacity: capacity.min(u32::MAX as usize) as u32,
-                    pad0: 0,
+                    n_spectra: n_spectra as u32,
                     pad1: 0,
                 };
                 self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -731,9 +817,11 @@ impl GpuKernel {
         uniforms: &[wgpu::Buffer],
         queries: &wgpu::Buffer,
         peaks: &wgpu::Buffer,
+        tables: &PeakTables,
         n_queries: usize,
     ) {
         encoder.clear_buffer(&work.hist, 0, Some((n_queries * BINS as usize * 4) as u64));
+        let build = self.bind(&self.build_table, &[(0, &uniforms[0]), (2, peaks), (13, &tables.table), (14, &tables.spectra)]);
         let groups: Vec<wgpu::BindGroup> = self
             .chunks
             .iter()
@@ -753,12 +841,16 @@ impl GpuKernel {
                         (7, &self.lnfact),
                         (8, scores),
                         (9, &work.hist),
+                        (13, &tables.table),
                     ],
                 )
             })
             .collect();
         let thresholds = self.bind(&self.threshold, &[(0, &uniforms[0]), (1, queries), (9, &work.hist), (10, &work.thresh)]);
         let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&self.build_table);
+        pass.set_bind_group(0, &build, &[]);
+        pass.dispatch_workgroups(tables.most_bins.div_ceil(WORKGROUP), tables.count, 1);
         pass.set_pipeline(&self.score);
         for (chunk, group) in self.chunks.iter().zip(&groups) {
             pass.set_bind_group(0, group, &[]);
@@ -814,38 +906,51 @@ impl GpuKernel {
         n
     }
 
-    /// The survivors of one batch of queries, in their order
+    /// Every survivor of one batch of queries, in their order, at or above
+    /// each query's threshold: a superset of the best `max_survivors`, which
+    /// [`Self::rank`] then keeps
     fn run_batch(&self, work: &mut Work, batch: &[(&ProcessedSpectrum, KernelParams)]) -> Vec<Vec<Survivor>> {
         let stats = &self.stats;
         stats.batches.fetch_add(1, Ordering::Relaxed);
         let n_queries = batch.len();
         let mut t = Instant::now();
 
-        // each spectrum's peaks once: its hypotheses come one after another
+        // each spectrum's peaks and table once: its hypotheses come one after another
         let mut peaks: Vec<[f32; 2]> = Vec::new();
+        let mut spectra: Vec<GpuSpectrum> = Vec::new();
         let mut queries = Vec::with_capacity(n_queries);
-        let mut last: Option<(*const ProcessedSpectrum, usize)> = None;
+        let mut last: Option<*const ProcessedSpectrum> = None;
+        let mut table_len = 0usize;
         for (spectrum, params) in batch {
             let here: *const ProcessedSpectrum = *spectrum;
-            let offset = match last {
-                Some((previous, offset)) if previous == here => offset,
-                _ => {
-                    let offset = peaks.len();
-                    peaks.extend(spectrum.masses.iter().zip(&spectrum.intensities).map(|(&m, &i)| [m, i]));
-                    last = Some((here, offset));
-                    offset
-                }
-            };
-            queries.push(GpuQuery::new(offset, spectrum.masses.len(), params));
+            if last != Some(here) {
+                let s = GpuSpectrum::new(&spectrum.masses, peaks.len(), table_len);
+                table_len += s.n_bins as usize;
+                peaks.extend(spectrum.masses.iter().zip(&spectrum.intensities).map(|(&m, &i)| [m, i]));
+                spectra.push(s);
+                last = Some(here);
+            }
+            queries.push(GpuQuery::new(spectra.last().expect("a spectrum"), params));
         }
         let st = wgpu::BufferUsages::STORAGE;
         let queries = make_buffer(&self.device, "queries", bytes_of(&queries), st);
         let peaks = make_buffer(&self.device, "peaks", bytes_of(&peaks), st);
-        let uniforms = self.uniforms(n_queries, work.capacity);
+        let tables = PeakTables {
+            table: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("peak tables"),
+                size: (table_len.max(1) * 4) as u64,
+                usage: st,
+                mapped_at_creation: false,
+            }),
+            spectra: make_buffer(&self.device, "spectra", bytes_of(&spectra), st),
+            count: spectra.len() as u32,
+            most_bins: spectra.iter().map(|s| s.n_bins).max().unwrap_or(1),
+        };
+        let uniforms = self.uniforms(n_queries, spectra.len(), work.capacity);
         t = Stats::add(&stats.setup, t);
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.encode_scoring(&mut encoder, work, &uniforms, &queries, &peaks, n_queries);
+        self.encode_scoring(&mut encoder, work, &uniforms, &queries, &peaks, &tables, n_queries);
         self.encode_compact(&mut encoder, work, &uniforms, n_queries);
         self.queue.submit(Some(encoder.finish()));
         let mut found = self.read_counter(work);
@@ -861,10 +966,10 @@ impl GpuKernel {
                     out.extend(self.run_batch(work, b));
                     return out;
                 }
-                return vec![self.read_scores(work, &batch[0].1)];
+                return vec![self.read_scores(work)];
             }
             Self::resize(&self.device, work, found.next_power_of_two().min(self.max_entries));
-            let uniforms = self.uniforms(n_queries, work.capacity);
+            let uniforms = self.uniforms(n_queries, spectra.len(), work.capacity);
             let mut encoder = self.device.create_command_encoder(&Default::default());
             self.encode_compact(&mut encoder, work, &uniforms, n_queries);
             self.queue.submit(Some(encoder.finish()));
@@ -903,18 +1008,25 @@ impl GpuKernel {
             }
             work.read_entries.unmap();
         }
-        let out = per_query
+        Stats::add(&stats.ranking, t);
+        per_query
+    }
+
+    /// The best `max_survivors` of each query's survivors, in peptide order
+    fn rank(&self, survivors: Vec<Vec<Survivor>>, batch: &[(&ProcessedSpectrum, KernelParams)]) -> Vec<Vec<Survivor>> {
+        let t = Instant::now();
+        let out = survivors
             .into_par_iter()
             .zip(batch.par_iter())
             .map(|(survivors, (_, params))| top_survivors(survivors, params.max_survivors))
             .collect();
-        Stats::add(&stats.ranking, t);
+        Stats::add(&self.stats.ranking, t);
         out
     }
 
     /// The survivors of a lone query with more than `max_entries`: every
     /// peptide's score copied back, chunk by chunk
-    fn read_scores(&self, work: &Work, params: &KernelParams) -> Vec<Survivor> {
+    fn read_scores(&self, work: &Work) -> Vec<Survivor> {
         let t = Instant::now();
         let mut all = Vec::new();
         for (chunk, scores) in self.chunks.iter().zip(&work.scores) {
@@ -946,9 +1058,8 @@ impl GpuKernel {
             }
             read.unmap();
         }
-        let best = top_survivors(all, params.max_survivors);
         Stats::add(&self.stats.device, t);
-        best
+        all
     }
 }
 
@@ -1052,10 +1163,20 @@ impl ChainKernel for GpuKernel {
         let mut work = self.work.lock().unwrap_or_else(|e| e.into_inner());
         Stats::add(&self.stats.queued, asked);
         self.stats.queries.fetch_add(queries.len() as u64, Ordering::Relaxed);
+        let work = &mut *work;
+        // the CPU ranks a batch's survivors while the device works on the next
         let mut out = Vec::with_capacity(queries.len());
+        let mut pending: Option<(Vec<Vec<Survivor>>, &[(&ProcessedSpectrum, KernelParams)])> = None;
         for batch in queries.chunks(self.max_batch) {
-            out.extend(self.run_batch(&mut work, batch));
+            let previous = pending.take();
+            let (survivors, ranked) = rayon::join(
+                || self.run_batch(work, batch),
+                || previous.map(|(survivors, batch)| self.rank(survivors, batch)),
+            );
+            out.extend(ranked.into_iter().flatten());
+            pending = Some((survivors, batch));
         }
+        out.extend(pending.map(|(survivors, batch)| self.rank(survivors, batch)).into_iter().flatten());
         out
     }
 

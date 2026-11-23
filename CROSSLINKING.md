@@ -476,14 +476,18 @@ batch (up to 2,048 queries; fewer for large databases, whose scores take more
 device memory). The GPU also keeps only each query's best peptides: a histogram
 of its scores finds the score of its `chain_survivors`-th best, and only the
 peptides at about that score or better are copied back, where the CPU keeps
-exactly the `chain_survivors` best. While the GPU works on a batch, the CPU
-pairs and rescores the batch before. Measured on an NVIDIA RTX 3080 Ti
-(DirectX 12), crosslink search step only:
+exactly the `chain_survivors` best. Each fragment window is looked up in the
+spectrum's peaks from a table of where each half dalton's peaks begin, instead
+of a binary search over all of them; the window's exact edges still decide
+which peaks count, so the scores are the same. While the GPU works on a batch,
+the CPU ranks the batch before's survivors and pairs and rescores the spectra
+before. Measured on an NVIDIA RTX 3080 Ti (DirectX 12), crosslink search step
+only:
 
 | search | `cpu` | `reflect` (16 CPU threads) | `gpu`, one spectrum at a time (v1.9.7) | `gpu` |
 |---|---|---|---|---|
 | Cas9 library, 36,563 spectra, 3,222 peptides | 10.5 s | 8.1 s | 18.1 s | 0.25 s |
-| Cas9 library, 36,563 spectra, 24,038 peptides | 9.1 s | 49.4 s | 20.2 s | 1.2 s |
+| Cas9 library, 36,563 spectra, 24,038 peptides | 9.1 s | 49.4 s | 20.2 s | 0.92 s |
 | one Pol II timsTOF run, 71,747 spectra, 147,104 peptides | 3.9 s | - | 1 min 13 s | 10.6 s |
 
 (DSSO data searched as a non-cleavable linker of DSSO's mass.) Every output file
@@ -508,21 +512,26 @@ RTX 3080 Ti; target CSMs at 1% FDR, the false ones in brackets:
 | human proteins added | peptides | `cpu` | `gpu` | `cpu` CSMs (false) | `gpu` CSMs (false) |
 |---|---|---|---|---|---|
 | none | 3,222 | 10.5 s | 0.25 s | 38 (0) | 38 (0) |
-| 1,000 | 393,059 | 12.9 s | 19.4 s | 33 (0) | 44 (6) |
-| 2,500 | 962,137 | 18.6 s | 49.0 s | 31 (0) | 33 (1) |
-| 5,000 | 1,948,125 | 32.0 s | 1 min 41 s | 27 (0) | 36 (0) |
-| 10,000 | 3,722,348 | 1 min 10 s | 3 min 10 s | 26 (0) | 31 (0) |
-| 20,000 | 7,295,838 | 2 min 33 s | 6 min 26 s | 23 (0) | 37 (2) |
+| 1,000 | 393,059 | 12.9 s | 15.2 s | 33 (0) | 44 (6) |
+| 2,500 | 962,137 | 18.6 s | 37.1 s | 31 (0) | 33 (1) |
+| 5,000 | 1,948,125 | 32.0 s | 1 min 11 s | 27 (0) | 36 (0) |
+| 10,000 | 3,722,348 | 1 min 10 s | 2 min 08 s | 26 (0) | 31 (0) |
+| 20,000 | 7,295,838 | 2 min 33 s | 4 min 15 s | 23 (0) | 37 (2) |
 
-* **Time.** Both grow with peptides x spectra. The GPU took about 52 s per
-  million peptides here and the `cpu` backend about 21 s, so `cpu` was the
-  faster from about 250,000 peptides (some 600 proteins with these digest
-  settings), and `auto` takes `cpu` above that. The GPU scores every ion of
-  every peptide against every spectrum; `cpu` looks up only the fragments that
-  match a peak. As a guide, 2 million spectra (39 HEK293 runs) against a whole
-  human proteome would take about 2.4 h with `cpu` and 6 h with `gpu` on this
-  computer, more with more link residues, precursor charges or a wider
-  precursor tolerance; `linear_proteins` narrows the database first.
+* **Time.** Both grow with peptides x spectra. The GPU took about 35 s per
+  million peptides here (52 s before its peak table) and the `cpu` backend
+  about 21 s, so `cpu` was the faster from about 300,000 peptides (some 700
+  proteins with these digest settings); `auto` takes `cpu` above 250,000, as
+  the `cpu` backend's FDR also held better on large databases (below). The
+  GPU scores every ion of every peptide against every spectrum; `cpu` looks up
+  only the fragments that match a peak. As a guide, 2 million spectra (39
+  HEK293 runs) against a whole human proteome would take about 2.4 h with
+  `cpu` and 4 h with `gpu` on this computer, more with more link residues,
+  precursor charges or a wider precursor tolerance; `linear_proteins` narrows
+  the database first.
+* **More GPU memory does not help.** The batches' scores take at most 256 MB
+  of GPU memory; 2 GB (batches eight times larger) changed the time by 2%,
+  with the GPU 84-91% busy either way: its arithmetic is the limit.
 * **Memory** was not the limit: at 20,000 proteins 5.3 GB of RAM (`cpu`), 7.2 GB
   of RAM and 2 GB of GPU memory (`gpu`). A 2 GB card would be nearly full.
 * **FDR.** `cpu` let no false match through at 1% at any size (0 of 140), and
@@ -590,14 +599,20 @@ gpu chain filter on NVIDIA GeForce RTX 3080 Ti: 36563 queries (spectra x precurs
 The GPU kernel is tested against the CPU reference on every adapter of the machine
 (hardware and software). Run this on the machine with the GPU; it prints each
 adapter and fails if any survivor differs (peptide set, link site, matched ions, or
-score beyond 1e-3), including for peaks placed exactly on tolerance-window edges.
-It also checks that batches of many queries keep exactly the survivors each query
-gets on its own, in small batches, with a copy-back buffer that has to grow, and
-with batches that have to be halved:
+score beyond 1e-3), including for peaks placed exactly on tolerance-window edges
+and on the edges of the GPU's peak-table bins (every half dalton, and one float
+step to either side). It also checks that batches of many queries keep exactly
+the survivors each query gets on its own, in small batches, with a copy-back
+buffer that has to grow, and with batches that have to be halved:
 
 ```
 cargo test -p sage-core --features gpu gpu_ -- --nocapture
 ```
+
+`XNOVA_TEST_GPU=<part of a name>` tests only the adapters so named (for
+example `XNOVA_TEST_GPU="RTX 5000"`). The GPU tests take turns: on Windows, a
+hardware GPU and the software renderer (WARP) busy at once in one process
+crashed the test process now and then, in the drivers; a search uses one GPU.
 
 Window edges are computed so that every device rounds them identically: charges
 enter as reciprocals rounded once on the CPU (GPU division is not correctly

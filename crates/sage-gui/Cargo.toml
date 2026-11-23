@@ -46,9 +46,12 @@ windows = { version = "0.58", features = [
     "Win32_Globalization",
     "Win32_Graphics_Dxgi",
     "Win32_Security",
+    # XNova's own processes for the usage meters (process snapshot, working sets)
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Performance",
+    "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

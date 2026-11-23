@@ -2419,9 +2419,9 @@ fn neutral_candidates(query: &ProcessedSpectrum, max_charge: u8) -> Vec<f32> {
 ///
 /// The GPU scores every peptide against every spectrum, so its time grows
 /// with the database: on the Cas9 library with human entrapment proteins
-/// (RTX 3080 Ti, 16 CPU threads) it took 52 s per million peptides against the
-/// `cpu` backend's 21 s, and the `cpu` backend was faster from about 250,000
-/// peptides (some 600 proteins). Larger databases also made the GPU's 1% lists
+/// (RTX 3080 Ti, 16 CPU threads) it took 35 s per million peptides against the
+/// `cpu` backend's 21 s, and the `cpu` backend was faster from about 300,000
+/// peptides (some 700 proteins). Larger databases also made the GPU's 1% lists
 /// less reliable: it proposes many more random candidates, and 9 of the 181
 /// matches it accepted at 1% were false, against none of the `cpu` backend's
 /// 140 (see CROSSLINKING.md, "Choosing a backend").
@@ -4722,13 +4722,29 @@ mod test {
         assert!(!auto_takes_gpu(AUTO_GPU_MAX_PEPTIDES + 1) && !auto_takes_gpu(7_295_838));
     }
 
+    /// One GPU test at a time. Windows' software renderer (WARP) and a
+    /// hardware GPU busy at once in one process crashed the test process now
+    /// and then (6 of 40 runs, a segmentation fault in the drivers); either on
+    /// its own never did (0 of 40 each, four tests at once). A search opens
+    /// one GPU, so only the tests, which open every adapter, take turns.
+    fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The GPU kernel on every adapter of this machine (hardware and software,
-    /// each driver API), or none when there is no GPU support
+    /// each driver API), or none when there is no GPU support.
+    /// `XNOVA_TEST_GPU=<part of a name>` keeps the adapters so named
     #[cfg(feature = "gpu")]
     fn gpu_kernels(db: &IndexedDatabase, cfg: &CrosslinkSettings) -> Vec<crate::crosslink_gpu::GpuKernel> {
         use crate::crosslink_kernel::{ChainKernel, IonTable};
+        let only = std::env::var("XNOVA_TEST_GPU").ok().map(|s| s.to_lowercase());
         crate::crosslink_gpu::GpuKernel::on_every_adapter(|| IonTable::build(db, |p| cfg.link_sites(p)))
             .into_iter()
+            .filter(|k| match (k, &only) {
+                (Ok(k), Some(only)) => k.adapter_name().to_lowercase().contains(only),
+                _ => true,
+            })
             .filter_map(|k| match k {
                 Ok(k) => {
                     eprintln!("GPU kernel on: {}", k.name());
@@ -4764,6 +4780,7 @@ mod test {
     #[test]
     fn gpu_kernel_matches_cpu_reference() {
         use crate::crosslink_kernel::{ChainKernel, KernelParams};
+        let _gpu = gpu_turn();
         let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
         let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
         let c = peptide("AKCDKEFRQLMNR", "PROT_C", Position::Internal);
@@ -4811,6 +4828,7 @@ mod test {
     #[test]
     fn gpu_kernel_agrees_on_window_edges() {
         use crate::crosslink_kernel::{ChainKernel, IonTable, KernelParams};
+        let _gpu = gpu_turn();
         let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
         let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
         let mut targets = distractors(200);
@@ -4868,6 +4886,58 @@ mod test {
         }
     }
 
+    /// Peaks on the GPU's peak-table bin edges (every half dalton) and one
+    /// float step to either side count exactly as the CPU's binary search
+    /// counts them: the table only says where to start looking
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_kernel_agrees_on_peak_table_edges() {
+        use crate::crosslink_kernel::{ChainKernel, KernelParams};
+        let _gpu = gpu_turn();
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let mut targets = distractors(200);
+        targets.push(a.clone());
+        targets.push(b.clone());
+        let db = database(targets);
+        let cfg = CrosslinkSettings::default();
+        let cpu = kernel_for(&db, &cfg);
+        let gpus = gpu_kernels(&db, &cfg);
+        if gpus.is_empty() {
+            eprintln!("skipping GPU peak-table test: no adapter");
+            return;
+        }
+        let mut masses = Vec::new();
+        for k in 200..5000u32 {
+            let edge = k as f32 / 2.0;
+            masses.extend([f32::from_bits(edge.to_bits() - 1), edge, f32::from_bits(edge.to_bits() + 1)]);
+        }
+        let q = ProcessedSpectrum {
+            level: 2,
+            id: "bin edges".into(),
+            intensities: (0..masses.len()).map(|i| 10.0 + (i % 13) as f32).collect(),
+            charges: vec![1; masses.len()],
+            masses,
+            ..Default::default()
+        };
+        for tol in [Tolerance::Ppm(-10.0, 10.0), Tolerance::Da(-0.5, 0.5), Tolerance::Da(0.0, 0.0)] {
+            let params = KernelParams {
+                precursor_mass: a.monoisotopic + b.monoisotopic + DSS,
+                max_fragment_charge: 3,
+                fragment_tol: tol.into(),
+                slack: 0.0,
+                min_matched: 1,
+                max_survivors: usize::MAX,
+            };
+            let want = cpu.survivors(&q, &params);
+            // (a zero-width window catches only peaks equal to an ion)
+            assert!(!want.is_empty(), "{tol:?}: no survivors");
+            for gpu in &gpus {
+                assert_same_survivors(&want, &gpu.survivors(&q, &params), &format!("{}, {tol:?}", gpu.name()));
+            }
+        }
+    }
+
     /// A batch of many queries gives each query the survivors it gets on its
     /// own, through every path a large search takes: several batches, the
     /// copy-back buffer growing, a batch halved, a lone query read whole. The
@@ -4877,6 +4947,7 @@ mod test {
     #[test]
     fn gpu_batches_keep_every_survivor() {
         use crate::crosslink_kernel::{top_survivors, ChainKernel, KernelParams, Survivor};
+        let _gpu = gpu_turn();
         let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
         let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
         let c = peptide("AKCDKEFRQLMNR", "PROT_C", Position::Internal);
@@ -4947,6 +5018,7 @@ mod test {
     #[test]
     fn score_many_finds_what_score_finds() {
         use crate::crosslink_kernel::ChainKernel;
+        let _gpu = gpu_turn();
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (db, a, b) = pair_fixture();
         let sc = Scorer { report_psms: 3, min_isotope_err: -1, max_isotope_err: 1, ..scorer(&db) };
