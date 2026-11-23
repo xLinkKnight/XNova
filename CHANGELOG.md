@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.8] - 2026-11-23
 
 ### Added
 - Choosing the GPU of non-cleavable crosslink searches (`gpu` / `auto` backends) on a computer with more than one: `sage --gpu "RTX 5000"` (a name as `--gpu-info` lists it, part of one, or `#n`), and in sage-gui Files > Resources > GPU to search on, kept with sage-gui's settings (not the search's) and passed as `--gpu`. Without it, the driver's choice; the log then names the GPU used and lists the others. A name the computer lacks is an error with `gpu` and a warning with `auto`.
