@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.9] - 2026-11-23
 
 ### Changed
 - The `gpu` crosslink backend is about a third faster on large databases, with identical results. Each fragment window is looked up in the spectrum's peaks from a table of where each half dalton's peaks begin (built on the GPU for each spectrum of a batch) instead of a binary search over all of them; the window's exact edges still decide which peaks count, and a bin never decreases as the mass grows, so the first peak found is the binary search's. The CPU also ranks a batch's survivors while the GPU works on the next. Crosslink search step on an RTX 3080 Ti, Cas9 library with human entrapment proteins: 19.4 s to 15.2 s (393,059 peptides), 1 min 41 s to 1 min 11 s (1.9 million), 6 min 26 s to 4 min 15 s (7.3 million); 1.2 s to 0.92 s against 24,038 peptides; the Pol II timsTOF run unchanged (10.6 s). Every output file was identical to the previous searches'. The `cpu` backend is still the faster for a whole proteome (2 min 33 s at 7.3 million peptides), so `auto` keeps its 250,000-peptide limit.
