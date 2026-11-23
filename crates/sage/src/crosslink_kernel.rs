@@ -206,6 +206,19 @@ pub struct Survivor {
 pub trait ChainKernel: Send + Sync {
     fn name(&self) -> &str;
     fn survivors(&self, query: &ProcessedSpectrum, params: &KernelParams) -> Vec<Survivor>;
+
+    /// `survivors` of many queries (a spectrum and a precursor hypothesis
+    /// each), in their order: the same survivors as one call each
+    fn survivors_many(&self, queries: &[(&ProcessedSpectrum, KernelParams)]) -> Vec<Vec<Survivor>> {
+        queries.iter().map(|(query, params)| self.survivors(query, params)).collect()
+    }
+
+    /// Whether `survivors_many` beats one `survivors` call per query (a
+    /// device's round trip costs more than its work), so that the search
+    /// gathers the queries of many spectra first
+    fn batches(&self) -> bool {
+        false
+    }
 }
 
 /// Apply the `max_survivors` limit and put the result in peptide order

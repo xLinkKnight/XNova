@@ -212,6 +212,10 @@ struct SageGui {
     mimalloc: bool,
     /// sage.exe's detail messages in the log too (`SAGE_LOG`)
     verbose_log: bool,
+    /// The GPU of non-cleavable crosslink searches (`--gpu`): a name as
+    /// `sage.exe --gpu-info` lists it, `#n` for one of identical cards, or
+    /// empty for the driver's choice
+    gpu_device: String,
     /// What stands before each log line
     log_time: logview::TimeShown,
     /// The running search, watched for the log's notes
@@ -246,6 +250,28 @@ fn state_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("sage-gui").join("state.json"))
 }
 
+/// The GPU menu's first entry: no `--gpu`
+const AUTO_GPU: &str = "Automatic (the graphics driver's fastest)";
+
+/// The GPUs to choose from, as `(--gpu value, label)`: each hardware adapter
+/// `sage.exe --gpu-info` lists (`name | backend | type`), by its name, or by
+/// `#n` (its place in the list) when identical cards share the name
+fn gpu_choices(adapters: &[String]) -> Vec<(String, String)> {
+    let name = |a: &String| a.split(" | ").next().unwrap_or(a).to_string();
+    let hardware: Vec<(usize, String)> =
+        adapters.iter().enumerate().filter(|(_, a)| !a.ends_with("| Cpu")).map(|(i, a)| (i, name(a))).collect();
+    hardware
+        .iter()
+        .map(|(i, n)| {
+            if hardware.iter().filter(|(_, m)| m == n).count() > 1 {
+                (format!("#{}", i + 1), format!("{n} (#{})", i + 1))
+            } else {
+                (n.clone(), n.clone())
+            }
+        })
+        .collect()
+}
+
 /// Log detail from the saved state: verbose unless chosen otherwise. v1.9.4
 /// saved "log_detail" whether it was chosen or not, so its "normal" is not
 /// read as a choice.
@@ -257,6 +283,31 @@ fn verbose_log(state: &serde_json::Value) -> bool {
 mod state_test {
     use super::verbose_log;
     use serde_json::json;
+
+    #[test]
+    fn gpus_are_offered_by_name_or_number() {
+        let listed: Vec<String> = [
+            "NVIDIA T400 | Dx12 | DiscreteGpu",
+            "NVIDIA RTX 5000 Ada Generation | Dx12 | DiscreteGpu",
+            "Microsoft Basic Render Driver | Dx12 | Cpu",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let choices = super::gpu_choices(&listed);
+        assert_eq!(
+            choices,
+            [
+                ("NVIDIA T400".to_string(), "NVIDIA T400".to_string()),
+                ("NVIDIA RTX 5000 Ada Generation".to_string(), "NVIDIA RTX 5000 Ada Generation".to_string()),
+            ],
+            "the software adapter is not offered"
+        );
+        // two identical cards: by their place in --gpu-info's list
+        let twins: Vec<String> = vec!["NVIDIA RTX A4000 | Dx12 | DiscreteGpu".into(), "NVIDIA RTX A4000 | Dx12 | DiscreteGpu".into()];
+        let values: Vec<String> = super::gpu_choices(&twins).into_iter().map(|(v, _)| v).collect();
+        assert_eq!(values, ["#1", "#2"]);
+    }
 
     #[test]
     fn the_log_is_verbose_unless_normal_was_chosen() {
@@ -294,6 +345,7 @@ impl SageGui {
             max_ram_gb: 0.0,
             mimalloc: true,
             verbose_log: true,
+            gpu_device: String::new(),
             log_time: Default::default(),
             watch: Default::default(),
             gpus: system::gpus(),
@@ -327,6 +379,7 @@ impl SageGui {
             app.max_ram_gb = state.get("max_ram_gb").and_then(|v| v.as_f64()).unwrap_or(0.0).max(0.0);
             app.mimalloc = state.get("allocator").and_then(|v| v.as_str()) != Some("system");
             app.verbose_log = verbose_log(&state);
+            app.gpu_device = text("gpu_device");
             app.log_time = logview::TimeShown::from_key(state.get("log_time").and_then(|v| v.as_str()).unwrap_or(""));
             if let Some(Ok(s)) = state.get("config").map(Settings::from_json) {
                 app.s = s;
@@ -362,6 +415,7 @@ impl SageGui {
             "max_ram_gb": self.max_ram_gb,
             "allocator": if self.mimalloc { "mimalloc" } else { "system" },
             "log_level": if self.verbose_log { "verbose" } else { "normal" },
+            "gpu_device": self.gpu_device,
             "log_time": self.log_time.key(),
             "config": self.s.to_json(&self.s.spectra),
         });
@@ -654,6 +708,11 @@ impl SageGui {
             args.push("--disable-telemetry-i-dont-want-to-improve-sage".into());
         }
         // sage.exe stops itself at the limit, with a message (Windows' cap stays as a backstop)
+        // the GPU of a non-cleavable crosslink search, if one was chosen
+        if self.s.crosslink.enabled && !self.gpu_device.is_empty() {
+            args.push("--gpu".into());
+            args.push(self.gpu_device.clone().into());
+        }
         if self.max_ram_gb > 0.0 {
             args.push("--max-memory".into());
             args.push(format!("{:.2}", self.max_ram_gb).into());
@@ -2080,6 +2139,35 @@ impl SageGui {
                 }
                 r | again
             });
+            row(ui, "GPU to search on", "The GPU of the gpu / auto backend of non-cleavable crosslink searches (Crosslinking tab), \
+                for a computer with more than one. Automatic: the one the graphics driver ranks fastest, which need \
+                not be the fastest card (with a small display card next to a large one, it may be the small one); the \
+                log names the GPU used. The choice belongs to this computer, not to the search settings: sage-gui \
+                keeps it and passes it to sage.exe as --gpu.", |ui| {
+                let listed = match &self.gpu_support {
+                    Some(system::GpuSupport::Yes(adapters)) => gpu_choices(adapters),
+                    _ => Vec::new(),
+                };
+                let shown = if self.gpu_device.is_empty() {
+                    AUTO_GPU.to_string()
+                } else {
+                    listed
+                        .iter()
+                        .find(|(value, _)| *value == self.gpu_device)
+                        .map(|(_, label)| label.clone())
+                        .unwrap_or_else(|| format!("{} (not found on this computer)", self.gpu_device))
+                };
+                ComboBox::from_id_salt("gpu_device")
+                    .selected_text(shown)
+                    .width(340.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.gpu_device, String::new(), AUTO_GPU);
+                        for (value, label) in listed {
+                            ui.selectable_value(&mut self.gpu_device, value, label);
+                        }
+                    })
+                    .response
+            });
         });
     }
 }
@@ -3357,10 +3445,10 @@ fn crosslink_tab(ui: &mut Ui, s: &mut Settings, lib: &mut library::Library, ed: 
         }
         grid(ui, "xl_backend", |ui| {
             row(ui, "Backend", "How non-cleavable crosslinks are searched:\n\
-                • cpu (default): seed search + partner lookup; validated, fine for complexes and small databases\n\
+                • cpu (default): seed search + partner lookup; validated, and the faster for whole proteomes (above about 250,000 peptides, some 600 proteins)\n\
                 • reflect: chain reflection on the CPU; reference for the GPU, slow\n\
-                • gpu: chain reflection on the graphics card, for proteome-scale searches (needs a sage.exe with GPU support, the default)\n\
-                • auto: gpu when a real GPU is available, otherwise cpu",
+                • gpu: chain reflection on the graphics card, in batches of spectra; 10-40x faster than cpu for complexes and small databases (needs a sage.exe with GPU support, the default)\n\
+                • auto: gpu for databases up to 250,000 peptides when a real GPU is available, otherwise cpu",
                 |ui| {
                     ComboBox::from_id_salt("backend")
                         .selected_text(xl.backend.key())
@@ -4053,6 +4141,46 @@ mod screenshots {
         let mut harness = library_harness(state.clone(), true);
         harness.run();
         let path = out.join("library_crosslinking_edit.png");
+        harness.render().expect("render").save(&path).unwrap();
+        println!("{}", path.display());
+    }
+
+    /// Files > Resources on a computer with two GPUs (an NVIDIA T400 and an RTX
+    /// 5000 Ada), the GPU menu open (`gpu_menu.png` in `SAGE_GUI_FIGURES`)
+    #[test]
+    #[ignore]
+    fn gpu_menu_preview() {
+        use egui_kittest::kittest::Queryable;
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut app: Option<SageGui> = None;
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1300.0, 900.0)).build_ui(move |ui| {
+            // fonts take effect on the frame after they are set
+            if !installed {
+                theme::install(ui.ctx(), false);
+                installed = true;
+                return;
+            }
+            let app = app.get_or_insert_with(|| {
+                let mut a = SageGui::new(ui.ctx());
+                a.probed_sage = a.sage_exe.clone();
+                a.gpu_probe = None;
+                a.gpu_device = String::new();
+                a.gpu_support = Some(system::GpuSupport::Yes(vec![
+                    "NVIDIA T400 | Dx12 | DiscreteGpu".into(),
+                    "NVIDIA RTX 5000 Ada Generation | Dx12 | DiscreteGpu".into(),
+                    "Microsoft Basic Render Driver | Dx12 | Cpu".into(),
+                ]));
+                a
+            });
+            app.resources(ui);
+        });
+        harness.run();
+        harness.get_all_by_role(egui::accesskit::Role::ComboBox).last().expect("the GPU menu").click();
+        harness.run();
+        harness.run_steps(10);
+        let path = out.join("gpu_menu.png");
         harness.render().expect("render").save(&path).unwrap();
         println!("{}", path.display());
     }

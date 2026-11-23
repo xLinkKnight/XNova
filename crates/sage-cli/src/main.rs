@@ -133,6 +133,15 @@ fn main() -> anyhow::Result<()> {
                 .help("Report whether this build can use a GPU, list the adapters it sees, and exit"),
         )
         .arg(
+            Arg::new("gpu")
+                .long("gpu")
+                .help(
+                    "The GPU of the gpu / auto crosslink backends: its name as --gpu-info lists it, part of it \
+                     (\"RTX 5000\"), or #N for the N-th it lists. Default: the one the driver ranks fastest",
+                )
+                .value_hint(ValueHint::Other),
+        )
+        .arg(
             Arg::new("max-memory")
                 .long("max-memory")
                 .value_parser(value_parser!(f64))
@@ -216,8 +225,13 @@ fn main() -> anyhow::Result<()> {
     let estimate = matches.get_flag("estimate");
     let max_memory = matches.get_one::<f64>("max-memory").copied();
 
+    let gpu = matches.get_one::<String>("gpu").cloned();
     let input = Input::from_arguments(matches)?;
     let mut parameters = input.build()?;
+    // the GPU belongs to the computer, not to the configuration
+    if let (Some(gpu), Some(crosslink)) = (gpu, parameters.crosslink.as_mut()) {
+        crosslink.gpu_device = Some(gpu);
+    }
 
     if estimate {
         return print_estimate(&mut parameters, parallel);

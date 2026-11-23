@@ -35,7 +35,7 @@
 //!   them as an ordinary variable modification (e.g. `K: 156.0786`).
 //! * The score is the joint X!Tandem-style hyperscore over both chains.
 
-use crate::crosslink_kernel::{ChainKernel, KernelParams};
+use crate::crosslink_kernel::{ChainKernel, KernelParams, Survivor};
 use crate::database::PeptideIx;
 use crate::enzyme::Position;
 use crate::ion_series::{IonSeries, Kind};
@@ -44,6 +44,7 @@ use crate::modification::Modifications;
 use crate::peptide::Peptide;
 use crate::scoring::{ScoreType, Scorer};
 use crate::spectrum::{select_most_intense_peak, ProcessedSpectrum};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -459,6 +460,12 @@ pub struct CrosslinkSettings {
     /// labelled residue is still free to react, unlike a modified one
     #[serde(skip)]
     pub labels: Vec<crate::modification::ModId>,
+    /// The GPU of the `gpu` / `auto` backends (sage.exe's `--gpu`, not part of
+    /// the configuration: it belongs to the computer): its name as
+    /// `--gpu-info` lists it, part of it (`RTX 5000`), or `#2` for the second
+    /// listed. `None`: the one the driver ranks fastest.
+    #[serde(skip)]
+    pub gpu_device: Option<String>,
 }
 
 impl Default for CrosslinkSettings {
@@ -487,6 +494,7 @@ impl Default for CrosslinkSettings {
             linear_spectrum_fdr: default_linear_protein_fdr(),
             min_linked_peaks: default_linked_peaks(),
             labels: Vec::new(),
+            gpu_device: None,
         }
     }
 }
@@ -1166,6 +1174,36 @@ struct PairEval {
     tally_b: Tally,
 }
 
+/// Spectra per chain-kernel call of [`CrosslinkScorer::score_many`] (their
+/// hypotheses are the kernel's queries)
+const SPECTRA_PER_KERNEL_CALL: usize = 2048;
+
+/// A precursor hypothesis of the chain-reflection search
+struct Hypothesis {
+    charge: u8,
+    /// the precursor's neutral mass at this charge
+    mass: f32,
+    iso: i8,
+    /// the precursor tolerance's window around `mass` less the isotope error
+    lo: f32,
+    hi: f32,
+    max_fc: u8,
+    params: KernelParams,
+}
+
+/// The precursor's ion mobility on each match
+fn with_ims(query: &ProcessedSpectrum, mut found: Vec<CrosslinkMatch>) -> Vec<CrosslinkMatch> {
+    let ims = query
+        .precursors
+        .first()
+        .and_then(|p| p.inverse_ion_mobility)
+        .unwrap_or_default();
+    for m in &mut found {
+        m.ims = ims;
+    }
+    found
+}
+
 /// Searches spectra for crosslinked peptides. Wraps a linear [`Scorer`] and
 /// reuses its tolerances, charge/isotope settings, ion types and score type.
 pub struct CrosslinkScorer<'a, 'db> {
@@ -1339,16 +1377,78 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
     /// Search one MS2 spectrum. Returns up to `scorer.report_psms` matches,
     /// best first.
     pub fn score(&self, query: &ProcessedSpectrum) -> Vec<CrosslinkMatch> {
-        let mut found = self.score_spectrum(query);
-        let ims = query
-            .precursors
-            .first()
-            .and_then(|p| p.inverse_ion_mobility)
-            .unwrap_or_default();
-        for m in &mut found {
-            m.ims = ims;
+        with_ims(query, self.score_spectrum(query))
+    }
+
+    /// Search many MS2 spectra: what [`Self::score`] finds in each, in their
+    /// order. `done` is called once per spectrum searched.
+    ///
+    /// A device kernel (`gpu`) gets the chain filter of a block of spectra,
+    /// every precursor hypothesis of each, in one call, so that it pays its
+    /// round trip once per batch instead of once per spectrum and hypothesis.
+    /// While it works on a block, the CPU finishes the block before.
+    pub fn score_many(&self, spectra: &[&ProcessedSpectrum], done: &(dyn Fn() + Sync)) -> Vec<Vec<CrosslinkMatch>> {
+        let kernel = match self.kernel {
+            Some(kernel) if kernel.batches() && !self.settings.is_cleavable() => kernel,
+            _ => {
+                return spectra
+                    .par_iter()
+                    .map(|query| {
+                        let found = self.score(query);
+                        done();
+                        found
+                    })
+                    .collect()
+            }
+        };
+        let mut out = Vec::with_capacity(spectra.len());
+        let mut pending: Option<(&[&ProcessedSpectrum], Vec<Option<Vec<Hypothesis>>>, Vec<Vec<Survivor>>)> = None;
+        for block in spectra.chunks(SPECTRA_PER_KERNEL_CALL) {
+            let hypotheses: Vec<Option<Vec<Hypothesis>>> = block.iter().map(|q| self.reflect_hypotheses(q)).collect();
+            let queries: Vec<(&ProcessedSpectrum, KernelParams)> = block
+                .iter()
+                .zip(&hypotheses)
+                .flat_map(|(query, h)| h.iter().flatten().map(move |h| (*query, h.params)))
+                .collect();
+            let previous = pending.take();
+            let (survivors, finished) = rayon::join(
+                || kernel.survivors_many(&queries),
+                || previous.map(|(block, h, s)| self.finish_block(block, h, s, done)),
+            );
+            out.extend(finished.into_iter().flatten());
+            pending = Some((block, hypotheses, survivors));
         }
-        found
+        out.extend(pending.map(|(block, h, s)| self.finish_block(block, h, s, done)).into_iter().flatten());
+        out
+    }
+
+    /// The matches of a block of spectra from their survivors (one list per
+    /// hypothesis, spectrum after spectrum)
+    fn finish_block(
+        &self,
+        block: &[&ProcessedSpectrum],
+        hypotheses: Vec<Option<Vec<Hypothesis>>>,
+        survivors: Vec<Vec<Survivor>>,
+        done: &(dyn Fn() + Sync),
+    ) -> Vec<Vec<CrosslinkMatch>> {
+        let mut survivors = survivors.into_iter();
+        let per_spectrum: Vec<Vec<Vec<Survivor>>> = hypotheses
+            .iter()
+            .map(|h| survivors.by_ref().take(h.as_ref().map_or(0, Vec::len)).collect())
+            .collect();
+        block
+            .par_iter()
+            .zip(hypotheses.par_iter())
+            .zip(per_spectrum.into_par_iter())
+            .map(|((query, hypotheses), survivors)| {
+                let found = match hypotheses {
+                    Some(hypotheses) => with_ims(query, self.reflect_matches(query, hypotheses, survivors)),
+                    None => Vec::new(),
+                };
+                done();
+                found
+            })
+            .collect()
     }
 
     fn score_spectrum(&self, query: &ProcessedSpectrum) -> Vec<CrosslinkMatch> {
@@ -1603,33 +1703,68 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
     /// 4. Loop-links: peptides whose mass plus linker equals the precursor are
     ///    looked up directly, since no partner is involved.
     fn score_reflect(&self, query: &ProcessedSpectrum, kernel: &dyn ChainKernel) -> Vec<CrosslinkMatch> {
-        let sc = self.scorer;
-        let cfg = self.settings;
-        let db = sc.db;
-        let Some(precursor) = query.precursors.first() else {
+        let Some(hypotheses) = self.reflect_hypotheses(query) else {
             return Vec::new();
         };
-        if db.peptides.is_empty() {
-            return Vec::new();
+        let survivors = hypotheses.iter().map(|h| kernel.survivors(query, &h.params)).collect();
+        self.reflect_matches(query, &hypotheses, survivors)
+    }
+
+    /// The precursor hypotheses of a spectrum (charges, then isotope errors)
+    /// and the chain filter's parameters of each; `None` without a precursor
+    /// or peptides
+    fn reflect_hypotheses(&self, query: &ProcessedSpectrum) -> Option<Vec<Hypothesis>> {
+        let sc = self.scorer;
+        let cfg = self.settings;
+        let precursor = query.precursors.first()?;
+        if sc.db.peptides.is_empty() {
+            return None;
         }
-        let linker = cfg.linker_mass();
         let mz = precursor.mz - PROTON;
         let charges: Vec<u8> = match precursor.charge {
             Some(z) if !sc.override_precursor_charge => vec![z],
             _ => (sc.min_precursor_charge..=sc.max_precursor_charge).collect(),
         };
-
-        let mut found: Vec<CrosslinkMatch> = Vec::new();
-        let mut pairs_scored = 0u32;
-        let mut seen: HashSet<(u32, u32)> = HashSet::new();
-
+        let mut out = Vec::new();
         for charge in charges {
             let mass = mz * charge as f32;
             let max_fc = frag_charge_bound(sc.max_fragment_charge, charge);
             for iso in sc.min_isotope_err..=sc.max_isotope_err {
                 let m = mass - iso as f32 * NEUTRON;
                 let (lo, hi) = sc.precursor_tol.bounds(m);
+                let params = KernelParams {
+                    precursor_mass: m,
+                    max_fragment_charge: max_fc,
+                    fragment_tol: sc.fragment_tol.into(),
+                    slack: (m - lo).abs().max((hi - m).abs()),
+                    min_matched: cfg.min_chain_peaks,
+                    max_survivors: cfg.chain_survivors,
+                };
+                out.push(Hypothesis { charge, mass, iso, lo, hi, max_fc, params });
+            }
+        }
+        Some(out)
+    }
 
+    /// The matches of a spectrum from its hypotheses' chain-filter survivors
+    fn reflect_matches(
+        &self,
+        query: &ProcessedSpectrum,
+        hypotheses: &[Hypothesis],
+        survivors: Vec<Vec<Survivor>>,
+    ) -> Vec<CrosslinkMatch> {
+        let sc = self.scorer;
+        let cfg = self.settings;
+        let db = sc.db;
+        let linker = cfg.linker_mass();
+
+        let mut found: Vec<CrosslinkMatch> = Vec::new();
+        let mut pairs_scored = 0u32;
+        let mut seen: HashSet<(u32, u32)> = HashSet::new();
+
+        for (h, survivors) in hypotheses.iter().zip(survivors) {
+            let &Hypothesis { charge, mass, iso, lo, hi, max_fc, .. } = h;
+            {
                 // ---- loop-links: one peptide + linker explains the precursor
                 if cfg.loop_links && !db.two_databases() {
                     let start = db.peptides.partition_point(|p| p.monoisotopic < lo - linker);
@@ -1673,16 +1808,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                     }
                 }
 
-                // ---- inter-peptide links: chain filter, then join on mass
-                let params = KernelParams {
-                    precursor_mass: m,
-                    max_fragment_charge: max_fc,
-                    fragment_tol: sc.fragment_tol.into(),
-                    slack: (m - lo).abs().max((hi - m).abs()),
-                    min_matched: cfg.min_chain_peaks,
-                    max_survivors: cfg.chain_survivors,
-                };
-                let survivors = kernel.survivors(query, &params);
+                // ---- inter-peptide links: the chain filter's survivors joined on mass
                 let masses = survivors
                     .iter()
                     .map(|s| db.peptides[s.peptide as usize].monoisotopic)
@@ -2289,10 +2415,28 @@ fn neutral_candidates(query: &ProcessedSpectrum, max_charge: u8) -> Vec<f32> {
     out
 }
 
+/// Most peptides (targets and decoys) the `auto` backend searches on a GPU.
+///
+/// The GPU scores every peptide against every spectrum, so its time grows
+/// with the database: on the Cas9 library with human entrapment proteins
+/// (RTX 3080 Ti, 16 CPU threads) it took 52 s per million peptides against the
+/// `cpu` backend's 21 s, and the `cpu` backend was faster from about 250,000
+/// peptides (some 600 proteins). Larger databases also made the GPU's 1% lists
+/// less reliable: it proposes many more random candidates, and 9 of the 181
+/// matches it accepted at 1% were false, against none of the `cpu` backend's
+/// 140 (see CROSSLINKING.md, "Choosing a backend").
+pub const AUTO_GPU_MAX_PEPTIDES: usize = 250_000;
+
+/// Whether the `auto` backend takes the GPU for a database of `peptides`
+pub fn auto_takes_gpu(peptides: usize) -> bool {
+    peptides <= AUTO_GPU_MAX_PEPTIDES
+}
+
 /// Build the chain kernel for the configured backend.
 ///
 /// `Ok(None)` means "use the seed/partner algorithm" (the `cpu` backend, any
-/// MS-cleavable reagent, or `auto` without a usable GPU).
+/// MS-cleavable reagent, `auto` with a database too large for the GPU to be
+/// the faster, or `auto` without a usable GPU).
 pub fn make_kernel(
     settings: &CrosslinkSettings,
     db: &crate::database::IndexedDatabase,
@@ -2318,11 +2462,36 @@ pub fn make_kernel(
         }
         Backend::Gpu | Backend::Auto => {
             let explicit = settings.backend == Backend::Gpu;
+            let peptides = db.peptides.len();
+            if !auto_takes_gpu(peptides) {
+                if !explicit {
+                    log::info!(
+                        "crosslink backend auto: {peptides} peptides, more than the {AUTO_GPU_MAX_PEPTIDES} up to \
+                         which the GPU is the faster; using the cpu backend (set \"backend\": \"gpu\" to search on \
+                         the GPU anyway)"
+                    );
+                    return Ok(None);
+                }
+                log::info!(
+                    "crosslink backend gpu: {peptides} peptides; above {AUTO_GPU_MAX_PEPTIDES} the cpu backend \
+                     was the faster in our tests, and its 1% FDR lists the more reliable (CROSSLINKING.md, \
+                     Choosing a backend)"
+                );
+            }
             #[cfg(feature = "gpu")]
             {
-                match crate::crosslink_gpu::GpuKernel::new(table(), explicit) {
+                let device = settings.gpu_device.as_deref();
+                match crate::crosslink_gpu::GpuKernel::new(table(), explicit, device) {
                     Ok(k) => return Ok(Some(Box::new(k))),
                     Err(e) if explicit => return Err(format!("crosslink backend `gpu`: {e}")),
+                    // `auto` with a GPU this computer lacks: its best GPU instead
+                    Err(e) if device.is_some() => {
+                        log::warn!("{e}; the auto backend takes the GPU the driver ranks fastest");
+                        match crate::crosslink_gpu::GpuKernel::new(table(), false, None) {
+                            Ok(k) => return Ok(Some(Box::new(k))),
+                            Err(e) => log::info!("no usable GPU ({e}); using the cpu backend"),
+                        }
+                    }
                     Err(e) => log::info!("no usable GPU ({e}); using the cpu backend"),
                 }
             }
@@ -4548,6 +4717,9 @@ mod test {
         #[cfg(not(feature = "gpu"))]
         assert!(make_kernel(&cfg(r#"{"backend":"gpu"}"#), &db).err().unwrap().contains("--features gpu"));
         assert!(serde_json::from_str::<CrosslinkSettings>(r#"{"backend":"cuda"}"#).is_err());
+        // `auto` leaves large databases to the cpu backend
+        assert!(auto_takes_gpu(db.peptides.len()) && auto_takes_gpu(AUTO_GPU_MAX_PEPTIDES));
+        assert!(!auto_takes_gpu(AUTO_GPU_MAX_PEPTIDES + 1) && !auto_takes_gpu(7_295_838));
     }
 
     /// The GPU kernel on every adapter of this machine (hardware and software,
@@ -4693,6 +4865,125 @@ mod test {
                     assert_same_survivors(&want, &gpu.survivors(&q, &params), &format!("{}, {tol:?}, slack {slack}", gpu.name()));
                 }
             }
+        }
+    }
+
+    /// A batch of many queries gives each query the survivors it gets on its
+    /// own, through every path a large search takes: several batches, the
+    /// copy-back buffer growing, a batch halved, a lone query read whole. The
+    /// best-`max_survivors` cut is the one `top_survivors` makes of every
+    /// score, as when the GPU copied every score back.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_batches_keep_every_survivor() {
+        use crate::crosslink_kernel::{top_survivors, ChainKernel, KernelParams, Survivor};
+        let a = peptide("GLEKVSTAAMQR", "PROT_A", Position::Internal);
+        let b = peptide("TDYHFPNEWKLIR", "PROT_B", Position::Internal);
+        let c = peptide("AKCDKEFRQLMNR", "PROT_C", Position::Internal);
+        let mut targets = distractors(400);
+        for p in [&a, &b, &c] {
+            targets.push(p.clone());
+        }
+        let db = database(targets);
+        let sc = scorer(&db);
+        let cfg = CrosslinkSettings::default();
+        let cpu = kernel_for(&db, &cfg);
+        let pairs = [(&a, &b, 3, 9), (&b, &c, 9, 1), (&a, &c, 3, 4), (&c, &c, 1, 4)];
+        let spectra: Vec<ProcessedSpectrum> = pairs.iter().map(|&(x, y, sx, sy)| pair_spectrum(&db, x, y, sx, sy)).collect();
+        // several hypotheses per spectrum, one after another as a search sends them
+        let mut queries = Vec::new();
+        for (q, &(x, y, _, _)) in spectra.iter().zip(&pairs) {
+            for (max_charge, slack, min_matched, max_survivors) in
+                [(2u8, 0.0f32, 1u16, usize::MAX), (3, 0.05, 3, 7), (4, 0.03, 2, 40), (3, 0.01, 1, 1)]
+            {
+                let params = KernelParams {
+                    precursor_mass: x.monoisotopic + y.monoisotopic + DSS,
+                    max_fragment_charge: max_charge,
+                    fragment_tol: sc.fragment_tol.into(),
+                    slack,
+                    min_matched,
+                    max_survivors,
+                };
+                queries.push((q, params));
+            }
+        }
+        let mut gpus = gpu_kernels(&db, &cfg);
+        if gpus.is_empty() {
+            eprintln!("skipping GPU batch test: no adapter");
+            return;
+        }
+        for gpu in &mut gpus {
+            let name = gpu.name().to_string();
+            // each query on its own with every survivor (the CPU's too), then the cut
+            let want: Vec<Vec<Survivor>> = queries
+                .iter()
+                .map(|(q, p)| {
+                    let every = KernelParams { max_survivors: usize::MAX, ..*p };
+                    let all = gpu.survivors(q, &every);
+                    assert_same_survivors(&cpu.survivors(q, &every), &all, &name);
+                    top_survivors(all, p.max_survivors)
+                })
+                .collect();
+            assert!(want.iter().any(|w| w.len() == 7) && want.iter().any(|w| w.len() == 1), "the cuts should bite");
+            assert!(want.iter().any(|w| w.len() > 100), "some queries should keep many survivors");
+            let check = |gpu: &crate::crosslink_gpu::GpuKernel, what: &str| {
+                let got = gpu.survivors_many(&queries);
+                assert_eq!(got.len(), want.len(), "{name}, {what}");
+                for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+                    assert_eq!(w, g, "query {i} ({name}, {what})");
+                }
+            };
+            check(gpu, "one batch");
+            gpu.squeeze(16, 2, 30);
+            check(gpu, "batches halved, lone queries read whole");
+            gpu.squeeze(3, 2, usize::MAX);
+            check(gpu, "batches of 3, a growing copy-back buffer");
+            eprintln!("{name}: batches agree on {} queries", queries.len());
+        }
+    }
+
+    /// `score_many` finds in each spectrum what `score` finds: with the CPU
+    /// kernel, and with the GPU's batches
+    #[test]
+    fn score_many_finds_what_score_finds() {
+        use crate::crosslink_kernel::ChainKernel;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (db, a, b) = pair_fixture();
+        let sc = Scorer { report_psms: 3, min_isotope_err: -1, max_isotope_err: 1, ..scorer(&db) };
+        let cfg = CrosslinkSettings::default();
+        let mut spectra = vec![pair_spectrum(&db, &a, &b, 3, 9), pair_spectrum(&db, &b, &a, 9, 3)];
+        // a spectrum of unknown charge (every charge tried), one without a precursor
+        let mut unknown = pair_spectrum(&db, &a, &b, 3, 9);
+        unknown.precursors[0].charge = None;
+        spectra.push(unknown);
+        let mut none = pair_spectrum(&db, &a, &b, 3, 9);
+        none.precursors.clear();
+        spectra.push(none);
+        let refs: Vec<&ProcessedSpectrum> = spectra.iter().collect();
+
+        let mut kernels: Vec<Box<dyn ChainKernel>> = vec![Box::new(kernel_for(&db, &cfg))];
+        #[cfg(feature = "gpu")]
+        kernels.extend(gpu_kernels(&db, &cfg).into_iter().map(|k| Box::new(k) as Box<dyn ChainKernel>));
+        for kernel in &kernels {
+            let xl = CrosslinkScorer::new(&sc, &cfg).with_kernel(Some(kernel.as_ref()));
+            let done = AtomicUsize::new(0);
+            let many = xl.score_many(&refs, &|| {
+                done.fetch_add(1, Ordering::Relaxed);
+            });
+            assert_eq!(done.load(Ordering::Relaxed), spectra.len(), "{}", kernel.name());
+            let key = |m: &CrosslinkMatch| {
+                (m.alpha, m.beta, m.alpha_site, m.beta_site, m.charge, m.hyperscore.to_bits(), m.rank, m.ims.to_bits())
+            };
+            for (i, (q, found)) in spectra.iter().zip(&many).enumerate() {
+                let one = xl.score(q);
+                assert_eq!(
+                    one.iter().map(key).collect::<Vec<_>>(),
+                    found.iter().map(key).collect::<Vec<_>>(),
+                    "spectrum {i} ({})",
+                    kernel.name()
+                );
+            }
+            assert!(!many[0].is_empty() && !many[2].is_empty() && many[3].is_empty(), "{}", kernel.name());
         }
     }
 

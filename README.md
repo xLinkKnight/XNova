@@ -57,14 +57,14 @@ Non-cleavable searches can run on three interchangeable backends, chosen with `"
 
 | backend | what it does | use it for |
 |---|---|---|
-| `cpu` (default) | seed search and partner lookup (above) | the validated default; purified complexes and small databases |
+| `cpu` (default) | seed search and partner lookup (above) | the validated default; the faster for whole proteomes |
 | `reflect` | chain reflection on the CPU | a reference for the GPU algorithm, to check it |
-| `gpu` | chain reflection, with the per-peptide scoring on a GPU | proteome-scale non-cleavable searches |
-| `auto` | `gpu` if a real GPU is present, else `cpu` | convenience |
+| `gpu` | chain reflection, with the per-peptide scoring on a GPU | complexes and small databases, 10-40x faster than `cpu` |
+| `auto` | `gpu` for databases up to 250,000 peptides if a real GPU is present, else `cpu` | convenience |
 
 **Chain reflection** takes the partner out of the first step. For a crosslink `A–B`, every fragment of `A` that contains the link site is shifted by `M − m(A)`, which depends only on `A` and the precursor, not on `B`. Every peptide in the database can therefore be scored on its own, with its link-site ions shifted, which suits a GPU: the work per spectrum grows with the number of peptides, not the number of pairs. The best peptides (`chain_survivors`, 20,000 by default) are paired by mass, and the best pairs are rescored exactly on the CPU, with the same scoring and FDR as the `cpu` backend.
 
-The GPU code uses [wgpu](https://wgpu.rs), so it runs on DirectX 12 (Windows), Vulkan (Linux) and Metal (macOS) with NVIDIA, AMD, Intel or Apple GPUs, with no CUDA dependency. The peptide ion table is uploaded once (about 1 GB for a human proteome with two missed cleavages) and split into chunks when it exceeds the device's limits. The GPU kernel is tested against the CPU reference on every adapter of a machine, `sage --gpu-info` lists the adapters, and `sage-gui` shows the GPU, its memory and whether the GPU backend can use it. MS-cleavable searches always use the doublet search on the CPU, which is already cheap.
+The GPU code uses [wgpu](https://wgpu.rs), so it runs on DirectX 12 (Windows), Vulkan (Linux) and Metal (macOS) with NVIDIA, AMD, Intel or Apple GPUs, with no CUDA dependency. The peptide ion table is uploaded once (about 1 GB for a human proteome with two missed cleavages) and split into chunks when it exceeds the device's limits. The GPU takes the spectra in batches of up to 2,048 spectrum-and-precursor-hypothesis queries, one round trip each, and copies back only each query's best peptides. On an RTX 3080 Ti the crosslink search step of a Cas9 library (36,563 spectra) took 0.25 s against 3,222 peptides and 1.2 s against 24,038 (`cpu`: 10.5 s and 9.1 s); a Pol II run against 147,104 peptides took 10.6 s (`cpu`: 3.9 s, with fewer candidates). Against a whole human proteome (7.3 million peptides) the `cpu` backend was 2.5x faster and let no false match through at 1% FDR in an entrapment test, where 5% of the GPU's 1% list was false. See [CROSSLINKING.md](CROSSLINKING.md#choosing-a-backend). The GPU kernel is tested against the CPU reference on every adapter of a machine, `sage --gpu-info` lists the adapters, and `sage-gui` shows the GPU, its memory and whether the GPU backend can use it. MS-cleavable searches always use the doublet search on the CPU, which is already cheap.
 
 ### Label-free and isobaric quantification
 

@@ -464,10 +464,79 @@ ignored for them, with a log message.
 
 | backend | what it does | when to use it |
 |---|---|---|
-| `cpu` (default) | seed search + partner lookup (below) | the validated default; cheap enough for purified complexes and small databases |
+| `cpu` (default) | seed search + partner lookup (below) | the validated default; the faster for whole proteomes (above about 250,000 peptides), with the more reliable FDR there (below) |
 | `reflect` | chain reflection (below) on the CPU | a slow *reference* of the GPU algorithm; use it to check the GPU, not for large databases |
-| `gpu` | chain reflection with the per-peptide scoring on a GPU | proteome-scale non-cleavable searches. Errors if no GPU backend is available |
-| `auto` | `gpu` if a real GPU is available, else `cpu` | convenience. Software adapters (llvmpipe, WARP) are never chosen by `auto`, since they are slower than `cpu`; backends can give slightly different results |
+| `gpu` | chain reflection with the per-peptide scoring on a GPU | complexes and small databases, where it is 10-40x faster than `cpu` (below). Errors if no GPU backend is available |
+| `auto` | `gpu` for databases of up to 250,000 peptides (targets and decoys) if a real GPU is available, else `cpu` | convenience. Software adapters (llvmpipe, WARP) are never chosen by `auto`, since they are slower than `cpu`; backends can give slightly different results |
+
+**How fast is the GPU backend?** The GPU takes the spectra in batches: each
+precursor hypothesis of a spectrum (a charge and an isotope error) is one query,
+and one round trip to the GPU scores every peptide against every query of a
+batch (up to 2,048 queries; fewer for large databases, whose scores take more
+device memory). The GPU also keeps only each query's best peptides: a histogram
+of its scores finds the score of its `chain_survivors`-th best, and only the
+peptides at about that score or better are copied back, where the CPU keeps
+exactly the `chain_survivors` best. While the GPU works on a batch, the CPU
+pairs and rescores the batch before. Measured on an NVIDIA RTX 3080 Ti
+(DirectX 12), crosslink search step only:
+
+| search | `cpu` | `reflect` (16 CPU threads) | `gpu`, one spectrum at a time (v1.9.7) | `gpu` |
+|---|---|---|---|---|
+| Cas9 library, 36,563 spectra, 3,222 peptides | 10.5 s | 8.1 s | 18.1 s | 0.25 s |
+| Cas9 library, 36,563 spectra, 24,038 peptides | 9.1 s | 49.4 s | 20.2 s | 1.2 s |
+| one Pol II timsTOF run, 71,747 spectra, 147,104 peptides | 3.9 s | - | 1 min 13 s | 10.6 s |
+
+(DSSO data searched as a non-cleavable linker of DSSO's mass.) Every output file
+of the batched `gpu` searches was identical to the one-spectrum-at-a-time
+searches. Up to v1.9.7 each spectrum and hypothesis was a round trip of its own
+(0.36-0.48 ms, mostly the round trip's fixed cost), and every peptide's score
+came back. Now the GPU's time is its work: about 0.1 ms per query at 147,104
+peptides, so with a large database the `cpu` backend's seed search is still
+faster. The `gpu` backend's chain reflection is exhaustive where `cpu` takes
+seeds, so it proposes more candidates (318 against 7 on the Pol II run, 65
+against 41 on the Cas9 library, where both found 38 CSMs at 1% FDR). The log
+ends a GPU search with where its time went (below).
+
+**Whole proteomes: `cpu` or `gpu`?** To see how the backends scale and how
+their FDR holds as the database grows, the Cas9 library run (36,563 spectra,
+the settings above) was searched against its own database plus 1,000 to 20,000
+random human proteins (UniProt UP000005640, canonical). The library's peptides
+are known, so every match to a human peptide is false, and the true FDR of each
+1% list can be counted. Crosslink search step, Ryzen 7 3700X (16 threads) and
+RTX 3080 Ti; target CSMs at 1% FDR, the false ones in brackets:
+
+| human proteins added | peptides | `cpu` | `gpu` | `cpu` CSMs (false) | `gpu` CSMs (false) |
+|---|---|---|---|---|---|
+| none | 3,222 | 10.5 s | 0.25 s | 38 (0) | 38 (0) |
+| 1,000 | 393,059 | 12.9 s | 19.4 s | 33 (0) | 44 (6) |
+| 2,500 | 962,137 | 18.6 s | 49.0 s | 31 (0) | 33 (1) |
+| 5,000 | 1,948,125 | 32.0 s | 1 min 41 s | 27 (0) | 36 (0) |
+| 10,000 | 3,722,348 | 1 min 10 s | 3 min 10 s | 26 (0) | 31 (0) |
+| 20,000 | 7,295,838 | 2 min 33 s | 6 min 26 s | 23 (0) | 37 (2) |
+
+* **Time.** Both grow with peptides x spectra. The GPU took about 52 s per
+  million peptides here and the `cpu` backend about 21 s, so `cpu` was the
+  faster from about 250,000 peptides (some 600 proteins with these digest
+  settings), and `auto` takes `cpu` above that. The GPU scores every ion of
+  every peptide against every spectrum; `cpu` looks up only the fragments that
+  match a peak. As a guide, 2 million spectra (39 HEK293 runs) against a whole
+  human proteome would take about 2.4 h with `cpu` and 6 h with `gpu` on this
+  computer, more with more link residues, precursor charges or a wider
+  precursor tolerance; `linear_proteins` narrows the database first.
+* **Memory** was not the limit: at 20,000 proteins 5.3 GB of RAM (`cpu`), 7.2 GB
+  of RAM and 2 GB of GPU memory (`gpu`). A 2 GB card would be nearly full.
+* **FDR.** `cpu` let no false match through at 1% at any size (0 of 140), and
+  its 5% lists were its 1% lists. `gpu` kept more of the true CSMs (35 of 37 at
+  20,000 proteins against 23), as its search is exhaustive, but 9 of the 181
+  CSMs it accepted at 1% were false (5%), and 9 of its 70 unique crosslinks. The
+  false ones are random human pairs, most a peptide linked to a copy of itself,
+  that outranked every decoy of a small FDR group: with some 40 true CSMs a 1%
+  estimate cannot resolve one false match (one in 40 is 2.5%), and the GPU
+  proposes about 16 times as many candidates, so lucky ones are far more
+  common. Counting one more false match than the decoys show (the `+ 1` of the
+  loop-links) would leave nothing at 1% at this size. A large dataset, with
+  thousands of CSMs per group, gives a much steadier estimate; with few true
+  crosslinks in a large database, prefer `cpu`.
 
 ### Building with GPU support
 
@@ -491,15 +560,43 @@ The peptide ion table is uploaded once and stays resident; for a human proteome 
 table size at start-up). Tables larger than the device's buffer limits are split
 into chunks automatically.
 
+### Choosing the GPU
+
+On a computer with more than one GPU, the `gpu` and `auto` backends take the
+one the graphics driver ranks fastest, which need not be the fastest card: next
+to a small display card (an NVIDIA T400, say) the driver may rank it first. The
+log names the GPU used and lists the others. Choose one with `--gpu`:
+
+```
+sage config.json --gpu "RTX 5000"
+```
+
+`--gpu` takes a name as `sage --gpu-info` lists it, any part of one that names a
+single GPU (case is ignored), or `#n` for the n-th GPU `--gpu-info` lists (for
+identical cards). A name this computer lacks is an error with `gpu` (the message
+lists its GPUs) and a warning with `auto`, which then takes the driver's choice.
+The choice is not part of the configuration file, since it belongs to the
+computer: in sage-gui it is Files > Resources > GPU to search on, kept with sage-gui's other
+settings and passed as `--gpu`.
+
+The log ends the search with where the GPU's time went, for example:
+
+```
+gpu chain filter on NVIDIA GeForce RTX 3080 Ti: 36563 queries (spectra x precursor hypotheses) x 24038 peptides in 36 batches of up to 1395; 1.0 s on the device (work and copies back), 0.1 s ranking the survivors on the CPU, 0.0 s setting up: 0.0319 ms per query
+```
+
 ### Checking the GPU on your machine
 
 The GPU kernel is tested against the CPU reference on every adapter of the machine
 (hardware and software). Run this on the machine with the GPU; it prints each
 adapter and fails if any survivor differs (peptide set, link site, matched ions, or
-score beyond 1e-3), including for peaks placed exactly on tolerance-window edges:
+score beyond 1e-3), including for peaks placed exactly on tolerance-window edges.
+It also checks that batches of many queries keep exactly the survivors each query
+gets on its own, in small batches, with a copy-back buffer that has to grow, and
+with batches that have to be halved:
 
 ```
-cargo test -p sage-core --features gpu gpu_kernel -- --nocapture
+cargo test -p sage-core --features gpu gpu_ -- --nocapture
 ```
 
 Window edges are computed so that every device rounds them identically: charges

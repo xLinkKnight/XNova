@@ -334,16 +334,10 @@ impl Runner {
         };
         let searched = msn.par_iter().filter(wanted).count() - left_out;
         let searching = crate::progress::step(format!("crosslink search, {}", self.files_of(msn)), searched, "spectra");
-        let matches: Vec<CrosslinkMatch> = msn
-            .par_iter()
-            .filter(wanted)
-            .filter(|spec| !explained(spec))
-            .flat_map(|spec| {
-                let found = xl.score(spec);
-                searching.add(1);
-                found
-            })
-            .collect();
+        // all at once: a GPU kernel takes the spectra in batches
+        let spectra: Vec<&ProcessedSpectrum> = msn.par_iter().filter(wanted).filter(|spec| !explained(spec)).collect();
+        let matches: Vec<CrosslinkMatch> =
+            xl.score_many(&spectra, &|| searching.add(1)).into_iter().flatten().collect();
         if let Ok(mut t) = self.timing.lock() {
             t.crosslink += start.elapsed();
         }

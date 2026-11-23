@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Choosing the GPU of non-cleavable crosslink searches (`gpu` / `auto` backends) on a computer with more than one: `sage --gpu "RTX 5000"` (a name as `--gpu-info` lists it, part of one, or `#n`), and in sage-gui Files > Resources > GPU to search on, kept with sage-gui's settings (not the search's) and passed as `--gpu`. Without it, the driver's choice; the log then names the GPU used and lists the others. A name the computer lacks is an error with `gpu` and a warning with `auto`.
+- The log says where the GPU's time went at the end of a GPU search: on the device (work and copies back), ranking the survivors on the CPU, and setting up.
+
+### Changed
+- The `auto` crosslink backend takes the GPU only for databases of up to 250,000 peptides (targets and decoys), and the `cpu` backend above, with a log line saying so; an explicit `"backend": "gpu"` still searches on the GPU, with a note in the log. On the Cas9 library with 1,000 to 20,000 human entrapment proteins (CROSSLINKING.md, "Whole proteomes: cpu or gpu?") the `cpu` backend was the faster from about 250,000 peptides (2 min 33 s against 6 min 26 s at 7.3 million) and let no false match through at 1% FDR, where 9 of the GPU's 181 were false.
+- The `gpu` crosslink backend (non-cleavable linkers) takes the spectra in batches instead of one at a time: one round trip to the GPU scores every peptide against up to 2,048 spectrum-and-precursor-hypothesis queries, the GPU keeps each query's best peptides (a score histogram finds its `chain_survivors`-th best score; the CPU then keeps exactly the best, as before), and the CPU pairs and rescores one batch while the GPU works on the next. Crosslink search step on an RTX 3080 Ti: 18.1 s to 0.25 s (Cas9 library, 3,222 peptides), 20.2 s to 1.2 s (24,038 peptides), 1 min 13 s to 10.6 s (Pol II run, 147,104 peptides), every output file identical. The `cpu` backend took 10.5 s, 9.1 s and 3.9 s.
+
 ## [v1.9.7] - 2026-11-22
 
 ### Added
