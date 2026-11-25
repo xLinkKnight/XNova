@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.10] - 2026-11-25
 
 ### Changed
 - sage.exe and sage-gui.exe carry Microsoft's C runtime inside them (linked statically, set in `.cargo/config.toml` for Windows builds), so they start on a computer without the Visual C++ Redistributable: they import only DLLs that are part of Windows (no `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` or `api-ms-win-crt-*`). Each program is about 0.2 MB larger. All tests pass, and the output files of five searches (cpu and gpu backends, Thermo .raw and timsTOF .d files) were identical to v1.9.9's.
