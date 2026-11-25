@@ -1,0 +1,6 @@
+# Windows builds carry Microsoft's C runtime inside sage.exe and sage-gui.exe
+# (/MT instead of /MD, for the Rust code and the C code the -sys crates
+# compile), so that they start on a computer without the Visual C++
+# Redistributable: they then import only DLLs that are part of Windows.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
