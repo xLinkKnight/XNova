@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v1.9.11] - 2026-11-26
 
 ### Fixed
 - The Progress tab's Output files list showed 0 B for every file sage.exe wrote when the results folder's path had a space in it (`HEK293 BS3 and DSSO Data\BS3 Search`): `results.json` lists the files as `file:///` URLs, which write a space as `%20`, and only the `file:///` was taken off. The URLs are now read as URLs (network shares too).

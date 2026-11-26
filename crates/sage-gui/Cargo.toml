@@ -1,6 +1,6 @@
 [package]
 name = "sage-gui"
-version = "1.9.10"
+version = "1.9.11"
 edition = "2021"
 description = "Desktop front-end for editing Sage search settings and running searches"
 license = "MIT"
