@@ -17,9 +17,14 @@ fn log_system() {
     system.refresh_memory();
     let cpu = system.cpus().first().map(|c| c.brand().trim().to_string()).unwrap_or_default();
     let os = system.long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
+    // every processor group (Windows has at most 64 logical CPUs in a group)
+    let groups = match sage_core::parallel::processor_groups() {
+        1 => String::new(),
+        n => format!(" in {n} processor groups"),
+    };
     log::info!(
-        "system: {os}, {cpu} ({} logical CPUs), {:.1} GB RAM",
-        system.cpus().len(),
+        "system: {os}, {cpu} ({} logical CPUs{groups}), {:.1} GB RAM",
+        sage_core::parallel::logical_cpus(),
         gib(system.total_memory())
     );
 }
@@ -196,20 +201,29 @@ fn main() -> anyhow::Result<()> {
         "setting Rayon worker thread stack size to {} MiB",
         stack_size_mib
     );
+    // all the logical CPUs, every processor group counted (num_cpus and Rust
+    // count only the group the program starts in: 64 of a 256-thread CPU)
     let threads = matches
         .get_one::<u16>("threads")
         .map(|&n| n as usize)
-        .unwrap_or_else(num_cpus::get);
+        .unwrap_or_else(sage_core::parallel::logical_cpus);
     log::info!("using {} CPU thread(s)", threads);
     log::info!("memory allocator: {}", allocator.name());
     log_system();
     // a progress line every 15 s about any step that runs that long
     let _heartbeat = sage_cli::progress::Heartbeat::start();
-    ThreadPoolBuilder::new()
-        .stack_size(stack_size_bytes)
-        .num_threads(threads)
-        .build_global()
-        .expect("configure Rayon pool");
+    let mut pool = ThreadPoolBuilder::new().stack_size(stack_size_bytes).num_threads(threads);
+    // several processor groups: each worker thread is placed in one, spread
+    // evenly, so that more than 64 threads run on every group's processors
+    // (Windows before 11 / Server 2022 keeps a program's threads in one group)
+    let groups = sage_core::parallel::processor_groups();
+    if groups > 1 {
+        pool = pool.start_handler(move |index| {
+            sage_core::parallel::spread_thread(index, threads);
+        });
+        log::info!("the {threads} threads are spread over the {groups} processor groups");
+    }
+    pool.build_global().expect("configure Rayon pool");
 
     let parallel = matches
         .get_one::<u16>("batch-size")

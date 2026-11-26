@@ -319,7 +319,8 @@ impl Sampler {
                         _ => 0,
                     };
                 }
-                let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+                // every processor group (a CPU with more than 64 threads has several)
+                let threads = crate::system::cpu_threads() as f64;
                 (100.0 * busy as f64 / ((now - then) as f64 * threads)).clamp(0.0, 100.0) as f32
             }
             _ => 0.0,

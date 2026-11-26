@@ -5418,7 +5418,9 @@ dependencies = [
  "svg2pdf",
  "tiny_http",
  "ureq",
+ "url",
  "webbrowser",
+ "wgpu 24.0.5",
  "windows 0.58.0",
  "winresource",
 ]

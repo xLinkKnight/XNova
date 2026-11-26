@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod clock;
+mod display;
 mod library;
 mod logview;
 mod progress;
@@ -29,9 +30,11 @@ const FIT_STEPS: usize = 2 * Tab::ALL.len();
 const REPO_URL: &str = "https://github.com/xLinkKnight/XNova";
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
+    // a window that closes unexpectedly says why (and %APPDATA%\sage-gui\crash.log keeps it)
+    display::record_panics();
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Sage search")
+            .with_title("XNova")
             // the XNova icon (from the XNova logo design files)
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/xnova.png"))
@@ -41,6 +44,9 @@ fn main() -> eframe::Result {
             .with_min_inner_size([720.0, 480.0]),
         ..Default::default()
     };
+    // Direct3D 12 (works over Remote Desktop), unless XNOVA_RENDERER says otherwise
+    let renderer = display::Renderer::chosen();
+    renderer.apply(&mut options);
     // `sage-gui --view <results folder>` opens the annotated spectra of a search,
     // `sage-gui --xiview <results folder>` its crosslinks in xiVIEW (web browser),
     // `sage-gui --circos <results folder> [style.json | template]` writes its
@@ -131,8 +137,8 @@ fn main() -> eframe::Result {
         Some("--xiview") => (None, args.next()),
         _ => (None, None),
     };
-    eframe::run_native(
-        "Sage search",
+    let result = eframe::run_native(
+        "XNova",
         options,
         Box::new(move |cc| {
             let mut app = SageGui::new(&cc.egui_ctx);
@@ -144,7 +150,14 @@ fn main() -> eframe::Result {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    // the window did not open: XNova again with the next renderer, or why not
+    if let Err(e) = &result {
+        if display::window_failed(renderer, &e.to_string()) {
+            return Ok(());
+        }
+    }
+    result
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -997,7 +1010,10 @@ impl SageGui {
 
         egui::TopBottomPanel::bottom("actions").show_separator_line(false).show(ctx, |ui| {
             let backdrop = theme::bar_start(ui);
-            ui.add_space(4.0);
+            // the ribbon covers the bar's top 3 px: room for it, then as much
+            // space above the buttons as egui leaves below a row (its item
+            // spacing), so that they sit in the middle of the bar
+            ui.add_space(theme::RIBBON + ui.spacing().item_spacing.y);
             ui.horizontal(|ui| {
                 let running = self.running();
                 let run = ui
@@ -1070,7 +1086,9 @@ impl SageGui {
                     });
                 }
             });
-            ui.add_space(4.0);
+            // egui keeps its item spacing below the row only when something
+            // follows it: as much space below the buttons as above
+            ui.add_space(0.0);
             theme::bar_end(ui, backdrop, false);
         });
 
@@ -1602,11 +1620,7 @@ impl SageGui {
             progress::State::Failed => bad,
             progress::State::Cancelled => muted,
         };
-        let bar = ui.add(
-            egui::ProgressBar::new(t.fraction())
-                .fill(fill)
-                .animate(running),
-        );
+        let bar = ui.add(egui::ProgressBar::new(t.fraction()).fill(fill));
         // Percentage centred on the bar, dark brown on a pale backdrop so it reads
         // over every fill colour and over the empty track
         let brown = Color32::from_rgb(90, 38, 4);
@@ -2121,26 +2135,29 @@ impl SageGui {
                 };
                 ui.end_row();
             }
-            row(ui, "GPU", "Graphics adapters Windows reports, with their dedicated video memory (vRAM). \
-                Integrated graphics have no vRAM of their own and borrow system RAM.", |ui| {
-                ui.vertical(|ui| {
-                    if self.gpus.is_empty() {
-                        ui.label(RichText::new("none found").color(theme::muted(ui)));
-                    }
-                    for gpu in &self.gpus {
-                        let memory = if gpu.vram >= 512 << 20 {
-                            format!("{:.1} GB vRAM", gpu.vram as f64 / system::GB)
-                        } else {
-                            format!("integrated, shares up to {:.1} GB of system RAM", gpu.shared as f64 / system::GB)
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label(&gpu.name);
-                            ui.label(RichText::new(memory).color(theme::muted(ui)));
-                        });
-                    }
-                })
-                .response
+            // one line per adapter: the list and its label are cells of their
+            // own, top-aligned (`row` centres a single line, and a list in it
+            // spilled into the next row)
+            let tip = "Graphics adapters Windows reports, with their dedicated video memory (vRAM). \
+                Integrated graphics have no vRAM of their own and borrow system RAM.";
+            ui.vertical(|ui| ui.label(RichText::new("GPU").color(theme::muted(ui))).on_hover_text(tip));
+            ui.vertical(|ui| {
+                if self.gpus.is_empty() {
+                    ui.label(RichText::new("none found").color(theme::muted(ui)));
+                }
+                for gpu in &self.gpus {
+                    let memory = if gpu.vram >= 512 << 20 {
+                        format!("{:.1} GB vRAM", gpu.vram as f64 / system::GB)
+                    } else {
+                        format!("integrated, shares up to {:.1} GB of system RAM", gpu.shared as f64 / system::GB)
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(&gpu.name).on_hover_text(tip);
+                        ui.label(RichText::new(memory).color(theme::muted(ui))).on_hover_text(tip);
+                    });
+                }
             });
+            ui.end_row();
             row(ui, "GPU support", "Whether this sage.exe can use a GPU. Only the gpu / auto backend of \
                 non-cleavable crosslink searches uses one (Crosslinking tab); everything else runs on the CPU.\n\
                 It needs a sage.exe with GPU support (included by default: cargo build --release -p sage-cli), and a Vulkan or \
@@ -4259,6 +4276,108 @@ mod screenshots {
                 println!("{}", path.display());
             }
         }
+    }
+
+    /// Files > Resources with three graphics cards listed: each on its own line,
+    /// clear of the GPU support row (`resources_gpus.png` in `SAGE_GUI_FIGURES`)
+    #[test]
+    #[ignore]
+    fn resources_gpus_preview() {
+        let out = std::path::PathBuf::from(std::env::var("SAGE_GUI_FIGURES").expect("set SAGE_GUI_FIGURES"));
+        std::fs::create_dir_all(&out).unwrap();
+        let mut app: Option<SageGui> = None;
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1100.0, 560.0)).build_ui(move |ui| {
+            if !installed {
+                theme::install(ui.ctx(), true);
+                theme::set_dark(ui.ctx(), true);
+                installed = true;
+                return;
+            }
+            let app = app.get_or_insert_with(|| {
+                let mut a = SageGui::new(ui.ctx());
+                a.probed_sage = a.sage_exe.clone();
+                a.gpu_probe = None;
+                let gpu = |name: &str, gb: u64, luid: &str| system::Gpu { name: name.into(), vram: gb << 30, shared: 0, luid: luid.into() };
+                a.gpus = vec![
+                    gpu("NVIDIA T400 4GB", 4, "luid_a"),
+                    gpu("NVIDIA RTX 5000 Ada Generation", 32, "luid_b"),
+                    gpu("NVIDIA RTX 5000 Ada Generation", 32, "luid_c"),
+                ];
+                a.gpu_support = Some(system::GpuSupport::Yes(vec![
+                    "NVIDIA T400 4GB | Dx12 | DiscreteGpu".into(),
+                    "NVIDIA RTX 5000 Ada Generation | Dx12 | DiscreteGpu".into(),
+                    "NVIDIA RTX 5000 Ada Generation | Dx12 | DiscreteGpu".into(),
+                ]));
+                a
+            });
+            egui::ScrollArea::vertical().show(ui, |ui| app.resources(ui));
+        });
+        harness.run_steps(6);
+        let path = out.join("resources_gpus.png");
+        harness.render().expect("render").save(&path).unwrap();
+        println!("{}", path.display());
+    }
+
+    /// Numbers typed into Files > Resources' CPU threads and Max RAM fields
+    /// (the fields that closed XNova in a Remote Desktop session) are taken,
+    /// and held to what the computer has. Typed as an input method commits
+    /// text, as Remote Desktop keyboards often do.
+    #[test]
+    fn resource_numbers_can_be_typed() {
+        use egui_kittest::kittest::{Key, Queryable};
+        let cpus = system::cpu_threads();
+        let mut installed = false;
+        let mut harness = Harness::builder().with_size(egui::vec2(1100.0, 700.0)).build_state(
+            move |ctx, app: &mut Option<SageGui>| {
+                // fonts take effect on the frame after they are set
+                if !installed {
+                    theme::install(ctx, false);
+                    installed = true;
+                    return;
+                }
+                let app = app.get_or_insert_with(|| {
+                    let mut a = SageGui::new(ctx);
+                    a.probed_sage = a.sage_exe.clone();
+                    a.gpu_probe = None;
+                    a.gpu_support = Some(system::GpuSupport::No);
+                    a.threads = 1;
+                    a.max_ram_gb = 0.0;
+                    a
+                });
+                egui::CentralPanel::default().show(ctx, |ui| app.resources(ui));
+            },
+            None,
+        );
+        harness.run_steps(3);
+        let mut typed = |harness: &mut Harness<'_, Option<SageGui>>, field: usize, text: &str| {
+            {
+                let fields = harness.get_all_by_role(egui::accesskit::Role::SpinButton).collect::<Vec<_>>();
+                fields[field].focus();
+            }
+            harness.run_steps(2);
+            {
+                let fields = harness.get_all_by_role(egui::accesskit::Role::SpinButton).collect::<Vec<_>>();
+                let node = fields.get(field).copied();
+                // editing: the field is a text box now
+                let text_box = harness.query_all_by_role(egui::accesskit::Role::TextInput).next();
+                let target = text_box.or(node).expect("the field");
+                // clear what is there (kittest sends no modifiers, so no Ctrl+A)
+                target.press_keys(&[Key::Backspace; 8]);
+                target.type_text(text);
+                target.key_press(Key::Enter);
+            }
+            harness.run_steps(3);
+        };
+        typed(&mut harness, 0, "8");
+        let threads = harness.state().as_ref().unwrap().threads;
+        assert_eq!(threads, 8.min(cpus), "CPU threads typed");
+        typed(&mut harness, 0, "100000");
+        assert_eq!(harness.state().as_ref().unwrap().threads, cpus, "held to the computer's {cpus}");
+        typed(&mut harness, 1, "48");
+        assert_eq!(harness.state().as_ref().unwrap().max_ram_gb, 48.0, "Max RAM typed");
+        typed(&mut harness, 1, "-5");
+        assert_eq!(harness.state().as_ref().unwrap().max_ram_gb, 0.0, "no negative RAM");
     }
 
     /// Files > Resources on a computer with two GPUs (an NVIDIA T400 and an RTX

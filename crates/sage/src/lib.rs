@@ -19,6 +19,7 @@ pub mod localization;
 pub mod mass;
 pub mod ml;
 pub mod modification;
+pub mod parallel;
 pub mod peptide;
 pub mod polymer;
 pub mod protein_grouping;

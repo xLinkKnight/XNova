@@ -5,9 +5,10 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Receiver};
 
-/// Logical CPUs (hardware threads)
+/// Logical CPUs (hardware threads), every processor group counted: Windows
+/// puts at most 64 in a group, and the usual counts see only one group
 pub fn cpu_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    sage_core::parallel::logical_cpus()
 }
 
 pub const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -50,7 +51,9 @@ pub struct Gpu {
     pub luid: String,
 }
 
-/// Hardware adapters (the Microsoft Basic Render Driver is left out)
+/// Hardware adapters (the Microsoft Basic Render Driver is left out), each
+/// once: Windows can list one adapter twice (seen in a Remote Desktop session
+/// on a server with two cards), and one adapter has one LUID
 #[cfg(windows)]
 pub fn gpus() -> Vec<Gpu> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
@@ -74,7 +77,14 @@ pub fn gpus() -> Vec<Gpu> {
             luid: format!("luid_0x{:08X}_0x{:08X}", desc.AdapterLuid.HighPart as u32, desc.AdapterLuid.LowPart),
         });
     }
-    out
+    each_once(out)
+}
+
+/// The adapters with a repeated LUID left out (two cards of one model have
+/// two LUIDs and both stay)
+fn each_once(gpus: Vec<Gpu>) -> Vec<Gpu> {
+    let mut seen = std::collections::HashSet::new();
+    gpus.into_iter().filter(|g| seen.insert(g.luid.clone())).collect()
 }
 
 #[cfg(not(windows))]
@@ -280,6 +290,31 @@ impl MemoryCap {
 
 #[cfg(test)]
 mod test {
+
+    /// An adapter Windows lists twice (one LUID) is shown once; two cards of
+    /// one model (two LUIDs) both
+    #[cfg(windows)]
+    #[test]
+    fn each_gpu_is_listed_once() {
+        let gpu = |name: &str, luid: &str| super::Gpu { name: name.into(), vram: 4 << 30, shared: 0, luid: luid.into() };
+        let listed = vec![
+            gpu("NVIDIA T400 4GB", "luid_0x00000000_0x0000A1"),
+            gpu("NVIDIA RTX 5000 Ada Generation", "luid_0x00000000_0x0000B2"),
+            gpu("NVIDIA T400 4GB", "luid_0x00000000_0x0000A1"),
+            gpu("NVIDIA RTX 5000 Ada Generation", "luid_0x00000000_0x0000C3"),
+        ];
+        let names: Vec<(String, String)> = super::each_once(listed).into_iter().map(|g| (g.name, g.luid)).collect();
+        assert_eq!(
+            names,
+            vec![
+                ("NVIDIA T400 4GB".into(), "luid_0x00000000_0x0000A1".into()),
+                ("NVIDIA RTX 5000 Ada Generation".into(), "luid_0x00000000_0x0000B2".into()),
+                ("NVIDIA RTX 5000 Ada Generation".into(), "luid_0x00000000_0x0000C3".into()),
+            ]
+        );
+        // this computer's count: every processor group
+        assert!(super::cpu_threads() >= std::thread::available_parallelism().unwrap().get());
+    }
 
     /// `sage.exe --estimate` through the GUI: the debug or release sage.exe of
     /// this build (skipped when neither is built)

@@ -309,6 +309,7 @@ impl Runner {
         xl: &CrosslinkScorer,
         settings: &CrosslinkSettings,
         msn: &[ProcessedSpectrum],
+        files: std::ops::Range<usize>,
         found: &mut CrosslinkChunks,
     ) {
         if let Some(isobaric) = &self.parameters.quant.tmt {
@@ -334,10 +335,24 @@ impl Runner {
         };
         let searched = msn.par_iter().filter(wanted).count() - left_out;
         let searching = crate::progress::step(format!("crosslink search, {}", self.files_of(msn)), searched, "spectra");
-        // all at once: a GPU kernel takes the spectra in batches
+        // all at once: a GPU kernel takes the spectra in batches; in order, so
+        // that each file is done before the next
         let spectra: Vec<&ProcessedSpectrum> = msn.par_iter().filter(wanted).filter(|spec| !explained(spec)).collect();
-        let matches: Vec<CrosslinkMatch> =
-            xl.score_many(&spectra, &|| searching.add(1)).into_iter().flatten().collect();
+        let files_searched = crate::progress::FilesSearched::new(
+            "crosslinks",
+            self.file_names(files),
+            spectra.iter().map(|spec| spec.file_id),
+            &self.crosslink_files_done,
+            self.parameters.mzml_paths.len(),
+        );
+        let matches: Vec<CrosslinkMatch> = xl
+            .score_many(&spectra, &|spec| {
+                searching.add(1);
+                files_searched.spectrum_done(spec.file_id);
+            })
+            .into_iter()
+            .flatten()
+            .collect();
         if let Ok(mut t) = self.timing.lock() {
             t.crosslink += start.elapsed();
         }
@@ -386,7 +401,8 @@ impl Runner {
                 if self.crosslink_needs_ms1() {
                     found.ms1_spectra.extend(ms1);
                 }
-                self.search_crosslink_chunk(&xl, &settings, &msn, &mut found);
+                let files = batch_size * chunk_idx..batch_size * chunk_idx + chunk.len();
+                self.search_crosslink_chunk(&xl, &settings, &msn, files, &mut found);
             }
             found
         };
@@ -427,8 +443,9 @@ impl Runner {
             let mut results = Vec::new();
             for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
                 let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
-                let features = self.search_processed_spectra(&linear, &msn);
-                self.search_crosslink_chunk(&xl, &settings, &msn, &mut found);
+                let files = batch_size * chunk_idx..batch_size * chunk_idx + chunk.len();
+                let features = self.search_processed_spectra(&linear, &msn, files.clone());
+                self.search_crosslink_chunk(&xl, &settings, &msn, files, &mut found);
                 results.push(self.complete_features(msn, ms1, features));
             }
             (results.into_iter().collect::<SageResults>(), found)
@@ -465,7 +482,8 @@ impl Runner {
             let mut results = Vec::new();
             for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
                 let (ms1, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
-                let features = self.search_processed_spectra(&linear, &msn);
+                let files = batch_size * chunk_idx..batch_size * chunk_idx + chunk.len();
+                let features = self.search_processed_spectra(&linear, &msn, files);
                 results.push(self.complete_features(msn, ms1, features));
             }
             results.into_iter().collect::<SageResults>()
@@ -496,7 +514,8 @@ impl Runner {
             let mut found = CrosslinkChunks::default();
             for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
                 let (_, msn) = self.read_processed_spectra(chunk, chunk_idx, batch_size);
-                self.search_crosslink_chunk(&xl, &settings, &msn, &mut found);
+                let files = batch_size * chunk_idx..batch_size * chunk_idx + chunk.len();
+                self.search_crosslink_chunk(&xl, &settings, &msn, files, &mut found);
             }
             found
         };

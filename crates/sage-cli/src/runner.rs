@@ -56,6 +56,10 @@ pub struct Runner {
     timing: std::sync::Mutex<Timing>,
     /// Total MS2 spectra searched (summed over all chunks), reported in telemetry
     spectra_searched: AtomicUsize,
+    /// Spectrum files the linear and the crosslink search have done, over
+    /// every batch (`- x.raw: searched for ... (2 of 3 files done)`)
+    pub(crate) linear_files_done: AtomicUsize,
+    pub(crate) crosslink_files_done: AtomicUsize,
     /// Quality control gathered while the spectra are read
     qc: std::sync::Mutex<qc::QcCollector>,
     /// The linear spectral library's scales, for the crosslink library
@@ -207,6 +211,8 @@ impl Runner {
                         start,
                         timing: Default::default(),
                         spectra_searched: AtomicUsize::new(0),
+                        linear_files_done: AtomicUsize::new(0),
+                        crosslink_files_done: AtomicUsize::new(0),
                         qc: Default::default(),
                         library: None,
                         linear_proteins: None,
@@ -231,6 +237,8 @@ impl Runner {
             start,
             timing: Default::default(),
             spectra_searched: AtomicUsize::new(0),
+            linear_files_done: AtomicUsize::new(0),
+            crosslink_files_done: AtomicUsize::new(0),
             qc: Default::default(),
             library: None,
             linear_proteins: None,
@@ -479,18 +487,22 @@ impl Runner {
             .expect("valid path segment")
     }
 
-    fn search_processed_spectra(
+    /// The linear search of a batch of files (`files`: their ids). The
+    /// spectra are taken in order, so each file is done before the next.
+    pub(crate) fn search_processed_spectra(
         &self,
         scorer: &Scorer,
         msn_spectra: &[ProcessedSpectrum],
+        files: std::ops::Range<usize>,
     ) -> Vec<Feature> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let counter = AtomicUsize::new(0);
         let start = Instant::now();
-        let to_search = msn_spectra
+        let wanted: Vec<&ProcessedSpectrum> = msn_spectra
             .iter()
             .filter(|spec| spec.masses.len() >= self.parameters.min_peaks && spec.level == 2)
-            .count();
+            .collect();
+        let to_search = wanted.len();
         let searching = crate::progress::step(
             format!("linear search, {}", self.files_of(msn_spectra)),
             to_search,
@@ -502,28 +514,32 @@ impl Runner {
             .as_ref()
             .map(|s| sage_core::localization::Localizer::new(&self.parameters.database.modifications, s));
 
-        let features: Vec<_> = msn_spectra
-            .par_iter()
-            .filter(|spec| spec.masses.len() >= self.parameters.min_peaks && spec.level == 2)
-            .map(|x| {
-                let prev = counter.fetch_add(1, Ordering::Relaxed);
-                searching.add(1);
-                if prev > 0 && prev % 10_000 == 0 {
-                    let duration = Instant::now().duration_since(start).as_millis() as usize;
+        let files_searched = crate::progress::FilesSearched::new(
+            "linear peptides",
+            self.file_names(files),
+            wanted.iter().map(|spec| spec.file_id),
+            &self.linear_files_done,
+            self.parameters.mzml_paths.len(),
+        );
+        let features: Vec<_> = sage_core::parallel::par_map_in_order(&wanted, |spec| {
+            let prev = counter.fetch_add(1, Ordering::Relaxed);
+            searching.add(1);
+            if prev > 0 && prev % 10_000 == 0 {
+                let duration = Instant::now().duration_since(start).as_millis() as usize;
 
-                    let rate = prev * 1000 / (duration + 1);
-                    log::trace!("- searched {} spectra ({} spectra/s)", prev, rate);
-                }
-                x
-            })
-            .flat_map(|spec| {
-                let mut features = scorer.score(spec);
-                if let Some(localizer) = &localizer {
-                    localizer.localize(scorer, spec, &mut features);
-                }
-                features
-            })
-            .collect();
+                let rate = prev * 1000 / (duration + 1);
+                log::trace!("- searched {} spectra ({} spectra/s)", prev, rate);
+            }
+            let mut features = scorer.score(spec);
+            if let Some(localizer) = &localizer {
+                localizer.localize(scorer, spec, &mut features);
+            }
+            files_searched.spectrum_done(spec.file_id);
+            features
+        })
+        .into_iter()
+        .flatten()
+        .collect();
 
         let duration = Instant::now().duration_since(start).as_millis() as usize;
         let prev = counter.load(Ordering::Relaxed);
@@ -535,6 +551,16 @@ impl Runner {
         self.spectra_searched.fetch_add(prev, Ordering::Relaxed);
         self.warn_no_precursor(msn_spectra);
         features
+    }
+
+    /// The ids and names of the files `files`
+    pub(crate) fn file_names(&self, files: std::ops::Range<usize>) -> Vec<(usize, String)> {
+        files
+            .filter_map(|id| {
+                let path = self.parameters.mzml_paths.get(id)?;
+                Some((id, sage_cloudpath::filename(path).unwrap_or_else(|| path.as_str()).to_string()))
+            })
+            .collect()
     }
 
     /// `files 1-8 of 21`: the files these spectra come from
@@ -727,7 +753,8 @@ impl Runner {
         batch_size: usize,
     ) -> SageResults {
         let spectra = self.read_processed_spectra(chunk, chunk_idx, batch_size);
-        let features = self.search_processed_spectra(scorer, &spectra.1);
+        let files = batch_size * chunk_idx..batch_size * chunk_idx + chunk.len();
+        let features = self.search_processed_spectra(scorer, &spectra.1, files);
         self.complete_features(spectra.1, spectra.0, features)
     }
 

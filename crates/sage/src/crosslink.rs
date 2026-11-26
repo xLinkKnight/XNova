@@ -1381,24 +1381,27 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
     }
 
     /// Search many MS2 spectra: what [`Self::score`] finds in each, in their
-    /// order. `done` is called once per spectrum searched.
+    /// order. `done` is told of each spectrum searched. The spectra are taken
+    /// in order, so the first ones are done first (a file of a batch is done
+    /// long before the next file is).
     ///
     /// A device kernel (`gpu`) gets the chain filter of a block of spectra,
     /// every precursor hypothesis of each, in one call, so that it pays its
     /// round trip once per batch instead of once per spectrum and hypothesis.
     /// While it works on a block, the CPU finishes the block before.
-    pub fn score_many(&self, spectra: &[&ProcessedSpectrum], done: &(dyn Fn() + Sync)) -> Vec<Vec<CrosslinkMatch>> {
+    pub fn score_many(
+        &self,
+        spectra: &[&ProcessedSpectrum],
+        done: &(dyn Fn(&ProcessedSpectrum) + Sync),
+    ) -> Vec<Vec<CrosslinkMatch>> {
         let kernel = match self.kernel {
             Some(kernel) if kernel.batches() && !self.settings.is_cleavable() => kernel,
             _ => {
-                return spectra
-                    .par_iter()
-                    .map(|query| {
-                        let found = self.score(query);
-                        done();
-                        found
-                    })
-                    .collect()
+                return crate::parallel::par_map_in_order(spectra, |query| {
+                    let found = self.score(query);
+                    done(query);
+                    found
+                })
             }
         };
         let mut out = Vec::with_capacity(spectra.len());
@@ -1429,7 +1432,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
         block: &[&ProcessedSpectrum],
         hypotheses: Vec<Option<Vec<Hypothesis>>>,
         survivors: Vec<Vec<Survivor>>,
-        done: &(dyn Fn() + Sync),
+        done: &(dyn Fn(&ProcessedSpectrum) + Sync),
     ) -> Vec<Vec<CrosslinkMatch>> {
         let mut survivors = survivors.into_iter();
         let per_spectrum: Vec<Vec<Vec<Survivor>>> = hypotheses
@@ -1445,7 +1448,7 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
                     Some(hypotheses) => with_ims(query, self.reflect_matches(query, hypotheses, survivors)),
                     None => Vec::new(),
                 };
-                done();
+                done(query);
                 found
             })
             .collect()
@@ -5039,7 +5042,7 @@ mod test {
         for kernel in &kernels {
             let xl = CrosslinkScorer::new(&sc, &cfg).with_kernel(Some(kernel.as_ref()));
             let done = AtomicUsize::new(0);
-            let many = xl.score_many(&refs, &|| {
+            let many = xl.score_many(&refs, &|_| {
                 done.fetch_add(1, Ordering::Relaxed);
             });
             assert_eq!(done.load(Ordering::Relaxed), spectra.len(), "{}", kernel.name());

@@ -108,8 +108,13 @@ pub struct Tracker {
     pub converted: usize,
     /// A conversion is in progress (its header was seen)
     converting: bool,
+    /// Files searched, counted as each file's last spectrum is searched
+    /// (`- x.raw: searched for crosslinks (2 of 3 files done)`), or at the end
+    /// of each batch from a sage.exe that does not say
     pub files_done: usize,
+    /// One past the last file of the batch being searched, and its first
     pub files_started: usize,
+    batch_from: usize,
     /// The batch of files being searched: the share of its spectra searched,
     /// from sage.exe's `progress:` lines
     batch_share: Option<f32>,
@@ -162,6 +167,22 @@ fn results_part(rest: &str) -> Option<(usize, usize, String)> {
 }
 
 /// The share done of a `progress:` line: `... (41%) ...` is 0.41
+/// `- cas9_b.raw: searched for crosslinks (2 of 3 files done)`: whether the
+/// search is the crosslink one, and its files done
+fn file_searched(msg: &str) -> Option<(bool, usize)> {
+    let rest = msg.strip_prefix("- ")?.strip_suffix(" files done)")?;
+    let (head, counts) = rest.rsplit_once(" (")?;
+    let crosslinks = if head.ends_with(": searched for crosslinks") {
+        true
+    } else if head.ends_with(": searched for linear peptides") {
+        false
+    } else {
+        return None;
+    };
+    let (done, _) = counts.split_once(" of ")?;
+    Some((crosslinks, done.trim().parse().ok()?))
+}
+
 fn percent_of(line: &str) -> Option<f32> {
     let (head, _) = line.split_once("%)")?;
     let (_, pct) = head.rsplit_once('(')?;
@@ -266,6 +287,7 @@ impl Tracker {
             converting: false,
             files_done: 0,
             files_started: 0,
+            batch_from: 0,
             batch_share: None,
             linear_files_done: None,
             crosslink_results: false,
@@ -449,8 +471,11 @@ impl Tracker {
             }
             return;
         }
-        // the crosslink search of a batch: most of its time
-        if msg.starts_with("progress: crosslink search, files ") {
+        // the crosslink search of a batch: most of its time; the linear one's
+        // when it is the batch's only search
+        if msg.starts_with("progress: crosslink search, files ")
+            || (msg.starts_with("progress: linear search, files ") && !self.both_per_batch())
+        {
             self.batch_share = percent_of(msg);
             return;
         }
@@ -501,10 +526,19 @@ impl Tracker {
                 self.reach(Stage::XlSearch);
                 self.linear_files_done = Some(self.files_done);
                 self.files_started = 0;
+                self.batch_from = 0;
                 self.files_done = 0;
                 self.batch_share = None;
                 return;
             }
+        }
+        // a file searched to its last spectrum: the counter of the search
+        // shown (with both searches on each batch, the crosslink search's)
+        if let Some((crosslinks, done)) = file_searched(msg) {
+            if crosslinks || !self.both_per_batch() {
+                self.files_done = self.files_done.max(done);
+            }
+            return;
         }
         if msg.starts_with("linear peptide search (results.sage.tsv)") {
             // "... and crosslink search, reading each spectrum file once": the
@@ -565,17 +599,21 @@ impl Tracker {
             // "processing files 0 .. 4 " (a batch searched in parallel)
             self.reach(Stage::Search);
             self.batch_share = None;
-            if let Some((_, end)) = rest.split_once("..") {
+            if let Some((start, end)) = rest.split_once("..") {
                 if let Some(n) = number(end) {
                     self.files_started = n as usize;
                 }
+                self.batch_from = number(start).map_or(self.files_done, |n| n as usize);
             }
         } else if let Some(rest) = msg.strip_prefix("- file IO:") {
             self.io_ms += number(rest).unwrap_or(0);
         } else if let Some(rest) = msg.strip_prefix("- search:") {
-            // "- search:  1234 ms (1000 spectra/s)"
+            // "- search:  1234 ms (1000 spectra/s)": the linear search of a
+            // batch, its files done unless the crosslink search follows
             self.search_ms += number(rest).unwrap_or(0);
-            self.files_done = self.files_started;
+            if !self.both_per_batch() {
+                self.files_done = self.files_done.max(self.files_started);
+            }
         } else if let Some(rest) = msg.strip_prefix("- crosslink search:") {
             // "- crosslink search:  12 ms (1 spectra, 0 candidate matches)"
             self.search_ms += number(rest).unwrap_or(0);
@@ -584,7 +622,7 @@ impl Tracker {
                 self.spectra += parts.next().and_then(number).unwrap_or(0);
                 self.candidates += parts.next().and_then(number).unwrap_or(0);
             }
-            self.files_done = self.files_started;
+            self.files_done = self.files_done.max(self.files_started);
         } else if let Some(rest) = msg.strip_prefix("crosslink chain scoring backend: ") {
             self.set_metric("Crosslink backend", rest.to_string());
         } else if msg.starts_with("aligning file") || msg.starts_with("aligned retention times")
@@ -612,6 +650,12 @@ impl Tracker {
         }
     }
 
+    /// The linear and the crosslink search both run on each batch of files
+    /// (the search stage covers both; a file is done after the crosslink search)
+    fn both_per_batch(&self) -> bool {
+        self.plan.crosslink && self.plan.linear && !self.plan.linear_proteins && !self.plan.linear_spectra
+    }
+
     /// 0..1, from the stage and, while searching, the files done
     pub fn fraction(&self) -> f32 {
         if self.state == State::Finished {
@@ -621,9 +665,17 @@ impl Tracker {
         let done: f32 = self.stages[..self.current].iter().map(|s| s.weight()).sum();
         let within = match self.stage() {
             Stage::Search | Stage::XlSearch if self.plan.files > 0 => {
-                // the batch in progress: its share searched, or half
-                let share = self.batch_share.unwrap_or(0.5);
-                (self.files_done as f32 + share * (self.files_started - self.files_done) as f32) / self.plan.files as f32
+                // the batch in progress: its share searched (else half of what
+                // is left of it), and never less than the files done
+                let from = self.batch_from.min(self.files_started);
+                let batch = match self.batch_share {
+                    Some(share) => from as f32 + share * (self.files_started - from) as f32,
+                    None => {
+                        let done = self.files_done.clamp(from, self.files_started);
+                        done as f32 + 0.5 * (self.files_started - done) as f32
+                    }
+                };
+                batch.max(self.files_done as f32) / self.plan.files as f32
             }
             Stage::Convert if self.plan.raw_files > 0 => self.converted as f32 / self.plan.raw_files as f32,
             Stage::Results => match &self.results_part {
@@ -762,15 +814,26 @@ fn read_outputs(dir: &Path) -> Vec<(PathBuf, u64)> {
         .flatten()
         .filter_map(|v| v.as_str())
         .map(|p| {
-            // paths may be file:// URLs
-            let p = p.strip_prefix("file:///").unwrap_or(p);
-            let path = PathBuf::from(p);
+            let path = output_path(p);
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             (path, size)
         })
         .collect();
     out.dedup_by(|a, b| a.0 == b.0);
     out
+}
+
+/// A path of `results.json`: sage.exe writes `file:///` URLs, which spell a
+/// space `%20` (a results folder such as `HEK293 BS3 and DSSO Data` was
+/// listed with every size 0 B when only the `file:///` was taken off), and a
+/// network share `file://server/share/...`
+fn output_path(p: &str) -> PathBuf {
+    if p.starts_with("file:") {
+        if let Some(path) = url::Url::parse(p).ok().and_then(|u| u.to_file_path().ok()) {
+            return path;
+        }
+    }
+    PathBuf::from(p.strip_prefix("file:///").unwrap_or(p))
 }
 
 /// Explain a failure from the runner's message, Sage's error lines and the log
@@ -1217,5 +1280,97 @@ mod test {
         let d = t.diagnosis.as_ref().unwrap();
         assert!(d.title.contains("settings"), "{}", d.title);
         assert!(d.evidence.iter().any(|l| l.contains("missing field")), "{:?}", d.evidence);
+    }
+
+    /// The file counters move as each file's last spectrum is searched: in a
+    /// crosslink search; with both searches on each batch (the crosslink
+    /// search's count); and with the linear search first (each pass its own)
+    #[test]
+    fn files_are_counted_as_they_are_searched() {
+        let log_of = |log: &mut Vec<String>, msgs: &[&str]| {
+            log.extend(msgs.iter().map(|m| format!("[2026-11-26T18:00:07Z INFO  sage_cli::runner] {m}")));
+        };
+        assert_eq!(file_searched("- cas9_b.raw: searched for crosslinks (2 of 3 files done)"), Some((true, 2)));
+        assert_eq!(file_searched("- a (1).d: searched for linear peptides (10 of 40 files done)"), Some((false, 10)));
+        assert_eq!(file_searched("- file 2 of 3: a.raw read in 1.2 s: 36,563 MS2 spectra"), None);
+
+        // crosslinks only: 4 files, two batches of 2
+        let mut t = Tracker::new(plan(true, false));
+        let mut log = Vec::new();
+        log_of(&mut log, &["using 16 CPU thread(s)", "processing files 0 .. 2 "]);
+        t.update(&log, log.len());
+        assert_eq!((t.stage(), t.files_done), (Stage::Search, 0));
+        let before = t.fraction();
+        log_of(&mut log, &["- a.raw: searched for crosslinks (1 of 4 files done)"]);
+        t.update(&log, log.len());
+        assert_eq!(t.files_done, 1);
+        assert!(t.fraction() > before, "a file done moves the bar");
+        assert_eq!(t.activity(), "Searching file 2 of 4");
+        log_of(&mut log, &["- b.raw: searched for crosslinks (2 of 4 files done)",
+            "- crosslink search:       12 ms (100 spectra, 5 candidate matches)", "processing files 2 .. 4 ",
+            "- c.raw: searched for crosslinks (3 of 4 files done)"]);
+        t.update(&log, log.len());
+        assert_eq!((t.files_started, t.files_done), (4, 3));
+        assert_eq!(t.activity(), "Searching file 4 of 4");
+
+        // both searches on each batch: the linear search's files do not count
+        let mut both = plan(true, false);
+        both.linear = true;
+        let mut t = Tracker::new(both);
+        let mut log = Vec::new();
+        log_of(&mut log, &["using 16 CPU thread(s)", "processing files 0 .. 2 ",
+            "- a.raw: searched for linear peptides (1 of 4 files done)",
+            "- b.raw: searched for linear peptides (2 of 4 files done)", "- search:         1 ms (500 spectra/s)"]);
+        t.update(&log, log.len());
+        assert_eq!(t.files_done, 0, "the batch's crosslink search is still to come");
+        log_of(&mut log, &["- a.raw: searched for crosslinks (1 of 4 files done)"]);
+        t.update(&log, log.len());
+        assert_eq!(t.files_done, 1);
+
+        // the linear search first: its files, then the crosslink search's from 0
+        let mut first = plan(true, false);
+        first.linear = true;
+        first.linear_proteins = true;
+        let mut t = Tracker::new(first);
+        let mut log = Vec::new();
+        log_of(&mut log, &["using 16 CPU thread(s)", "=== searching the spectrum files: linear search ===",
+            "processing files 0 .. 4 ", "- a.raw: searched for linear peptides (1 of 4 files done)",
+            "- b.raw: searched for linear peptides (2 of 4 files done)"]);
+        t.update(&log, log.len());
+        assert_eq!((t.stage(), t.files_done), (Stage::Search, 2));
+        log_of(&mut log, &["- c.raw: searched for linear peptides (3 of 4 files done)",
+            "- d.raw: searched for linear peptides (4 of 4 files done)", "- search:         1 ms (500 spectra/s)",
+            "=== linear peptide results (results.sage.tsv) ===", "discovered 1207 target peptides at 1% FDR",
+            "=== crosslink database: the proteins of the linear search ===",
+            "=== searching the spectrum files: crosslink search ===", "processing files 0 .. 4 ",
+            "- a.raw: searched for crosslinks (1 of 4 files done)"]);
+        t.update(&log, log.len());
+        assert_eq!((t.stage(), t.files_done, t.linear_files_done), (Stage::XlSearch, 1, Some(4)));
+        assert_eq!(t.activity(), "Crosslink search: files 2\u{2013}4 of 4");
+    }
+
+    /// Output paths as sage.exe writes them in results.json: URLs with the
+    /// spaces of a folder name as %20, a network share, or plain paths
+    #[cfg(windows)]
+    #[test]
+    fn output_paths_with_spaces_are_found() {
+        assert_eq!(
+            output_path("file:///D:/StorMS/UserSpace/HEK293%20BS3%20and%20DSSO%20Data/BS3%20Search/results.sage.tsv"),
+            PathBuf::from(r"D:\StorMS\UserSpace\HEK293 BS3 and DSSO Data\BS3 Search\results.sage.tsv")
+        );
+        assert_eq!(output_path("file://server/share/out/crosslinks.mzid"), PathBuf::from(r"\\server\share\out\crosslinks.mzid"));
+        assert_eq!(output_path(r"C:\results\peptides.sage.tsv"), PathBuf::from(r"C:\results\peptides.sage.tsv"));
+
+        // a real folder with spaces: results.json read back with true sizes
+        let dir = std::env::temp_dir().join(format!("xnova outputs {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("results.sage.tsv");
+        std::fs::write(&file, vec![b'x'; 1234]).unwrap();
+        let url = url::Url::from_file_path(&file).unwrap().to_string();
+        assert!(url.contains("%20"), "{url}");
+        std::fs::write(dir.join("results.json"), format!("{{\"output_paths\": [\"{url}\"]}}")).unwrap();
+        let outputs = read_outputs(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(outputs, vec![(file, 1234)]);
     }
 }

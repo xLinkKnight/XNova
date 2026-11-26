@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- The Progress tab's Output files list showed 0 B for every file sage.exe wrote when the results folder's path had a space in it (`HEK293 BS3 and DSSO Data\BS3 Search`): `results.json` lists the files as `file:///` URLs, which write a space as `%20`, and only the `file:///` was taken off. The URLs are now read as URLs (network shares too).
+- sage-gui over Remote Desktop and in virtual machines: the window is drawn with Direct3D 12 (wgpu) instead of OpenGL, which such sessions often lack (`egui_glow requires opengl 2.0+`). With no graphics card to draw with, it uses Windows' own software renderer (WARP), which every Remote Desktop session has; on a computer with several cards, the one driving the display. OpenGL stays available with `XNOVA_RENDERER=opengl` (`software` forces the software renderer). When the window cannot open, sage-gui starts again with the next way of drawing (Direct3D 12, then the software renderer, then OpenGL), and when none works it says why in a message box instead of closing without a word.
+- A window that closes unexpectedly now says why: a panic is recorded in `%APPDATA%\sage-gui\crash.log` (with where it happened), and one that ends the window is also shown in a message box. The window that closed when numbers were typed into CPU threads or Max RAM in a Remote Desktop session using OpenGL could not be reproduced here; typing into those fields, as an input method commits text, is now tested, and the window no longer uses OpenGL there.
+- More than 64 CPU threads: Windows puts at most 64 logical processors in a processor group, and sage.exe and sage-gui counted only one group (64 of an AMD EPYC 9754's 256 threads). Both now count every group: sage.exe's default `--threads` and its log (`256 logical CPUs in 4 processor groups`), sage-gui's CPU threads field and its usage meters. With several groups, sage.exe places its worker threads evenly over them, since Windows before Windows 11 and Windows Server 2022 keeps a program's threads in one group unless told otherwise.
+- Files > Resources lists each graphics card once: Windows listed a T400 twice in a Remote Desktop session on a server with a T400 and an RTX 5000 Ada (the same adapter id; two cards of one model keep both lines). The list of cards no longer runs into the GPU support row below it.
+
+### Changed
+- The Progress tab's file counters count each file as its last spectrum is searched, in the linear and in the crosslink search, instead of a whole batch at once (32 files in a 64-thread search): sage.exe logs `- D7_BS3_DDA.raw: searched for crosslinks (7 of 40 files done)`, and searches the spectra of each batch in file order, the first file first. The results are the same: four searches of three files in two batches (linear, linear and crosslink together, linear first, crosslinks only) wrote files identical to v1.9.10's, apart from the order of exactly tied rows in `crosslinks_CSMs.csv`, which differs between two runs of v1.9.10 too.
+- The Progress tab: the "to come" mark is ten separate dots (twelve dashes ran together into a ring), the progress bar has no spinner of its own, and the action bar's buttons sit in the middle of the bar (as much space above them, under the ribbon, as below). The window is titled XNova.
+
 ## [v1.9.10] - 2026-11-25
 
 ### Changed

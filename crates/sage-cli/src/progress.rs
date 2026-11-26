@@ -198,9 +198,94 @@ impl Drop for Heartbeat {
     }
 }
 
+/// Each spectrum file of a batch, logged as its last spectrum is searched,
+/// with how many files the search has done in all:
+/// `- cas9_b.raw: searched for crosslinks (2 of 3 files done)` (sage-gui
+/// counts the files from these lines)
+pub struct FilesSearched<'a> {
+    what: &'static str,
+    /// file id -> its place in `left` and `names`
+    slots: std::collections::HashMap<usize, usize>,
+    /// spectra of each file still to search
+    left: Vec<AtomicUsize>,
+    names: Vec<String>,
+    /// files the search has done, over every batch
+    done: &'a AtomicUsize,
+    total: usize,
+}
+
+impl<'a> FilesSearched<'a> {
+    /// The batch's files (id, name) and the file id of each spectrum to
+    /// search; `done` counts the search's files over every batch, of `total`.
+    /// A file with no spectrum to search is done at once.
+    pub fn new(
+        what: &'static str,
+        files: Vec<(usize, String)>,
+        spectra: impl Iterator<Item = usize>,
+        done: &'a AtomicUsize,
+        total: usize,
+    ) -> Self {
+        let slots: std::collections::HashMap<usize, usize> =
+            files.iter().enumerate().map(|(slot, (id, _))| (*id, slot)).collect();
+        let mut counts = vec![0usize; files.len()];
+        for id in spectra {
+            if let Some(&slot) = slots.get(&id) {
+                counts[slot] += 1;
+            }
+        }
+        let searched = FilesSearched {
+            what,
+            slots,
+            left: counts.iter().map(|&n| AtomicUsize::new(n)).collect(),
+            names: files.into_iter().map(|(_, name)| name).collect(),
+            done,
+            total,
+        };
+        for (slot, &n) in counts.iter().enumerate() {
+            if n == 0 {
+                searched.finished(slot);
+            }
+        }
+        searched
+    }
+
+    /// A spectrum of file `file_id` has been searched
+    pub fn spectrum_done(&self, file_id: usize) {
+        if let Some(&slot) = self.slots.get(&file_id) {
+            if self.left[slot].fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.finished(slot);
+            }
+        }
+    }
+
+    fn finished(&self, slot: usize) {
+        let n = self.done.fetch_add(1, Ordering::AcqRel) + 1;
+        log::info!("- {}: searched for {} ({} of {} files done)", self.names[slot], self.what, n, self.total);
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A file is done with its last spectrum; one with none to search at once
+    #[test]
+    fn files_are_counted_as_their_last_spectrum_is_searched() {
+        let done = AtomicUsize::new(1);
+        let files = vec![(1, "b.raw".to_string()), (2, "c.raw".to_string()), (3, "d.raw".to_string())];
+        let spectra = [1, 1, 2];
+        let searched = FilesSearched::new("crosslinks", files, spectra.iter().copied(), &done, 4);
+        // d.raw had nothing to search
+        assert_eq!(done.load(Ordering::Relaxed), 2);
+        searched.spectrum_done(1);
+        assert_eq!(done.load(Ordering::Relaxed), 2);
+        searched.spectrum_done(2);
+        searched.spectrum_done(1);
+        assert_eq!(done.load(Ordering::Relaxed), 4);
+        // a spectrum of another batch's file changes nothing
+        searched.spectrum_done(9);
+        assert_eq!(done.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn progress_lines_read_well() {

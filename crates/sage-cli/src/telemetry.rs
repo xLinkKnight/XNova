@@ -59,7 +59,7 @@ impl Telemetry {
             parquet,
             os_name: system.long_os_version().unwrap_or_default(),
             total_memory: system.total_memory(),
-            cpus: num_cpus::get(),
+            cpus: sage_core::parallel::logical_cpus(),
         }
     }
 

@@ -395,6 +395,9 @@ pub fn bar_start(ui: &Ui) -> egui::layers::ShapeIdx {
     ui.painter().add(egui::Shape::Noop)
 }
 
+/// Height of the logo-gradient ribbon on a bar's edge
+pub const RIBBON: f32 = 3.0;
+
 /// Finish a bar (the toolbar, `top`, or the action bar): the gradient tint
 /// behind it, and the logo's gradient as a ribbon on its edge towards the
 /// settings, in place of egui's separator line
@@ -402,9 +405,9 @@ pub fn bar_end(ui: &Ui, backdrop: egui::layers::ShapeIdx, top: bool) {
     let rect = ui.clip_rect();
     ui.painter().set(backdrop, gradient_rect(rect, &palette(ui.visuals().dark_mode).wash));
     let band = if top {
-        Rect::from_min_max(pos2(rect.left(), rect.bottom() - 3.0), rect.max)
+        Rect::from_min_max(pos2(rect.left(), rect.bottom() - RIBBON), rect.max)
     } else {
-        Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + 3.0))
+        Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + RIBBON))
     };
     ui.painter().add(gradient_rect(band, &LOGO));
 }
@@ -683,11 +686,13 @@ pub fn step_mark(ui: &mut Ui, mark: StepMark) -> Response {
             ui.ctx().request_repaint();
         }
         StepMark::Pending => {
+            // ten round dots with clear gaps (twelve dashes of 55% ran together
+            // into a ring on screen)
             let grey = muted(ui);
-            let dashes = 12;
-            for k in 0..dashes {
-                let from = -TAU / 4.0 + k as f32 * TAU / dashes as f32;
-                painter.add(egui::Shape::line(arc(from, from + 0.55 * TAU / dashes as f32, r - 0.5), Stroke::new(1.4_f32, grey)));
+            let dots = 10;
+            for k in 0..dots {
+                let a = -TAU / 4.0 + k as f32 * TAU / dots as f32;
+                painter.circle_filled(c + (r - 0.5) * vec2(a.cos(), a.sin()), 0.95, grey);
             }
         }
         StepMark::Failed => {
