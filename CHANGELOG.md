@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Crosslink FDR of pairs of one peptide twice (two copies of one sequence, I = L, modified alike or not): they have an FDR group of their own, with the loop-link estimate `(decoys + 1) / targets`, instead of being intra-protein links. A chance match of such a pair is a single wrong peptide, two targets or two decoys, with a weaker chain as good as its stronger, so chance pairs of one peptide twice outrank chance pairs of two peptides; among the intra-protein links their decoy-decoy pairs set the threshold for all, while their targets passed on the strength of the others. Checked on two HEK293T BS3 runs of Cao et al. 2026 (PXD071417), searched against the human proteome and a shuffled twin of every protein (an entrapment, where every match to a twin is false): 25-35% of these pairs at 5% FDR were false in four settings, against at most 0.2% of the other intra-protein links. In their own group, with `min_linked_peaks` 0 and `residues` `K`, the matches at 1% went from 2,897 (0.41% false) to 3,302 (0.24%), as the other intra-protein links no longer wait for those decoys; the pairs of one peptide twice at 1% from 100 (10% false) to none, since as for loop-links that takes 100 of them above the first decoy; at 5%, 82 of them with 2.4% false. With KSTY and `min_linked_peaks` 2, the matches at 1% went from 858 to 1,362 (0.46% and 0.29% false), and no pair of one peptide twice passed at 5% either (43 had at 1%, none of them twins). Without the `+ 1`, 59-70 of them passed at 1% with K only, about 3% false, and 11-15% were false at 5%. The log's table of matches at 1% by group has a row for them (`identical peptides`) when any are at 1%, and the CSM report's `Homomeric` crosslink type now means these pairs (it was the pairs of one peptide with the same modifications).
+
+### Added
+- `crosslinks.sage.tsv` and `crosslinks_FDRfiltered.sage.tsv`: an `overlap` column, after `topology_peaks`. `identical` for a pair of one sequence twice (above), `nested` when one peptide lies inside the other, as when they are a missed cleavage apart, and empty otherwise. Nested pairs share fragments as copies of one peptide do, but decoy pairs seldom nest, so the decoys cannot tell how many of them are false; on the entrapment above there were 13 at 5% FDR (`min_linked_peaks` 0, K only), with an estimated 31% false but too few twins to be sure.
+
 ## [v1.9.11] - 2026-11-26
 
 ### Fixed

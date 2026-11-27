@@ -11,7 +11,7 @@ use log::info;
 use rayon::prelude::*;
 use sage_core::crosslink::{
     assign_q_values, assign_q_values_in_window, CrosslinkMatch, CrosslinkScorer, CrosslinkSettings, LinkKind,
-    PairClass,
+    Overlap, PairClass,
 };
 use sage_core::crosslink_quant::{quantify_lfq, CrosslinkLfq};
 use sage_core::mass::Tolerance;
@@ -37,15 +37,16 @@ type Reporters = HashMap<(usize, String), (f32, Vec<f32>)>;
 /// `fdr_group`): targets, target-decoy and decoy-decoy matches, as the FDR
 /// counted them, so the log shows where the decoys fell
 fn log_fdr_groups(matches: &[CrosslinkMatch]) {
-    let kinds = ["inter-protein", "intra-protein", "loop-links", "multivalent"];
+    let kinds = ["inter-protein", "intra-protein", "identical peptides", "loop-links", "multivalent"];
     // [kind][recorded, guessed charge][TT, TD, DD]
-    let mut counts = [[[0usize; 3]; 2]; 4];
+    let mut counts = [[[0usize; 3]; 2]; 5];
     for m in matches.iter().filter(|m| m.spectrum_q <= FDR_CUTOFF) {
         let kind = match (m.kind, m.intra_protein) {
+            (LinkKind::Inter, _) if m.overlap == Overlap::Identical => 2,
             (LinkKind::Inter, false) => 0,
             (LinkKind::Inter, true) => 1,
-            (LinkKind::Loop, _) => 2,
-            (LinkKind::Multi, _) => 3,
+            (LinkKind::Loop, _) => 3,
+            (LinkKind::Multi, _) => 4,
         };
         let class = match m.class {
             PairClass::TT => 0,
@@ -56,7 +57,7 @@ fn log_fdr_groups(matches: &[CrosslinkMatch]) {
     }
     let rows: Vec<(String, [usize; 3])> = (0..2)
         .flat_map(|guessed| {
-            (0..4).map(move |k| {
+            (0..kinds.len()).map(move |k| {
                 let name = if guessed == 1 { format!("{}, guessed charge", kinds[k]) } else { kinds[k].to_string() };
                 (name, counts[k][guessed])
             })
@@ -69,7 +70,7 @@ fn log_fdr_groups(matches: &[CrosslinkMatch]) {
     info!("crosslink FDR, matches at 1% by group: targets / target-decoy / decoy-decoy");
     let t = crate::progress::thousands;
     for (name, [tt, td, dd]) in rows {
-        info!("  {name:<32} {:>7} / {:>5} / {:>5}", t(tt), t(td), t(dd));
+        info!("  {name:<34} {:>7} / {:>5} / {:>5}", t(tt), t(td), t(dd));
     }
 }
 
@@ -91,6 +92,16 @@ fn database_name(group: u8) -> &'static str {
         (true, false) => "1",
         (false, true) => "2",
         (false, false) => "",
+    }
+}
+
+/// `overlap` column of a pair: `identical` (one sequence twice, I = L, its
+/// own FDR group), `nested` (one inside the other), or empty
+fn overlap(m: &CrosslinkMatch) -> &'static str {
+    match m.overlap {
+        Overlap::Identical => "identical",
+        Overlap::Nested => "nested",
+        Overlap::Distinct => "",
     }
 }
 
@@ -945,6 +956,7 @@ impl Runner {
             "topology",
             "species",
             "topology_peaks",
+            "overlap",
         ]
         .into_iter()
         .map(String::from)
@@ -1026,6 +1038,7 @@ impl Runner {
                 topology(m),
                 m.species.as_deref().map(|s| species_text(db, s)).unwrap_or_default(),
                 m.species.as_deref().map(|s| s.topology_peaks.to_string()).unwrap_or_default(),
+                overlap(m).to_string(),
             ];
             record.extend(absolute_positions(ctx, m, letters.len()));
             if silac {

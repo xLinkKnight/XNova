@@ -9,7 +9,7 @@
 //! TWO_HUMAN:K3`), from the protein sequences of the FASTA.
 
 use super::crosslink_export::{mz, ExportContext};
-use sage_core::crosslink::{rank_score, CrosslinkMatch, LinkKind, PairClass};
+use sage_core::crosslink::{rank_score, CrosslinkMatch, LinkKind, Overlap, PairClass};
 use sage_core::database::PeptideIx;
 
 /// The report's file name, in the results folder
@@ -67,12 +67,13 @@ fn peptide_scores(m: &CrosslinkMatch) -> Vec<(Option<f64>, u16)> {
     }
 }
 
-/// `Crosslink type` column
+/// `Crosslink type` column; `Homomeric`: two copies of one peptide sequence
+/// (I = L, modified alike or not), the pairs with an FDR group of their own
 fn crosslink_type(m: &CrosslinkMatch) -> &'static str {
     match m.kind {
         LinkKind::Loop => "Loop-link",
         LinkKind::Multi => "Multivalent",
-        LinkKind::Inter if m.beta == Some(m.alpha) => "Homomeric",
+        LinkKind::Inter if m.overlap == Overlap::Identical => "Homomeric",
         LinkKind::Inter if m.intra_protein => "Intra-protein",
         LinkKind::Inter => "Inter-protein",
     }

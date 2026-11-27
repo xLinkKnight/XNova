@@ -747,6 +747,7 @@ pub(super) mod test {
             alpha_site: sites.0,
             beta_site: sites.1,
             intra_protein: false,
+            overlap: Default::default(),
             charge: 4,
             rt: 12.5,
             expmass: 2500.0,

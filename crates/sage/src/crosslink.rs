@@ -878,6 +878,40 @@ impl PairClass {
     }
 }
 
+/// How the residues of a pair's two peptides relate, with I and L alike and
+/// modifications set aside
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum Overlap {
+    /// Neither sequence lies inside the other (and loop-links and
+    /// multivalent species)
+    #[default]
+    Distinct,
+    /// One peptide's sequence lies inside the other's, as when they are a
+    /// missed cleavage apart. The two share fragments like copies of one
+    /// peptide, but a decoy pair seldom nests, so the decoys cannot tell how
+    /// many such pairs are false
+    Nested,
+    /// One sequence twice: copies of one peptide, modified alike or not.
+    /// Such pairs have an FDR group of their own (see [`fdr_group`])
+    Identical,
+}
+
+impl Overlap {
+    /// Of two peptides' residues
+    pub fn of(a: &[u8], b: &[u8]) -> Self {
+        let same = |x: &u8, y: &u8| x == y || (matches!(x, b'I' | b'L') && matches!(y, b'I' | b'L'));
+        let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+        let is_short = |w: &[u8]| w.iter().zip(short).all(|(x, y)| same(x, y));
+        if short.len() == long.len() && is_short(long) {
+            Overlap::Identical
+        } else if !short.is_empty() && long.windows(short.len()).any(is_short) {
+            Overlap::Nested
+        } else {
+            Overlap::Distinct
+        }
+    }
+}
+
 /// A crosslink-spectrum match (CSM)
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CrosslinkMatch {
@@ -897,6 +931,9 @@ pub struct CrosslinkMatch {
     pub beta_site: u16,
     /// Do the two peptides share a protein? (always true for loop-links)
     pub intra_protein: bool,
+    /// Pairs: is one peptide's sequence the other's, or inside it? Set for
+    /// the matches a spectrum keeps
+    pub overlap: Overlap,
     pub charge: u8,
     pub rt: f32,
     pub expmass: f32,
@@ -1876,11 +1913,15 @@ impl<'a, 'db> CrosslinkScorer<'a, 'db> {
         }
         found.sort_by(|a, b| b.hyperscore.total_cmp(&a.hyperscore));
         found.truncate(self.scorer.report_psms.max(1));
+        let db = self.scorer.db;
         for idx in 0..found.len() {
             let next = found.get(idx + 1).map(|m| m.hyperscore).unwrap_or_default();
             found[idx].rank = idx as u32 + 1;
             found[idx].delta_next = found[idx].hyperscore - next;
             found[idx].pairs_scored = pairs_scored;
+            if let (LinkKind::Inter, Some(beta)) = (found[idx].kind, found[idx].beta) {
+                found[idx].overlap = Overlap::of(&db[found[idx].alpha].sequence, &db[beta].sequence);
+            }
         }
         if self.scorer.annotate_matches {
             for m in found.iter_mut().filter(|m| m.kind != LinkKind::Multi) {
@@ -2557,7 +2598,18 @@ pub fn rank_score(m: &CrosslinkMatch) -> f64 {
 /// 5 loop-links through at 1% with q 0. Pairs keep their estimate: their
 /// groups are large, the estimate held there, and a `+ 1` cost one library a
 /// sixth of its unique crosslinks for three fewer false ones.
-fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
+///
+/// Pairs of one peptide twice ([`Overlap::Identical`]) are single peptides
+/// too. A chance match of one is a single wrong peptide, so it is both
+/// targets or both decoys, and its weaker chain is as good as its stronger:
+/// such pairs outrank chance pairs of two peptides. Among the intra-protein
+/// pairs, their decoy-decoy pairs set the threshold for all while their
+/// targets passed on the strength of the others. On two HEK293T BS3 runs
+/// searched with a shuffled twin of every protein (entrapment), 25-35% of
+/// them at 5% FDR were false, against at most 0.2% of the other
+/// intra-protein pairs; in a group of their own with this estimate, 2.4%,
+/// and with `decoys / targets` 11-15%: the group is small.
+fn q_from_sorted(classes: &[PairClass], single: bool) -> Vec<f32> {
     let (mut tt, mut td, mut dd) = (0f64, 0f64, 0f64);
     let mut q = Vec::with_capacity(classes.len());
     for class in classes {
@@ -2566,7 +2618,7 @@ fn q_from_sorted(classes: &[PairClass], loops: bool) -> Vec<f32> {
             PairClass::TD => td += 1.0,
             PairClass::DD => dd += 1.0,
         }
-        let false_hits = if loops { td + dd + 1.0 } else { td.max(dd) };
+        let false_hits = if single { td + dd + 1.0 } else { td.max(dd) };
         q.push((false_hits / tt.max(1.0)).clamp(0.0, 1.0) as f32);
     }
     // q-values are monotone: the best FDR at which a hit would be accepted
@@ -2606,27 +2658,37 @@ fn q_multivalent(species: &[(bool, u8)]) -> Vec<f32> {
 }
 
 /// FDR groups: loop-links, intra-protein links, inter-protein links,
-/// multivalent species. Intra-protein links are far more likely to be true
-/// than inter-protein links, so pooling them would hide inter-protein false
-/// positives (Fischer & Rappsilber, Anal. Chem. 2017).
+/// multivalent species and pairs of one peptide twice. Intra-protein links
+/// are far more likely to be true than inter-protein links, so pooling them
+/// would hide inter-protein false positives (Fischer & Rappsilber, Anal.
+/// Chem. 2017). Pairs of one peptide twice are single peptides to the FDR,
+/// and far more often false than the other intra-protein pairs (see
+/// [`q_from_sorted`]).
 ///
-/// Matches of precursors without a recorded charge form the same four groups
+/// Matches of precursors without a recorded charge form the same five groups
 /// of their own. Each such spectrum is searched at every charge of
 /// `precursor_charge` and keeps its best match; the higher charges mean
 /// larger masses, longer peptides and higher scores by chance, so pooled with
 /// the others these matches would set the score threshold for all.
 fn fdr_group(m: &CrosslinkMatch) -> usize {
     let kind = match (m.kind, m.intra_protein) {
-        (LinkKind::Loop, _) => 0,
-        (LinkKind::Inter, true) => 1,
-        (LinkKind::Inter, false) => 2,
-        (LinkKind::Multi, _) => 3,
+        (LinkKind::Loop, _) => LOOP_LINKS,
+        (LinkKind::Inter, _) if m.overlap == Overlap::Identical => IDENTICAL_PAIRS,
+        (LinkKind::Inter, true) => INTRA_PROTEIN,
+        (LinkKind::Inter, false) => INTER_PROTEIN,
+        (LinkKind::Multi, _) => MULTIVALENT,
     };
     kind + if m.charge_guessed { FDR_KINDS } else { 0 }
 }
 
+/// The [`fdr_group`]s of recorded charges (guessed ones: + [`FDR_KINDS`])
+const LOOP_LINKS: usize = 0;
+const INTRA_PROTEIN: usize = 1;
+const INTER_PROTEIN: usize = 2;
+const MULTIVALENT: usize = 3;
+const IDENTICAL_PAIRS: usize = 4;
 /// Kinds of match with an FDR of their own (see [`fdr_group`])
-const FDR_KINDS: usize = 4;
+const FDR_KINDS: usize = 5;
 
 /// Canonical identity of a unique crosslink (peptide pair + link sites),
 /// independent of which chain is called alpha; multivalent species add a
@@ -2749,10 +2811,11 @@ fn assign_q(matches: &mut [CrosslinkMatch], include: &[bool]) -> (usize, usize) 
     };
 
     for group in 0..2 * FDR_KINDS {
-        let loops = group % FDR_KINDS == 0;
+        // single peptides: loop-links and pairs of one peptide twice
+        let single = matches!(group % FDR_KINDS, LOOP_LINKS | IDENTICAL_PAIRS);
         // q-values of matches sorted best first, by the group's estimate
         let q_of = |sorted: &[usize], matches: &[CrosslinkMatch]| {
-            if group % FDR_KINDS == 3 {
+            if group % FDR_KINDS == MULTIVALENT {
                 let species: Vec<(bool, u8)> = sorted
                     .iter()
                     .map(|&i| match &matches[i].species {
@@ -2768,7 +2831,7 @@ fn assign_q(matches: &mut [CrosslinkMatch], include: &[bool]) -> (usize, usize) 
                 q_multivalent(&species)
             } else {
                 let classes: Vec<PairClass> = sorted.iter().map(|&i| matches[i].class).collect();
-                q_from_sorted(&classes, loops)
+                q_from_sorted(&classes, single)
             }
         };
 
@@ -4637,6 +4700,9 @@ mod test {
             assert_eq!(pair_set(&db2, &h_cpu[0]), pair_set(&db2, &h_ref[0]));
             assert!((h_cpu[0].hyperscore - h_ref[0].hyperscore).abs() < 1e-6);
             assert_eq!(h_cpu[0].class, h_ref[0].class);
+            // the self pair is two copies of one peptide (its own FDR group)
+            let overlap = if x.sequence == y.sequence { Overlap::Identical } else { Overlap::Distinct };
+            assert_eq!((h_cpu[0].overlap, h_ref[0].overlap), (overlap, overlap), "{sx},{sy}");
         }
     }
 
@@ -5261,6 +5327,46 @@ mod test {
         assert_eq!((csms, links), (200, 200), "the pairs only");
         assert!(m[..200].iter().all(|x| x.spectrum_q == 0.0));
         assert!(m[201..211].iter().all(|x| x.spectrum_q >= 0.1 && x.crosslink_q >= 0.1));
+    }
+
+    #[test]
+    fn overlap_of_two_sequences() {
+        use Overlap::*;
+        assert_eq!(Overlap::of(b"PEPTIDEK", b"PEPTIDEK"), Identical);
+        assert_eq!(Overlap::of(b"PEPTIDEK", b"PEPTLDEK"), Identical, "I and L alike");
+        assert_eq!(Overlap::of(b"VSTAAMQR", b"GLEKVSTAAMQR"), Nested, "a missed cleavage apart");
+        assert_eq!(Overlap::of(b"GLEKVSTAAMQR", b"EKVSTA"), Nested);
+        assert_eq!(Overlap::of(b"GLEKVSTAAMQR", b"TDYHFPNEWKLIR"), Distinct);
+        assert_eq!(Overlap::of(b"PEPTIDEK", b"PEPTIDER"), Distinct);
+    }
+
+    /// Pairs of one peptide twice get their FDR among themselves, as single
+    /// peptides: their decoys no longer hold back the other intra-protein
+    /// pairs, and their own targets need many more targets than decoys
+    #[test]
+    fn identical_pairs_have_their_own_fdr() {
+        use PairClass::*;
+        let pair = |score: f64, class, alpha, beta| CrosslinkMatch { alpha_score: score, beta_score: score, ..csm(2.0 * score, class, LinkKind::Inter, alpha, Some(beta)) };
+        // 200 intra-protein pairs of two peptides, all targets
+        let mut m: Vec<CrosslinkMatch> = (0..200).map(|i| pair(40.0 + i as f64 * 0.1, TT, i, i + 1000)).collect();
+        m.push(pair(30.0, TD, 300, 1300));
+        // 26 pairs of one peptide twice, above most of them; 6 are decoys
+        for i in 0..26 {
+            let class = if i % 4 == 3 { DD } else { TT };
+            m.push(CrosslinkMatch { overlap: Overlap::Identical, ..pair(75.0 - i as f64, class, 500 + i, 500 + i) });
+        }
+        let (csms, links) = assign_q_values(&mut m);
+        assert_eq!((csms, links), (200, 200), "the pairs of two peptides only");
+        assert!(m[..200].iter().all(|x| x.spectrum_q == 0.0), "untouched by the identical pairs' decoys");
+        // (decoys + 1) / targets: 7 / 20 after all of them
+        let identical = &m[201..];
+        assert!(identical.iter().all(|x| x.spectrum_q > 0.01));
+        assert!((identical[25].spectrum_q - 7.0 / 20.0).abs() < 1e-6, "{}", identical[25].spectrum_q);
+        // pooled with the other intra-protein pairs, their decoys held all those back
+        for x in &mut m {
+            x.overlap = Overlap::Distinct;
+        }
+        assert_eq!(assign_q_values(&mut m).0, 3, "only the identical targets above every decoy");
     }
 
     #[test]

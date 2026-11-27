@@ -681,7 +681,8 @@ Progress tab shows the part under way and moves its bar with them.
 
 `spectrum_q` is per CSM; `crosslink_q` is per unique crosslink (peptide pair +
 sites), from its best CSM. Both are computed separately for loop-links,
-intra-protein links, inter-protein links and multivalent species.
+intra-protein links, inter-protein links, pairs of one peptide twice and
+multivalent species.
 
 **Count crosslinks with `crosslink_q`.** A CSM q-value controls CSMs, not
 crosslinks: false matches spread over many crosslinks of one CSM each, while
@@ -722,10 +723,30 @@ crosslinks at the level) go by `crosslink_q`. The CSM report
   of them through at 1%, all with q 0, which made up half and a seventh of the
   false matches there. Pairs keep `TD / TT`: their groups are large and that
   estimate held on both libraries.
+* **Pairs of one peptide twice: a group of their own, `(decoys + 1) /
+  targets`.** Two copies of one sequence (`overlap` `identical`: I = L,
+  modified alike or not, such as `IMKAQALR` with `IM[UNIMOD:35]KAQALR`) are one
+  peptide to the FDR. A chance match of one is a single wrong peptide, so the
+  pair is two targets or two decoys, and its weaker chain is as good as its
+  stronger, which ranks such chance pairs above chance pairs of two peptides.
+  Up to v1.9.11 they were intra-protein links, where their decoy-decoy pairs
+  set the threshold for every intra-protein link while their own targets
+  passed on the strength of the others. On two HEK293T BS3 runs of Cao et al.
+  2026 (PXD071417), searched against the human proteome and a shuffled twin of
+  every protein (an entrapment: a match to a twin is false), 25-35% of these
+  pairs at 5% FDR were false in four settings, against at most 0.2% of the
+  other intra-protein links. In their own group, with `min_linked_peaks` 0 and
+  `residues` `K`: 82 at 5%, 2.4% false; none at 1% (where 100 had passed, 10%
+  false), which as for loop-links takes 100 of them above the first decoy; and
+  the matches at 1% went from 2,897 (0.41% false) to 3,302 (0.24%). With KSTY
+  and `min_linked_peaks` 2, from 858 to 1,362 matches at 1%, and no pair of one
+  peptide twice passed at 5% either. Without the `+ 1` (`decoys / targets`),
+  59-70 of them passed at 1% with K only, but about 3% of those were false,
+  and 11-15% at 5%: the group is too small for its decoys alone.
 * **Guessed charges apart.** A precursor without a recorded charge is searched
   at every charge of `precursor_charge` and keeps its best match. Higher charges
   mean larger masses, longer peptides and higher scores by chance, so these
-  matches get their FDR among themselves (in the same four groups) and cannot
+  matches get their FDR among themselves (in the same five groups) and cannot
   set the threshold for the precursors whose charge the instrument recorded.
 * **Precursor mass window** (`precursor_window`, on by default). Random matches
   spread over the whole precursor tolerance; true ones cluster, and in an
@@ -748,7 +769,8 @@ other candidate stay in `crosslinks.sage.tsv`.
 * **The match:** `CSM ID` (`psm_id` of `crosslinks.sage.tsv`), `Confidence`
   (`High`: CSM q-value at most 1%, `Medium`: at most 5%), `CSM q-value`,
   `Crosslink q-value`, `Crosslink type` (`Inter-protein`, `Intra-protein`,
-  `Homomeric` for two copies of one peptide, `Loop-link`, `Multivalent`),
+  `Homomeric` for two copies of one peptide sequence, modified alike or not,
+  as `overlap` `identical` in `crosslinks.sage.tsv`, `Loop-link`, `Multivalent`),
   `Topology` (`a1b`, `a1a`, `loop`, `a2b`, `a1b1c`, ...), `Peptides` (how
   many), `Sequence` (the peptides, `-` between them) and `Crosslinks`: each
   link in its proteins, `RPAB5_YEAST:K59-RPB2_YEAST:K813` (UniProt entry names;
@@ -779,6 +801,14 @@ target-target, -1 otherwise; `class` is `TT`/`TD`/`DD` (loop-links: `TT`/`DD`).
 `linked_a` / `linked_b` count those that carry the linker (non-cleavable linkers
 only, see `min_linked_peaks`). With two crosslink databases, `database_a` /
 `database_b` say which one each peptide is from (`1`, `2` or `1+2`).
+
+`overlap` compares a pair's two sequences, with I and L alike and modifications
+set aside: `identical` for one sequence twice (such pairs have an FDR group of
+their own, see [FDR](#fdr-of-crosslink-searches)), `nested` when one peptide
+lies inside the other, as when they are a missed cleavage apart, and empty
+otherwise (and for loop-links and multivalent species). Nested pairs share
+fragments as copies of one peptide do, but decoy pairs seldom nest, so the
+decoys cannot tell how many of them are false: read them with care.
 
 `abs_pos_a` / `abs_pos_b` give the link residues' positions in their proteins
 (1-based, the protein sequence's own numbering): `abs_pos_a` is `link_a` in each
